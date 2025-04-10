@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 # Open the camera
-cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use 0 if it's the default camera
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Use 0 if it's the default camera
 cap.set(3, 800)
 cap.set(4, 600)
 
