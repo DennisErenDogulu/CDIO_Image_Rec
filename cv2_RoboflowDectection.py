@@ -1,53 +1,51 @@
-from roboflow import Roboflow
 import cv2
 import random
 import threading
 import time
+import logging
 from queue import Queue
+from roboflow import Roboflow
 
-rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")   # ← your API key
-project = rf.workspace("cdio-n5rcb").project("cdio_4")
-model   = project.version(8).model              # ← use the version that’s deployed
+# ✅ Roboflow Setup
+rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
+project = rf.workspace("cdio-nczdp").project("cdio-golfbot2025")
+model = project.version(9).model
 
 # ✅ Assign colors for different classes
 class_colors = {}
 
-# ✅ Start video capture
+# ✅ Video Capture Setup
 cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffering
-cap.set(cv2.CAP_PROP_FPS, 30)  # Adjust FPS for smoother performance
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap.set(cv2.CAP_PROP_FPS, 30)
 
-frame_queue = Queue(maxsize=1)  # Stores latest frame
-output_queue = Queue(maxsize=1)  # Stores processed frame
-
-skip_frames = 3  # ✅ Process every 3rd frame for better FPS
+frame_queue = Queue(maxsize=1)
+output_queue = Queue(maxsize=1)
 frame_count = 0
+skip_frames = 5  # Tune as needed
+
+stop_event = threading.Event()
 
 def capture_frames():
-    """ Captures frames and skips unnecessary ones for higher FPS. """
     global frame_count
-    while True:
+    while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
+            logging.warning("Failed to read frame.")
             break
 
-        frame = cv2.resize(frame, (416, 416))  # ✅ Smaller frame for faster processing
-
+        frame = cv2.resize(frame, (416, 416))
         frame_count += 1
-        if frame_count % skip_frames == 0:
-            if not frame_queue.full():
-                frame_queue.put(frame)
+
+        if frame_count % skip_frames == 0 and not frame_queue.full():
+            frame_queue.put(frame)
 
 def draw_coordinate_system(frame):
-    """ Overlays a coordinate system on the frame. """
     h, w, _ = frame.shape
+    cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 255, 255), 1)
+    cv2.line(frame, (0, h // 2), (w, h // 2), (255, 255, 255), 1)
 
-    # Draw center lines (X and Y axis)
-    cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 255, 255), 1)  # Vertical (Y-axis)
-    cv2.line(frame, (0, h // 2), (w, h // 2), (255, 255, 255), 1)  # Horizontal (X-axis)
-
-    # Draw grid lines
-    step_size = 50  # Adjust for denser/sparser grid
+    step_size = 50
     for x in range(0, w, step_size):
         cv2.line(frame, (x, 0), (x, h), (50, 50, 50), 1)
     for y in range(0, h, step_size):
@@ -56,52 +54,35 @@ def draw_coordinate_system(frame):
     return frame
 
 def process_frames():
-    """ Runs object detection in parallel & counts objects. """
-    while True:
+    while not stop_event.is_set():
         if not frame_queue.empty():
             frame = frame_queue.get()
-            
-            start_time = time.time()  # ✅ Start time for measuring speed
-            
-            # ✅ Run inference (Optimize confidence & overlap if needed)
-            predictions = model.predict(frame, confidence=30, overlap=20).json()
+            start_time = time.time()
 
-            # ✅ Count instances of each class
+            try:
+                result = model.predict(frame, confidence=60, overlap=20).json()
+            except Exception as e:
+                logging.error(f"Model prediction error: {e}")
+                continue
+
             object_counts = {}
-
-            # ✅ Process predictions (draw bounding boxes)
-            for pred in predictions.get('predictions', []):
-                x, y, w, h = int(pred['x']), int(pred['y']), int(pred['width']), int(pred['height'])
+            for pred in result.get('predictions', []):
+                x, y = int(pred['x']), int(pred['y'])
+                w, h = int(pred['width']), int(pred['height'])
                 label = pred['class']
                 confidence = pred['confidence']
 
-                # ✅ Count detected objects by class
-                if label not in object_counts:
-                    object_counts[label] = 1
-                else:
-                    object_counts[label] += 1
+                object_counts[label] = object_counts.get(label, 0) + 1
 
-                # ✅ Assign a unique color to each class
                 if label not in class_colors:
                     class_colors[label] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
 
                 color = class_colors[label]
-
-                # Draw bounding box with class-specific color
                 cv2.rectangle(frame, (x - w // 2, y - h // 2), (x + w // 2, y + h // 2), color, 2)
-                cv2.putText(frame, f"{label}: {confidence:.2f}", (x - w // 2, y - h // 2 - 10), 
+                cv2.putText(frame, f"{label}: {confidence:.2f}", (x - w // 2, y - h // 2 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                # ✅ Show object coordinates
-                cv2.putText(frame, f"({x}, {y})", (x + 5, y - 5), 
+                cv2.putText(frame, f"({x}, {y})", (x + 5, y - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-            # ✅ Display the object count on the frame
-            y_offset = 30
-            for obj, count in object_counts.items():
-                cv2.putText(frame, f"{obj}: {count}", (10, y_offset), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                y_offset += 30
 
             # ✅ Draw coordinate system
             frame = draw_coordinate_system(frame)
@@ -109,30 +90,28 @@ def process_frames():
             if not output_queue.full():
                 output_queue.put(frame)
 
-            end_time = time.time()  # ✅ End time for measuring speed
-            print(f"Inference Time: {end_time - start_time:.2f} sec | Detected Objects: {object_counts}")
-
 def display_frames():
-    """ Displays frames in a separate thread for smoother performance. """
-    while True:
+    while not stop_event.is_set():
         if not output_queue.empty():
             frame = output_queue.get()
             cv2.imshow("Live Object Detection", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
 
-# ✅ Run capture, processing, and display in parallel
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                stop_event.set()
+# ✅ Thread Setup
 cap_thread = threading.Thread(target=capture_frames, daemon=True)
 proc_thread = threading.Thread(target=process_frames, daemon=True)
-disp_thread = threading.Thread(target=display_frames, daemon=True)
+disp_thread = threading.Thread(target=display_frames)
 
 cap_thread.start()
 proc_thread.start()
 disp_thread.start()
 
+disp_thread.join()
+stop_event.set()
 cap_thread.join()
 proc_thread.join()
-disp_thread.join()
 
 cap.release()
 cv2.destroyAllWindows()
