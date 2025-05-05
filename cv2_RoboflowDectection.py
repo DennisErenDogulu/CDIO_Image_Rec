@@ -9,7 +9,7 @@ from roboflow import Roboflow
 # ✅ Roboflow Setup
 rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
 project = rf.workspace("cdio-nczdp").project("cdio-golfbot2025")
-model = project.version(9).model
+model = project.version(10).model
 
 # ✅ Assign colors for different classes
 class_colors = {}
