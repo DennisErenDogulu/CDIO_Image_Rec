@@ -1,10 +1,44 @@
 import cv2
-import threading
 import random
-from inference import InferencePipeline
+import threading
+import time
+import logging
+from queue import Queue
+from roboflow import Roboflow
+
+# ✅ Roboflow Setup
+rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
+project = rf.workspace("cdio-nczdp").project("cdio-golfbot2025")
+model = project.version(10).model
+
+# ✅ Assign colors for different classes
+class_colors = {}
+
+# ✅ Video Capture Setup
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap.set(cv2.CAP_PROP_FPS, 30)
+
+frame_queue = Queue(maxsize=1)
+output_queue = Queue(maxsize=1)
+frame_count = 0
+skip_frames = 5  # Tune as needed
 
 stop_event = threading.Event()
-class_colors = {}
+
+def capture_frames():
+    global frame_count
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            logging.warning("Failed to read frame.")
+            break
+
+        frame = cv2.resize(frame, (416, 416))
+        frame_count += 1
+
+        if frame_count % skip_frames == 0 and not frame_queue.full():
+            frame_queue.put(frame)
 
 def draw_coordinate_system(frame):
     h, w, _ = frame.shape
@@ -16,79 +50,68 @@ def draw_coordinate_system(frame):
         cv2.line(frame, (x, 0), (x, h), (50, 50, 50), 1)
     for y in range(0, h, step_size):
         cv2.line(frame, (0, y), (w, y), (50, 50, 50), 1)
+
     return frame
 
-def my_sink(result, video_frame):
-    # Get the image from the result
-    if "output_image" in result:
-        np_frame = result["output_image"].numpy_image
-    elif "original_image" in result:
-        np_frame = result["original_image"].numpy_image
-    else:
-        np_frame = video_frame.numpy_image
+def process_frames():
+    while not stop_event.is_set():
+        if not frame_queue.empty():
+            frame = frame_queue.get()
+            start_time = time.time()
 
-    frame = draw_coordinate_system(np_frame.copy())
+            try:
+                result = model.predict(frame, confidence=60, overlap=20).json()
+            except Exception as e:
+                logging.error(f"Model prediction error: {e}")
+                continue
 
-    # Get predictions and make sure they are usable
-    predictions = result.get("predictions", [])
-    if isinstance(predictions, list):
-        for pred in predictions:
-            # DEBUG: Uncomment if you want to see raw output
-            # print("Raw prediction:", pred)
+            object_counts = {}
+            for pred in result.get('predictions', []):
+                x, y = int(pred['x']), int(pred['y'])
+                w, h = int(pred['width']), int(pred['height'])
+                label = pred['class']
+                confidence = pred['confidence']
 
-            # Unwrap if tuple
-            if isinstance(pred, tuple):
-                pred = pred[0]
-
-            if isinstance(pred, dict):
-                label = pred.get("class", "unknown")
-                confidence = pred.get("confidence", 0.0) * 100  # Convert to percent
-                x = pred.get("x", 0)
-                y = pred.get("y", 0)
-                w_box = pred.get("width", 0)
-                h_box = pred.get("height", 0)
+                object_counts[label] = object_counts.get(label, 0) + 1
 
                 if label not in class_colors:
-                    class_colors[label] = (
-                        random.randint(0, 255),
-                        random.randint(0, 255),
-                        random.randint(0, 255)
-                    )
+                    class_colors[label] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
                 color = class_colors[label]
-
-                top_left = (int(x - w_box / 2), int(y - h_box / 2))
-                bottom_right = (int(x + w_box / 2), int(y + h_box / 2))
-
-                # Draw bounding box
-                cv2.rectangle(frame, top_left, bottom_right, color, 2)
-
-                # Draw label + confidence below box to avoid offscreen
-                label_text = f"{label}: {confidence:.1f}%"
-                text_position = (top_left[0], top_left[1] - 10)
-                cv2.putText(frame, label_text, text_position,
+                cv2.rectangle(frame, (x - w // 2, y - h // 2), (x + w // 2, y + h // 2), color, 2)
+                cv2.putText(frame, f"{label}: {confidence:.2f}", (x - w // 2, y - h // 2 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(frame, f"({x}, {y})", (x + 5, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    # Show the frame
-    cv2.imshow("Live Inference", frame)
+            # ✅ Draw coordinate system
+            frame = draw_coordinate_system(frame)
 
-    # Quit on 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        pipeline.stop()
-        stop_event.set()
+            if not output_queue.full():
+                output_queue.put(frame)
 
-# Initialize the Roboflow pipeline
-pipeline = InferencePipeline.init_with_workflow(
-    api_key="qJTLU5ku2vpBGQUwjBx2",
-    workspace_name="cdio-nczdp",
-    workflow_id="detect-and-classify-2",
-    video_reference=0,
-    max_fps=30,
-    on_prediction=my_sink
-)
+def display_frames():
+    while not stop_event.is_set():
+        if not output_queue.empty():
+            frame = output_queue.get()
+            cv2.imshow("Live Object Detection", frame)
 
-pipeline.start()
-stop_event.wait()
-pipeline.join()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                stop_event.set()
+# ✅ Thread Setup
+cap_thread = threading.Thread(target=capture_frames, daemon=True)
+proc_thread = threading.Thread(target=process_frames, daemon=True)
+disp_thread = threading.Thread(target=display_frames)
+
+cap_thread.start()
+proc_thread.start()
+disp_thread.start()
+
+disp_thread.join()
+stop_event.set()
+cap_thread.join()
+proc_thread.join()
+
+cap.release()
 cv2.destroyAllWindows()
-print("Done.")
-print("Predictions:", predictions)
