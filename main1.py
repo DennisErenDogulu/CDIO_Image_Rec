@@ -15,6 +15,34 @@ right_motor = Motor(Port.C)
 collection_motor = Motor(Port.A)  
 robot = DriveBase(left_motor, right_motor, wheel_diameter=55.5, axle_track=104)
 
+def test():
+    ev3.speaker.say("SIU")
+    ev3.speaker.beep()
+
+    ev3.speaker.beep()
+    
+    # Reset motor angles
+    left_motor.reset_angle(0)
+    right_motor.reset_angle(0)
+    
+    # Perform the turn
+    robot.turn(90)
+    
+    # Wait a moment to ensure the turn is complete
+    wait(1000)
+    
+    # Get the final angles
+    left_angle = left_motor.angle()
+    right_angle = right_motor.angle()
+    
+    # Display the angles on the screen
+    ev3.screen.clear()
+    ev3.screen.print("Left: ", left_angle)
+    ev3.screen.print("Right: ", right_angle)
+    
+    # Beep to indicate completion
+    ev3.speaker.beep()
+
 def collect_ball():
     ev3.speaker.beep()
     collection_motor.run_time(500, 1000)  # Placeholder til at samle bold op, starter motoren i 1 sekund og samler bold op
@@ -44,4 +72,10 @@ def move_pattern():
     robot.stop()
 
 
-move_pattern()
+
+test()
+
+
+
+
+
