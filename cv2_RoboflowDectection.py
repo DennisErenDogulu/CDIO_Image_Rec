@@ -1,3 +1,10 @@
+import cv2
+import random
+import threading
+import time
+import logging
+from queue import Queue
+from roboflow import Roboflow
 #!/usr/bin/env python3
 """
 Start:      python vision_send_xy.py COM6      # ← Windows-porten
@@ -8,129 +15,112 @@ from queue import Queue
 from typing import List, Tuple
 from roboflow import Roboflow
 
-# ---------- CLI -----------------------------------------------------------
-PORT = sys.argv[1] if len(sys.argv) > 1 else "none"
-def open_ser(p):
-    if p.lower() == "none":
-        class Dummy:  # viser bare hvad der ville blive sendt
-            def write(self, data): print("[DRY]", data.decode().strip())
-        return Dummy()
-    return serial.Serial(p, 115200, timeout=0.3)
-ser = open_ser(PORT)
-
-# ---------- konstanter ----------------------------------------------------
-FIELD_W, FIELD_H = 180, 120      # cm
-GRID = 10
-GOAL_A_H, GOAL_B_H = 8, 20
-HSV_TOL = (10,100,100)
-BALL_CLASSES = ("whitetabletennisballs","orangetabletennisballs")
-
-# ---------- Roboflow ------------------------------------------------------
+# ✅ Roboflow Setup
 rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
-model = rf.workspace("cdio-nczdp").project("cdio-golfbot2025").version(12).model
+project = rf.workspace("cdio-nczdp").project("cdio-golfbot2025")
+model = project.version(10).model
 
-# ---------- logging & kamera ---------------------------------------------
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s")
-log = logging.getLogger(__name__)
+# ✅ Assign colors for different classes
+class_colors = {}
 
-cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)   # ← ændr index hvis nødvendigt
-if not cap.isOpened(): log.error("kamera?!"); sys.exit(1)
-cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+# ✅ Video Capture Setup
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap.set(cv2.CAP_PROP_FPS, 30)
 
-# ---------- globale tilstande --------------------------------------------
-corners: List[Tuple[int,int]] = []
-H_px_cm = H_cm_px = None;  ready = False
-stage = "corners"          # corners→front→back→track
-front_hsv = back_hsv = None
-Qin,Qout,stop = Queue(1),Queue(1),threading.Event()
-last = None
+frame_queue = Queue(maxsize=1)
+output_queue = Queue(maxsize=1)
+frame_count = 0
+skip_frames = 5  # Tune as needed
 
-# ---------- små helpers ---------------------------------------------------
-def project(pt):  # cm→px
-    v=np.array([*pt,1],np.float32); p=H_px_cm@v; p/=p[2]; return int(p[0]),int(p[1])
-def px2cm(pt):
-    if not ready: return None
-    v=np.array([*pt,1],np.float32); c=H_cm_px@v; c/=c[2]; return float(c[0]),float(c[1])
-def hsv_range(c):
-    h,s,v=map(int,c); dh,ds,dv=HSV_TOL
-    lo=np.array([max(0,h-dh),max(0,s-ds),max(0,v-dv)],np.uint8)
-    hi=np.array([min(179,h+dh),min(255,s+ds),min(255,v+dv)],np.uint8)
-    return lo,hi
+stop_event = threading.Event()
 
-# ---------- mus -----------------------------------------------------------
-def mouse(e,x,y,_,__):
-    global stage,H_px_cm,H_cm_px,ready,front_hsv,back_hsv
-    if e!=cv2.EVENT_LBUTTONDOWN: return
-    if stage=="corners":
-        corners.append((x,y)); log.info("corner %d %s",len(corners),(x,y))
-        if len(corners)==4:
-            dst=np.float32([[0,0],[FIELD_W,0],[FIELD_W,FIELD_H],[0,FIELD_H]])
-            H_px_cm=cv2.getPerspectiveTransform(dst,np.float32(corners))
-            H_cm_px=np.linalg.inv(H_px_cm); ready=True; stage="front"
-            log.info("homografi ✔ – klik GRØN lap")
-    elif stage=="front":
-        hsv=cv2.cvtColor(last,cv2.COLOR_BGR2HSV); front_hsv=hsv[y,x]; stage="back"
-        log.info("front=%s – klik BLÅ lap",front_hsv)
-    elif stage=="back":
-        hsv=cv2.cvtColor(last,cv2.COLOR_BGR2HSV); back_hsv=hsv[y,x]; stage="track"
-        log.info("back=%s – ▶ tracking",back_hsv)
+def capture_frames():
+    global frame_count
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            logging.warning("Failed to read frame.")
+            break
 
-# ---------- tråde ---------------------------------------------------------
-def grab():
-    while not stop.is_set():
-        ret,f=cap.read()
-        if ret: Qin.put(cv2.resize(f,(416,416)))
+        frame = cv2.resize(frame, (416, 416))
+        frame_count += 1
 
-def proc():
-    global last
-    while not stop.is_set():
-        if Qin.empty(): time.sleep(0.005); continue
-        frame=Qin.get(); last=frame.copy()
+        if frame_count % skip_frames == 0 and not frame_queue.full():
+            frame_queue.put(frame)
 
-        # -- Roboflow
-        try: preds=model.predict(frame,confidence=60,overlap=20).json()
-        except Exception as e: log.error("RF %s",e); preds={}
-        balls=[]
-        for p in preds.get('predictions',[]):
-            x,y,w,h=map(int,[p['x'],p['y'],p['width'],p['height']])
-            lab=p['class']; clean=lab.lower().replace(" ","")
-            col=(random.randrange(255),random.randrange(255),random.randrange(255))
-            cv2.rectangle(frame,(x-w//2,y-h//2),(x+w//2,y+h//2),col,2)
-            cv2.putText(frame,f"{lab}:{p['confidence']:.2f}",(x-w//2,y-h//2-8),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.5,col,2)
-            if clean in BALL_CLASSES: balls.append((x,y,lab))
+def draw_coordinate_system(frame):
+    h, w, _ = frame.shape
+    cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 255, 255), 1)
+    cv2.line(frame, (0, h // 2), (w, h // 2), (255, 255, 255), 1)
 
-        # -- overlays
-        if ready:
-            for x in range(0,FIELD_W+1,GRID_STEP):
-                cv2.line(frame,project((x,0)),project((x,FIELD_H)),(255,255,255),1)
-            for y in range(0,FIELD_H+1,GRID_STEP):
-                cv2.line(frame,project((0,y)),project((FIELD_W,y)),(255,255,255),1)
-        for c in corners: cv2.circle(frame,c,5,(0,0,255),-1)
+    step_size = 50
+    for x in range(0, w, step_size):
+        cv2.line(frame, (x, 0), (x, h), (50, 50, 50), 1)
+    for y in range(0, h, step_size):
+        cv2.line(frame, (0, y), (w, y), (50, 50, 50), 1)
 
-        # -- robot-centroid + SEND xy ------------------------
-        if stage=="track" and front_hsv is not None and back_hsv is not None and balls:
-            hsv=cv2.cvtColor(last,cv2.COLOR_BGR2HSV)
-            cf=cv2.moments(cv2.inRange(hsv,*hsv_range(front_hsv)))
-            cb=cv2.moments(cv2.inRange(hsv,*hsv_range(back_hsv)))
-            if cf["m00"] and cb["m00"]:
-                rx,ry=int((cf["m10"]/cf["m00"]+cb["m10"]/cb["m00"])/2),\
-                      int((cf["m01"]/cf["m00"]+cb["m01"]/cb["m00"])/2)
-                bx,by,_=min(balls,key=lambda b:(b[0]-rx)**2+(b[1]-ry)**2)
-                cv2.circle(frame,(bx,by),6,(0,255,255),2)
-                ball_cm=px2cm((bx,by))
-                if ball_cm:
-                    ser.write(f"{ball_cm[0]:.1f};{ball_cm[1]:.1f}\n".encode())
-                    log.info("send xy %.1f %.1f",*ball_cm)
+    return frame
 
-        if not Qout.full(): Qout.put(frame)
+def process_frames():
+    while not stop_event.is_set():
+        if not frame_queue.empty():
+            frame = frame_queue.get()
+            start_time = time.time()
 
-# ---------- main ----------------------------------------------------------
-cv2.namedWindow("Live"); cv2.setMouseCallback("Live",mouse)
-threading.Thread(target=grab,daemon=True).start()
-threading.Thread(target=proc,daemon=True).start()
-while not stop.is_set():
-    if not Qout.empty(): cv2.imshow("Live",Qout.get())
-    if cv2.waitKey(1)&0xFF in (27,ord('q')): stop.set()
-cap.release(); cv2.destroyAllWindows()
+            try:
+                result = model.predict(frame, confidence=60, overlap=20).json()
+            except Exception as e:
+                logging.error(f"Model prediction error: {e}")
+                continue
+
+            object_counts = {}
+            for pred in result.get('predictions', []):
+                x, y = int(pred['x']), int(pred['y'])
+                w, h = int(pred['width']), int(pred['height'])
+                label = pred['class']
+                confidence = pred['confidence']
+
+                object_counts[label] = object_counts.get(label, 0) + 1
+
+                if label not in class_colors:
+                    class_colors[label] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+                color = class_colors[label]
+                cv2.rectangle(frame, (x - w // 2, y - h // 2), (x + w // 2, y + h // 2), color, 2)
+                cv2.putText(frame, f"{label}: {confidence:.2f}", (x - w // 2, y - h // 2 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(frame, f"({x}, {y})", (x + 5, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # ✅ Draw coordinate system
+            frame = draw_coordinate_system(frame)
+
+            if not output_queue.full():
+                output_queue.put(frame)
+
+def display_frames():
+    while not stop_event.is_set():
+        if not output_queue.empty():
+            frame = output_queue.get()
+            cv2.imshow("Live Object Detection", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                stop_event.set()
+# ✅ Thread Setup
+cap_thread = threading.Thread(target=capture_frames, daemon=True)
+proc_thread = threading.Thread(target=process_frames, daemon=True)
+disp_thread = threading.Thread(target=display_frames)
+
+cap_thread.start()
+proc_thread.start()
+disp_thread.start()
+
+disp_thread.join()
+stop_event.set()
+cap_thread.join()
+proc_thread.join()
+
+cap.release()
+cv2.destroyAllWindows()
