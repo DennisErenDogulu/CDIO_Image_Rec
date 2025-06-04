@@ -1,209 +1,136 @@
 #!/usr/bin/env python3
-import cv2, numpy as np, random, threading, time, logging, os
-from   queue import Queue
-from   typing import List, Tuple
-from   roboflow import Roboflow
+"""
+Start:      python vision_send_xy.py COM6      # ← Windows-porten
+Udvikling:  python vision_send_xy.py none      # kun log, ingen send
+"""
+import sys, os, cv2, numpy as np, math, time, random, logging, threading, serial
+from queue import Queue
+from typing import List, Tuple
+from roboflow import Roboflow
 
-# ─── bruger-konstanter ────────────────────────────────────────────────────
-FIELD_WIDTH_CM, FIELD_HEIGHT_CM = 180, 120
-GRID_SPACING_CM                 = 10
-GOAL_A_HEIGHT_CM, GOAL_B_HEIGHT_CM = 8, 20
+# ---------- CLI -----------------------------------------------------------
+PORT = sys.argv[1] if len(sys.argv) > 1 else "none"
+def open_ser(p):
+    if p.lower() == "none":
+        class Dummy:  # viser bare hvad der ville blive sendt
+            def write(self, data): print("[DRY]", data.decode().strip())
+        return Dummy()
+    return serial.Serial(p, 115200, timeout=0.3)
+ser = open_ser(PORT)
 
-BLOB_TOLER_HSV   = (10, 100, 100)      # ±H,S,V for lap-farver
-MASK_MIN_AREA    = 100                 # px² – filtrer støj
+# ---------- konstanter ----------------------------------------------------
+FIELD_W, FIELD_H = 180, 120      # cm
+GRID = 10
+GOAL_A_H, GOAL_B_H = 8, 20
+HSV_TOL = (10,100,100)
+BALL_CLASSES = ("whitetabletennisballs","orangetabletennisballs")
 
-# Bold-klasser fra Roboflow (lowercase, uden mellemrum)
-BALL_CLASSES = ("whitetabletennisballs", "orangetabletennisballs")
-
-# ─── Roboflow ─────────────────────────────────────────────────────────────
-rf    = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
+# ---------- Roboflow ------------------------------------------------------
+rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
 model = rf.workspace("cdio-nczdp").project("cdio-golfbot2025").version(12).model
 
-# ─── OpenCV setup ─────────────────────────────────────────────────────────
-os.environ['OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS'] = '0'
-cv2.setUseOptimized(True)
-
+# ---------- logging & kamera ---------------------------------------------
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s  %(levelname)-8s  %(message)s")
+    format="%(asctime)s %(levelname)-8s %(message)s")
 log = logging.getLogger(__name__)
 
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    log.error("Kunne ikke åbne kamera!")
-    raise SystemExit(1)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-cap.set(cv2.CAP_PROP_FPS, 30)
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)   # ← ændr index hvis nødvendigt
+if not cap.isOpened(): log.error("kamera?!"); sys.exit(1)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
 
-# ─── globale states ───────────────────────────────────────────────────────
-field_corners: List[Tuple[int,int]] = []
-H_px_from_cm = None          # cm ➜ pixel
-H_cm_from_px = None          # pixel ➜ cm (inverse)
-homog_ready  = False
-
-stage        = "corners"     # corners → front → back → track
+# ---------- globale tilstande --------------------------------------------
+corners: List[Tuple[int,int]] = []
+H_px_cm = H_cm_px = None;  ready = False
+stage = "corners"          # corners→front→back→track
 front_hsv = back_hsv = None
+Qin,Qout,stop = Queue(1),Queue(1),threading.Event()
+last = None
 
-frame_Q = Queue(maxsize=1)
-out_Q   = Queue(maxsize=1)
-stop    = threading.Event()
+# ---------- små helpers ---------------------------------------------------
+def project(pt):  # cm→px
+    v=np.array([*pt,1],np.float32); p=H_px_cm@v; p/=p[2]; return int(p[0]),int(p[1])
+def px2cm(pt):
+    if not ready: return None
+    v=np.array([*pt,1],np.float32); c=H_cm_px@v; c/=c[2]; return float(c[0]),float(c[1])
+def hsv_range(c):
+    h,s,v=map(int,c); dh,ds,dv=HSV_TOL
+    lo=np.array([max(0,h-dh),max(0,s-ds),max(0,v-dv)],np.uint8)
+    hi=np.array([min(179,h+dh),min(255,s+ds),min(255,v+dv)],np.uint8)
+    return lo,hi
 
-# ─── helper: homografi + tegning ──────────────────────────────────────────
-def project(pt_cm):
-    vec = np.array([pt_cm[0], pt_cm[1], 1.0], np.float32)
-    px  = H_px_from_cm @ vec
-    px /= px[2]
-    return int(px[0]), int(px[1])
+# ---------- mus -----------------------------------------------------------
+def mouse(e,x,y,_,__):
+    global stage,H_px_cm,H_cm_px,ready,front_hsv,back_hsv
+    if e!=cv2.EVENT_LBUTTONDOWN: return
+    if stage=="corners":
+        corners.append((x,y)); log.info("corner %d %s",len(corners),(x,y))
+        if len(corners)==4:
+            dst=np.float32([[0,0],[FIELD_W,0],[FIELD_W,FIELD_H],[0,FIELD_H]])
+            H_px_cm=cv2.getPerspectiveTransform(dst,np.float32(corners))
+            H_cm_px=np.linalg.inv(H_px_cm); ready=True; stage="front"
+            log.info("homografi ✔ – klik GRØN lap")
+    elif stage=="front":
+        hsv=cv2.cvtColor(last,cv2.COLOR_BGR2HSV); front_hsv=hsv[y,x]; stage="back"
+        log.info("front=%s – klik BLÅ lap",front_hsv)
+    elif stage=="back":
+        hsv=cv2.cvtColor(last,cv2.COLOR_BGR2HSV); back_hsv=hsv[y,x]; stage="track"
+        log.info("back=%s – ▶ tracking",back_hsv)
 
-def px_to_cm(pt_px):
-    if not homog_ready or H_cm_from_px is None:
-        return None
-    vec = np.array([pt_px[0], pt_px[1], 1.0], np.float32)
-    cm  = H_cm_from_px @ vec
-    cm /= cm[2]
-    return float(cm[0]), float(cm[1])
-
-def draw_field(img):
-    for x in range(0, FIELD_WIDTH_CM+1, GRID_SPACING_CM):
-        cv2.line(img, project((x,0)), project((x,FIELD_HEIGHT_CM)), (255,255,255),1)
-    for y in range(0, FIELD_HEIGHT_CM+1, GRID_SPACING_CM):
-        cv2.line(img, project((0,y)), project((FIELD_WIDTH_CM,y)), (255,255,255),1)
-    mid = FIELD_HEIGHT_CM/2
-    cv2.line(img, project((0,mid-GOAL_A_HEIGHT_CM/2)), project((0,mid+GOAL_A_HEIGHT_CM/2)), (255,0,0),4)
-    cv2.line(img, project((FIELD_WIDTH_CM,mid-GOAL_B_HEIGHT_CM/2)),
-                  project((FIELD_WIDTH_CM,mid+GOAL_B_HEIGHT_CM/2)), (0,255,0),4)
-
-def draw_clicks(img):
-    for p in field_corners:
-        cv2.circle(img, p, 5, (0,0,255), -1)
-
-def hsv_range(center):
-    h, s, v = map(int, center)      # cast til Python-int først
-    dh, ds, dv = BLOB_TOLER_HSV
-    low  = np.array([max(0,   h-dh),
-                     max(0,   s-ds),
-                     max(0,   v-dv)], dtype=np.uint8)
-    high = np.array([min(179, h+dh),
-                     min(255, s+ds),
-                     min(255, v+dv)], dtype=np.uint8)
-    return low, high
-
-
-# ─── mouse callback ───────────────────────────────────────────────────────
-def mouse_cb(ev,x,y,flags,param):
-    global stage, H_px_from_cm, H_cm_from_px, homog_ready, front_hsv, back_hsv
-    if ev != cv2.EVENT_LBUTTONDOWN:
-        return
-
-    if stage == "corners":
-        field_corners.append((x,y))
-        log.info("Corner %d gemt: (%d,%d)", len(field_corners), x, y)
-        if len(field_corners) == 4:
-            dst = np.float32([[0,0],[FIELD_WIDTH_CM,0],
-                              [FIELD_WIDTH_CM,FIELD_HEIGHT_CM],[0,FIELD_HEIGHT_CM]])
-            H_px_from_cm = cv2.getPerspectiveTransform(dst, np.float32(field_corners))
-            H_cm_from_px = np.linalg.inv(H_px_from_cm)
-            homog_ready  = True
-            stage = "front"
-            log.info("Homografi klar ✓ – klik GRØN front-lap")
-
-    elif stage == "front":
-        hsv = cv2.cvtColor(last_frame, cv2.COLOR_BGR2HSV)
-        front_hsv = hsv[y,x]; stage = "back"
-        log.info("Front farve = %s – klik BLÅ bag-lap", front_hsv)
-
-    elif stage == "back":
-        hsv = cv2.cvtColor(last_frame, cv2.COLOR_BGR2HSV)
-        back_hsv = hsv[y,x]; stage = "track"
-        log.info("Bag farve = %s – ▶ tracking starter", back_hsv)
-
-# ─── capture / process tråde ──────────────────────────────────────────────
-def grabber():
+# ---------- tråde ---------------------------------------------------------
+def grab():
     while not stop.is_set():
-        ret, f = cap.read()
-        if ret:
-            frame_Q.put(cv2.resize(f, (416,416)))
+        ret,f=cap.read()
+        if ret: Qin.put(cv2.resize(f,(416,416)))
 
-def processor():
-    global last_frame
+def proc():
+    global last
     while not stop.is_set():
-        if frame_Q.empty():
-            time.sleep(0.005); continue
-        frame = frame_Q.get()
-        last_frame = frame.copy()
+        if Qin.empty(): time.sleep(0.005); continue
+        frame=Qin.get(); last=frame.copy()
 
-        # Roboflow
-        try:
-            preds = model.predict(frame, confidence=60, overlap=20).json()
-        except Exception as e:
-            log.error("Model fejl: %s", e)
-            preds = {}
+        # -- Roboflow
+        try: preds=model.predict(frame,confidence=60,overlap=20).json()
+        except Exception as e: log.error("RF %s",e); preds={}
+        balls=[]
+        for p in preds.get('predictions',[]):
+            x,y,w,h=map(int,[p['x'],p['y'],p['width'],p['height']])
+            lab=p['class']; clean=lab.lower().replace(" ","")
+            col=(random.randrange(255),random.randrange(255),random.randrange(255))
+            cv2.rectangle(frame,(x-w//2,y-h//2),(x+w//2,y+h//2),col,2)
+            cv2.putText(frame,f"{lab}:{p['confidence']:.2f}",(x-w//2,y-h//2-8),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.5,col,2)
+            if clean in BALL_CLASSES: balls.append((x,y,lab))
 
-        for p in preds.get('predictions', []):
-            x,y,w,h = map(int, [p['x'],p['y'],p['width'],p['height']])
-            label_raw = p['class']
-            label_clean = label_raw.lower().replace(" ", "")
-            col = (random.randint(0,255), random.randint(0,255), random.randint(0,255))
+        # -- overlays
+        if ready:
+            for x in range(0,FIELD_W+1,GRID_STEP):
+                cv2.line(frame,project((x,0)),project((x,FIELD_H)),(255,255,255),1)
+            for y in range(0,FIELD_H+1,GRID_STEP):
+                cv2.line(frame,project((0,y)),project((FIELD_W,y)),(255,255,255),1)
+        for c in corners: cv2.circle(frame,c,5,(0,0,255),-1)
 
-            cv2.rectangle(frame, (x-w//2,y-h//2), (x+w//2,y+h//2), col, 2)
-            cv2.putText(frame, f"{label_raw}:{p['confidence']:.2f}",
-                        (x-w//2, y-h//2-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+        # -- robot-centroid + SEND xy ------------------------
+        if stage=="track" and front_hsv is not None and back_hsv is not None and balls:
+            hsv=cv2.cvtColor(last,cv2.COLOR_BGR2HSV)
+            cf=cv2.moments(cv2.inRange(hsv,*hsv_range(front_hsv)))
+            cb=cv2.moments(cv2.inRange(hsv,*hsv_range(back_hsv)))
+            if cf["m00"] and cb["m00"]:
+                rx,ry=int((cf["m10"]/cf["m00"]+cb["m10"]/cb["m00"])/2),\
+                      int((cf["m01"]/cf["m00"]+cb["m01"]/cb["m00"])/2)
+                bx,by,_=min(balls,key=lambda b:(b[0]-rx)**2+(b[1]-ry)**2)
+                cv2.circle(frame,(bx,by),6,(0,255,255),2)
+                ball_cm=px2cm((bx,by))
+                if ball_cm:
+                    ser.write(f"{ball_cm[0]:.1f};{ball_cm[1]:.1f}\n".encode())
+                    log.info("send xy %.1f %.1f",*ball_cm)
 
-            if label_clean in BALL_CLASSES:
-                pos_cm = px_to_cm((x,y))
-                if pos_cm:
-                    log.info("📍 %s ved (%.1f cm, %.1f cm)", label_raw, *pos_cm)
+        if not Qout.full(): Qout.put(frame)
 
-        # overlays
-        if homog_ready:
-            draw_field(frame)
-        draw_clicks(frame)
-
-        # robot-tracking (samme som før)
-        if stage == "track":
-            hsv = cv2.cvtColor(last_frame, cv2.COLOR_BGR2HSV)
-            fL,fU = hsv_range(front_hsv)
-            bL,bU = hsv_range(back_hsv)
-            mask_f = cv2.inRange(hsv, fL, fU)
-            mask_b = cv2.inRange(hsv, bL, bU)
-
-            def centroid(m):
-                M = cv2.moments(m)
-                return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])) \
-                       if M["m00"] > MASK_MIN_AREA else None
-
-            cf = centroid(mask_f); cb = centroid(mask_b)
-            if cf and cb:
-                cx,cy = (cf[0]+cb[0])//2, (cf[1]+cb[1])//2
-                cv2.circle(frame, cf, 4, (0,255,0), -1)
-                cv2.circle(frame, cb, 4, (255,0,0), -1)
-                cv2.circle(frame, (cx,cy), 4, (0,0,255), -1)
-                cv2.line(frame, (cx,cy), cf, (0,255,255), 2)
-
-        if not out_Q.full():
-            out_Q.put(frame)
-
-# ─── main-loop ────────────────────────────────────────────────────────────
-cv2.namedWindow("Live Object Detection")
-cv2.setMouseCallback("Live Object Detection", mouse_cb)
-
-threading.Thread(target=grabber, daemon=True).start()
-threading.Thread(target=processor, daemon=True).start()
-
-try:
-    while not stop.is_set():
-        if out_Q.empty():
-            time.sleep(0.005); continue
-        img = out_Q.get()
-        cv2.imshow("Live Object Detection", img)
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord('q'), 27):
-            stop.set()
-        elif key == ord('r'):
-            log.info("Nulstiller kalibrering + farver")
-            field_corners.clear()
-            homog_ready = False
-            stage = "corners"
-finally:
-    stop.set()
-    cap.release()
-    cv2.destroyAllWindows()
+# ---------- main ----------------------------------------------------------
+cv2.namedWindow("Live"); cv2.setMouseCallback("Live",mouse)
+threading.Thread(target=grab,daemon=True).start()
+threading.Thread(target=proc,daemon=True).start()
+while not stop.is_set():
+    if not Qout.empty(): cv2.imshow("Live",Qout.get())
+    if cv2.waitKey(1)&0xFF in (27,ord('q')): stop.set()
+cap.release(); cv2.destroyAllWindows()

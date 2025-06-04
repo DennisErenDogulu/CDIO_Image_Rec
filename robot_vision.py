@@ -2,38 +2,37 @@
 from pybricks.hubs import EV3Brick
 from pybricks.ev3devices import Motor
 from pybricks.parameters import Port
-from pybricks.robotics import DriveBase
-from pybricks.communication import UART
 from pybricks.tools import wait
+from pybricks.communication import UART
+from pybricks.robotics import DriveBase
+import math
 
-# ───────────────────────── hardware ───────────────────────
+WHEEL = 55.5   # mm
+AXLE  = 104    # mm
+
 ev3 = EV3Brick()
-left  = Motor(Port.B)
-right = Motor(Port.C)
-collector = Motor(Port.A)
-robot = DriveBase(left, right, wheel_diameter=55.5, axle_track=104)
+drv = DriveBase(Motor(Port.B), Motor(Port.C), wheel_diameter=WHEEL, axle_track=AXLE)
+uart = UART('serial')
+ev3.speaker.say("XY ready")
 
-uart = UART('serial')          # Bluetooth-SPP
+def go_to(x_cm, y_cm):
+    # antag robot starter på (0,0) vendt mod +X (juster selv efter behov)
+    dx, dy = x_cm, y_cm
+    dist = math.hypot(dx, dy)
+    angle = math.degrees(math.atan2(dy, dx))
+    drv.turn(angle)            # drej
+    drv.straight(dist*10)      # kør (cm→deg)
+    drv.straight(-30)          # ryk fri
 
-def drive_and_collect(turn_deg, dist_cm):
-    ev3.screen.print("TURN", turn_deg, "DIST", dist_cm)
-    robot.reset()
-    robot.turn(turn_deg)
-    robot.straight(dist_cm * 10)      # 1 cm ≈ 10 deg på standardhjul
-    collector.run_time(500, 800)      # saml bold
-    robot.straight(-30)               # træk dig fri
-
-# ───────────────────────── main loop ──────────────────────
-ev3.speaker.say("Ready")
-buf = ""
+buf=""
 while True:
     if uart.any():
         buf += uart.read().decode()
         if '\n' in buf:
-            line, buf = buf.split('\n',1)
+            ln, buf = buf.split('\n',1)
             try:
-                t, d = map(float, line.split(';'))
-                drive_and_collect(t, d)
+                x,y = map(float, ln.split(';'))
+                go_to(x, y)
             except ValueError:
-                ev3.screen.print("Bad line:", line)
+                ev3.screen.print("bad:", ln)
     wait(50)
