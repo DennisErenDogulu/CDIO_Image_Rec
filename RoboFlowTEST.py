@@ -11,9 +11,9 @@ from robot_connection.client_automated import send_path
 class RoboFlowGridTest:
     def __init__(self):
         # ✅ Initialize Roboflow
-        self.rf = Roboflow(api_key="7kMjalIwU9TqGmKM0g4i")
-        self.project = self.rf.workspace("pingpong-fafrv").project("pingpongdetector-rqboj")
-        self.model = self.project.version(2).model
+        self.rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
+        self.project = rf.workspace("cdio-nczdp").project("cdio-golfbot2025")
+        self.model = project.version(10).model
 
         self.class_colors = {}
 
