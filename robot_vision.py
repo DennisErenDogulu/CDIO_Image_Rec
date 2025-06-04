@@ -19,9 +19,9 @@ def drive_and_collect(turn_deg, dist_cm):
     ev3.screen.print("TURN", turn_deg, "DIST", dist_cm)
     robot.reset()
     robot.turn(turn_deg)
-    robot.straight(dist_cm * 10)      # 1 cm ≈ 10 deg på standardhjul
-    collector.run_time(500, 800)      # saml bold
-    robot.straight(-30)               # træk dig fri
+    robot.straight(dist_cm * 10)      # 1 cm ≈ 10 deg on a standard 55.5 mm wheel
+    collector.run_time(500, 800)      # spin intake for 0.8 s
+    robot.straight(-30)               # back up 30 cm
 
 # ───────────────────────── main loop ──────────────────────
 ev3.speaker.say("Ready")
@@ -30,7 +30,7 @@ while True:
     if uart.any():
         buf += uart.read().decode()
         if '\n' in buf:
-            line, buf = buf.split('\n',1)
+            line, buf = buf.split('\n', 1)
             try:
                 t, d = map(float, line.split(';'))
                 drive_and_collect(t, d)
