@@ -5,6 +5,15 @@ import time
 import logging
 from queue import Queue
 from roboflow import Roboflow
+#!/usr/bin/env python3
+"""
+Start:      python vision_send_xy.py COM6      # ← Windows-porten
+Udvikling:  python vision_send_xy.py none      # kun log, ingen send
+"""
+import sys, os, cv2, numpy as np, math, time, random, logging, threading, serial
+from queue import Queue
+from typing import List, Tuple
+from roboflow import Roboflow
 
 # ✅ Roboflow Setup
 rf = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
