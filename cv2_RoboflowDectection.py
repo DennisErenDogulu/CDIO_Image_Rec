@@ -17,7 +17,7 @@ BALL_CLASSES = ("whitetabletennisballs", "orangetabletennisballs")
 
 # ─── Roboflow ─────────────────────────────────────────────────────────────
 rf    = Roboflow(api_key="qJTLU5ku2vpBGQUwjBx2")
-model = rf.workspace("cdio-nczdp").project("cdio-golfbot2025").version(10).model
+model = rf.workspace("cdio-nczdp").project("cdio-golfbot2025").version(12).model
 
 # ─── OpenCV setup ─────────────────────────────────────────────────────────
 os.environ['OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS'] = '0'
