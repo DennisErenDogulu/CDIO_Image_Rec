@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-import sys, cv2, os, math, time, random, json, socket, threading, logging, numpy as np, heapq
+import sys
+import cv2
+import os
+import math
+import time
+import random
+import json
+import socket
+import threading
+import logging
+import numpy as np
+import heapq
 from queue import Queue
 from typing import List, Tuple, Optional
 # Roboflow
@@ -33,13 +44,11 @@ IGNORED_AREA = {
 # Startpunkt (cm)
 START_POINT_CM = (20.0, 20.0)
 
-# Mulige mål (A og B) i cm‐koordinater (her defineret som en liste af grid‐celler langs kanten)
-GOAL_RANGE = {
-    # Målet A er ved højre kant (x = REAL_WIDTH_CM), fra y = 56 til 64 cm
-    'A': [(REAL_WIDTH_CM, y_cm) for y_cm in range(56, 65)],
-    # Målet B kunne ligge langs en anden kant (eksempelvis venstre kant). Udkommenter / tilpas hvis I vil.
-    'B': [(x_cm, REAL_HEIGHT_CM) for x_cm in range(80, 91)]
-}
+# Global variabel for, hvor det lille mål (A) placeres initialt: "left" eller "right"
+SMALL_GOAL_SIDE = "left"   # Ændr til "right" hvis I vil starte med det lille mål på højre kant
+
+# Hvor langt (i cm) robotten stopper før mål‐kanten (så den ikke kører ind i selve målet)
+GOAL_OFFSET_CM = 10
 
 # EV3 (TCP)
 EV3_IP   = "172.20.10.6"
@@ -111,9 +120,9 @@ class RoboFlowGridTest:
         self.class_colors = {}
 
         # Video capture (OpenCV)
-        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
-            logger.error("Kunne ikke åbne kamera #%d", 1)
+            logger.error("Kunne ikke åbne kamera #%d", 0)
             raise SystemExit(1)
         # Bredde/højde, hvis I vil bruge fuld HD. 
         # Bemærk: Roboflow‐model tager 416 × 416 som input, så vi skalerer alligevel.
@@ -146,9 +155,14 @@ class RoboFlowGridTest:
         # Fast startpunkt (i cm)
         self.start_point_cm = START_POINT_CM
 
-        # Mulige mål‐områder (i cm)
-        self.goal_range = GOAL_RANGE.copy()
-        self.selected_goal = 'A'    # Standard mål “A”
+        # Sæt, hvor det lille mål skal være (venstre/højre)
+        self.small_goal_side = SMALL_GOAL_SIDE.lower()  # "left" eller "right"
+
+        # Byg dynamisk goal_range baseret på small_goal_side
+        self.goal_range = self._build_goal_ranges()
+
+        # Standard valgt mål label ('A' er det lille mål, 'B' det store)
+        self.selected_goal = 'A'
         self.placing_goal  = False  # Hvis I vil tillade at klikke og ændre mål
 
         # Ignoreret rektangel i cm
@@ -156,6 +170,45 @@ class RoboFlowGridTest:
 
         # Fuld grid‐rute (list af grid‐celler), beregnet i draw_full_route()
         self.full_grid_path = []
+
+
+    def _build_goal_ranges(self) -> dict:
+        """
+        Returnerer en dict med to nøgler: 'A' (det lille goal) og 'B' (det store goal),
+        hvor placeringen og højde afhænger af self.small_goal_side.
+
+        - Mål A (lille mål) er 80 mm = 8 cm højt, centreret vertikalt omkring 60 cm.
+          Y‐intervallet for A: [60cm - 4cm, 60cm + 4cm] = [56, 64].
+        - Mål B (stort mål) er 200 mm = 20 cm højt, centreret vertikalt omkring 60 cm.
+          Y‐intervallet for B: [60cm - 10cm, 60cm + 10cm] = [50, 70].
+
+        Hvis small_goal_side == "left", ligger mål A langs venstre kant (x=0) og mål B langs højre kant (x=REAL_WIDTH_CM).
+        Hvis small_goal_side == "right", ligger mål A langs højre kant (x=REAL_WIDTH_CM) og mål B langs venstre kant (x=0).
+        """
+        ranges = {}
+
+        # Y‐interval (cm) for lille mål (A)
+        y_min_A = 60 - 4  # 56
+        y_max_A = 60 + 4  # 64
+
+        # Y‐interval (cm) for stort mål (B)
+        y_min_B = 60 - 10  # 50
+        y_max_B = 60 + 10  # 70
+
+        if self.small_goal_side == "left":
+            # Mål A = lille mål i venstre kant (x = 0)
+            ranges['A'] = [(0, y_cm) for y_cm in range(y_min_A, y_max_A + 1)]
+            # Mål B = stort mål i højre kant (x = REAL_WIDTH_CM)
+            ranges['B'] = [(self.real_width_cm, y_cm) for y_cm in range(y_min_B, y_max_B + 1)]
+        else:
+            # small_goal_side == "right"
+            # Mål A = lille mål i højre kant (x = REAL_WIDTH_CM)
+            ranges['A'] = [(self.real_width_cm, y_cm) for y_cm in range(y_min_A, y_max_A + 1)]
+            # Mål B = stort mål i venstre kant (x = 0)
+            ranges['B'] = [(0, y_cm) for y_cm in range(y_min_B, y_max_B + 1)]
+
+        return ranges
+
 
     # ────── Homografi & klik ──────
 
@@ -177,7 +230,7 @@ class RoboFlowGridTest:
                 logger.info("Corner %d sat: (%d, %d)", len(self.calibration_points), x, y)
 
             if len(self.calibration_points) == 4:
-                # Byg matrices til homografi Baseret på (cm) → (px)
+                # Byg matrices til homografi baseret på (cm) → (px)
                 dst_pts = np.array([
                     [0, 0],
                     [self.real_width_cm, 0],
@@ -205,6 +258,7 @@ class RoboFlowGridTest:
                         self.obstacles.add((gx, gy))
                         logger.info("🚧 Tilføjede obstacle ved (%d, %d)", gx, gy)
 
+
     def _mark_center_obstacle(self):
         """
         Fyld en 20 cm × 20 cm firkant i midten som blocking obstacles.
@@ -217,7 +271,8 @@ class RoboFlowGridTest:
             for y_cm in range(int(cy - half), int(cy + half), self.grid_spacing_cm):
                 gx, gy = self.cm_to_grid_coords(x_cm, y_cm)
                 self.obstacles.add((gx, gy))
-        logger.info("Center (%d×%d cm) markeret som obstacle.", 2*half, 2*half)
+        logger.info("Center (%d×%d cm) markeret som obstacle.", 2 * half, 2 * half)
+
 
     def _ensure_outer_edges_walkable(self):
         """
@@ -234,6 +289,7 @@ class RoboFlowGridTest:
             self.obstacles.discard((0, gy))
             self.obstacles.discard((max_gx, gy))
         logger.info("✅ Ydre kanter ryddet for obstacles.")
+
 
     # ────── Tegn grid, obstacles, mål, start ──────
 
@@ -273,7 +329,7 @@ class RoboFlowGridTest:
             pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0]
             cv2.circle(overlay, tuple(pt_px.astype(int)), 6, (0, 0, 255), -1)
 
-        # Tegn mål‐områder (grønne cirkler)
+        # Tegn mål‐områder (grønne cirkler) med den dynamiske goal_range:
         for label, pts in self.goal_range.items():
             for (x_cm, y_cm) in pts:
                 xy_cm = np.array([[[x_cm, y_cm]]], dtype="float32")
@@ -298,6 +354,7 @@ class RoboFlowGridTest:
 
         return overlay
 
+
     # ────── Pixel ↔ cm ↔ grid‐konvertering ──────
 
     def pixel_to_cm(self, px: int, py: int) -> Optional[Tuple[float, float]]:
@@ -314,6 +371,7 @@ class RoboFlowGridTest:
         y_cm_flipped = self.real_height_cm - y_cm
         return (x_cm, y_cm_flipped)
 
+
     def cm_to_grid_coords(self, x_cm: float, y_cm: float) -> Tuple[int,int]:
         """
         Konverter (x_cm, y_cm) til (gx, gy) som heltal (grid‐celler). 
@@ -323,14 +381,15 @@ class RoboFlowGridTest:
         gy = int(y_cm // self.grid_spacing_cm)
         return (gx, gy)
 
+
     # ────── Tegn fuld rute på billedet ──────
 
     def draw_full_route(self, frame: np.ndarray, ball_positions: List[Tuple[float,float,str]]) -> np.ndarray:
         """
         Tegn ruten:
-         1) Beregn “route” i cm (start → hver non-orange bold → orange bold → mål).
+         1) Beregn “route” i cm (start → hver non-orange bold → orange bold → mål‐offset).
          2) For hvert par i denne cm‐rute, kør A* på grid → fuld liste af grid‐celler (self.full_grid_path).
-         3) Tegn streger (gule) langs alle grid‐celler i sellest grid‐rute.
+         3) Tegn streger (gule) langs alle grid‐celler i selve grid‐ruten.
          4) Skriv “Total Path: X cm to Goal Y”.
         Returnerer overlayet.
         """
@@ -365,17 +424,33 @@ class RoboFlowGridTest:
             route_cm.append((orange_ball[0], orange_ball[1]))
             current = (orange_ball[0], orange_ball[1])
 
-        # Vælg nærmeste mål‐celle i selected_goal
+        # Beregn “target‐point” for målet: 
+        # – Skal være i midten (vertikalt) af det valgte mål, 
+        # – og GOAL_OFFSET_CM væk fra selve målkanten (så robotten ikke kører ind i målet).
         goal_candidates = self.goal_range.get(self.selected_goal, [])
         if not goal_candidates:
             logger.warning("No goal candidates for %s", self.selected_goal)
             return frame
 
-        # Find den mål‐celle, der er tættest til current
-        best_goal_cm = min(
-            goal_candidates,
-            key=lambda g: heuristic(self.cm_to_grid_coords(*current), self.cm_to_grid_coords(g[0], g[1]))
-        )
+        # Midten i y‐retningen af det aktuelle mål‐interval
+        y_vals = [y for (_, y) in goal_candidates]
+        y_mid = sum(y_vals) / len(y_vals)
+
+        # Bestem om det valgte mål sidder til venstre eller højre
+        # Hvis selected_goal == 'A', er A’s side = self.small_goal_side
+        # Hvis selected_goal == 'B', er B’s side modsat self.small_goal_side
+        if self.selected_goal == 'A':
+            is_left = (self.small_goal_side == "left")
+        else:
+            is_left = (self.small_goal_side != "left")
+
+        # Beregn x‐koordinat med offset
+        if is_left:
+            x_target = GOAL_OFFSET_CM  # lidt væk fra venstre kant
+        else:
+            x_target = self.real_width_cm - GOAL_OFFSET_CM  # lidt væk fra højre kant
+
+        best_goal_cm = (x_target, y_mid)
         route_cm.append(best_goal_cm)
 
         # Konverter “route_cm” til en fuld liste af grid‐celler vha. A*
@@ -394,7 +469,7 @@ class RoboFlowGridTest:
 
             self.full_grid_path.extend(segment)
 
-        # Tegn hele mall grid‐ruten som gul streg
+        # Tegn hele mappede grid‐rute som gul streg
         overlay = frame.copy()
         path_color = (0, 255, 255)
         total_cm   = 0
@@ -422,6 +497,7 @@ class RoboFlowGridTest:
 
         return overlay
 
+
     # ────── Tråd: Capture frames ──────
 
     def capture_frames(self):
@@ -438,6 +514,7 @@ class RoboFlowGridTest:
             if self.frame_count % self.skip_frames == 0:
                 if not self.frame_queue.full():
                     self.frame_queue.put(frame)
+
 
     # ────── Tråd: Process frames ──────
 
@@ -494,12 +571,13 @@ class RoboFlowGridTest:
                 # Tegn grid & obstacles & start & mål
                 frame_with_grid = self.draw_metric_grid(original)
 
-                # Tegn rute fra start → bolde → mål
+                # Tegn rute fra start → bolde → mål‐offset
                 frame_with_route = self.draw_full_route(frame_with_grid, self.ball_positions_cm)
 
                 # Put resultat i output_queue (til display)
                 if not self.output_queue.full():
                     self.output_queue.put(frame_with_route)
+
 
     # ────── Tråd: Display frames & brugerinput ──────
 
@@ -510,6 +588,7 @@ class RoboFlowGridTest:
          • 'q': Quit
          • '1': Vælg målet = 'A'
          • '2': Vælg målet = 'B'
+         • '3': Toggle: lille mål (A) skifte mellem venstre/højre kant
          • 's': Send den fulde grid‐rute til EV3 (hvis beregnet)
         """
         cv2.namedWindow("Live Object Detection")
@@ -530,15 +609,23 @@ class RoboFlowGridTest:
             elif key == ord('2'):
                 self.selected_goal = 'B'
                 logger.info("✅ Selected Goal B")
+            elif key == ord('3'):
+                # Toggle: lille mål til venstre ↔ lille mål til højre
+                self.small_goal_side = "right" if self.small_goal_side == "left" else "left"
+                self.goal_range = self._build_goal_ranges()
+                logger.info(f"🔄 Skiftede small_goal_side til {self.small_goal_side!r}")
             elif key == ord('s'):
                 # Send path til EV3, hvis vi har en rute
                 if self.full_grid_path:
-                    # heading: kan tilpasses efter hvordan I vil dreje EV3 til startretning
                     heading = EV3_HEADING_DEFAULT
                     send_path(EV3_IP, EV3_PORT, self.full_grid_path, heading)
                     logger.info("📨 Path sendt: %s", self.full_grid_path)
                 else:
                     logger.warning("⚠️ Ingen rute beregnet endnu til at sende.")
+
+        # Når 'q' trykkes, afsluttes
+        cv2.destroyAllWindows()
+
 
     # ────── Public metode: start tråde ──────
 
