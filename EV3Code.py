@@ -1,112 +1,125 @@
 #!/usr/bin/env python3
 """
-EV3dev TCP Server Script incorporating Pybricks-style drive_and_collect
+tcp_server.py  –  EV3dev TCP Server (Python 3.5-kompatibel)
 
-Listens on port 12345 for a JSON‐encoded payload containing:
-    {
-      "path": [[gx1, gy1], [gx2, gy2], …],
-      "heading": "N"  # one of "N", "E", "S", "W"
-    }
-For each consecutive pair of grid cells, this script:
-    1. Turns the robot to face the next cell
-    2. Drives forward to that cell
-    3. Runs the collector motor for 0.8 s
-    4. Backs up 30 cm
-After finishing the entire path, it responds with "DONE\n" and closes the connection.
+Hver indkommende TCP-forbindelse skal sende én enkelt JSON-linje (`\n`-termineret) 
+i ét af to formater:
+
+  A) {"turn": <antal grader>, "drive": <antal cm>}
+     → Robotten drejer ‘turn’ grader og kører ‘drive’ cm frem, aktiverer collector, 
+       bakker 30 cm, og svarer “OK\n”.
+
+  B) {"path": [[gx1, gy1], [gx2, gy2], …], "heading": "<E|N|S|W>"}
+     → Robotten følger et grid <optionelt multi-hop>:
+          1. Drej så du peger mod næste grid-celle.
+          2. Kør distancen til næste celle (i cm), aktiver collector, bak 30 cm.
+          3. Gentag for hver overgang.
+       Til sidst svarer den “DONE\n”.
+
+Ved ugyldigt eller ufuldstændigt JSON svarer den “ERROR\n”.
 """
 
 import socket
 import threading
 import json
 import math
-import time
 
-from ev3dev2.motor import LargeMotor, MediumMotor, OUTPUT_B, OUTPUT_C, OUTPUT_A, SpeedPercent
-from ev3dev2.robotics import DriveBase
-from ev3dev2.display import Display
+from ev3dev2.motor    import OUTPUT_B, OUTPUT_C, OUTPUT_A, MediumMotor
+from ev3dev2.motor    import MoveDifferential, SpeedRPM
+from ev3dev2.wheel    import EV3Tire
+from ev3dev2.display  import Display
 
-# ───────── Hardware Setup ─────────
-# Ports: B = left wheel, C = right wheel, A = collector
-left_motor      = LargeMotor(OUTPUT_B)
-right_motor     = LargeMotor(OUTPUT_C)
-collector_motor = MediumMotor(OUTPUT_A)
+# ───────── Hardware-opsætning ─────────
+AXLE_TRACK_MM = 104                    # Akselafstand (mm)
+mdiff         = MoveDifferential(
+    OUTPUT_B, OUTPUT_C, EV3Tire, AXLE_TRACK_MM
+)
+collector     = MediumMotor(OUTPUT_A)   # Collector-motor
+display       = Display()              # EV3-skærm
 
-# Create a DriveBase so we can call .turn() and .straight()
-WHEEL_DIAM_CM = 5.55   # 55.5 mm diameter
-AXLE_TRACK_CM = 10.4   # 104 mm axle track
-robot_drive = DriveBase(left_motor, right_motor, wheel_diameter=WHEEL_DIAM_CM, axle_track=AXLE_TRACK_CM)
+# Global state
+robot_heading_deg = 0.0                # Aktuel robot-heading i grader (0° = +X, CCW positiv)
 
-# EV3 screen (for on-screen feedback)
-display = Display()
 
-# Grid spacing in cm (must match your PC’s grid)
-GRID_SPACING_CM = 2
-
-# Global heading (degrees from +X, CCW positive)
-robot_heading_deg = 0.0
-
-# ───────── Helper Functions ─────────
+# ───────── Hjælpefunktioner ─────────
 
 def grid_to_cm(gx, gy):
     """
-    Convert grid coordinates (gx, gy) to the real-world center (x_cm, y_cm).
-    Each cell is GRID_SPACING_CM × GRID_SPACING_CM, so center is offset by half a cell.
+    Konverter grid-koordinat (gx, gy) til (x_cm, y_cm) – center af grid-celle.
+    Hver celle er GRID_SPACING_CM × GRID_SPACING_CM.
     """
-    x_cm = gx * GRID_SPACING_CM + GRID_SPACING_CM / 2.0
-    y_cm = gy * GRID_SPACING_CM + GRID_SPACING_CM / 2.0
+    GRID_SPACING_CM = 2
+    x_cm = (gx + 0.5) * GRID_SPACING_CM
+    y_cm = (gy + 0.5) * GRID_SPACING_CM
     return x_cm, y_cm
+
 
 def compute_turn_angle(dx, dy, current_heading):
     """
-    Given a vector (dx, dy) in cm, and the robot’s current heading (degrees),
-    return the smallest signed angular change (in degrees) needed so the robot
-    faces the vector. 0° = +X axis, positive is CCW.
+    Beregn den mindste, signerede vinkel (i grader), som robotten skal dreje,
+    for at pege i retning af vektoren (dx, dy). 0° svarer til +X-aksen, positiv retning CCW.
     """
-    theta_rad = math.atan2(dy, dx)
-    theta_deg = math.degrees(theta_rad)
-    delta = (theta_deg - current_heading + 180.0) % 360.0 - 180.0
+    theta_deg = math.degrees(math.atan2(dy, dx))
+    delta     = (theta_deg - current_heading + 180.0) % 360.0 - 180.0
     return delta
+
 
 def drive_and_collect(turn_deg, dist_cm):
     """
-    Turn the robot by turn_deg degrees, drive forward dist_cm cm,
-    run the collector for 0.8 s, then back up 30 cm.
-    Displays status on the EV3 screen.
+    Udfør én “drej og kør”-sekvens:
+      1. Drej med turn_deg grader (positiv = CCW).
+      2. Kør dist_cm cm fremad.
+      3. Aktiver collector-motor i 0.8 s (50% hastighed).
+      4. Bak 30 cm (med samme hastighed).
+    Skriver status til EV3-skærmen vha. text_pixels().
     """
-    # Display on EV3 screen
+    # Vis på EV3-skærmen
     display.clear()
-    display.text_box(f"TURN {turn_deg:.1f}°", font='courB24', x=10, y=10)
-    display.text_box(f"DIST {dist_cm:.1f}cm", font='courB24', x=10, y=50)
+    display.text_pixels(
+        "TURN {:.1f}\u00B0".format(turn_deg),
+        x=10, y=10, text_color='white'
+    )
+    display.text_pixels(
+        "DRIVE {:.1f} cm".format(dist_cm),
+        x=10, y=40, text_color='white'
+    )
     display.update()
 
-    # Turn in place
-    robot_drive.turn(turn_deg)
+    # 1) Drej
+    mdiff.turn_degrees(SpeedRPM(40), turn_deg)
 
-    # Drive forward dist_cm (DriveBase expects cm directly)
-    robot_drive.straight(dist_cm)
+    # 2) Kør frem (cm → mm)
+    mdiff.on_for_distance(SpeedRPM(40), dist_cm * 10)
 
-    # Run collector for 0.8 s (800 ms)
-    collector_motor.on_for_seconds(speed=500, seconds=0.8)
+    # 3) Aktiver collector i 0.8 s
+    collector.on_for_seconds(50, 0.8)
 
-    # Back up 30 cm
-    robot_drive.straight(-30)
+    # 4) Bak 30 cm (→ 300 mm)
+    mdiff.on_for_distance(SpeedRPM(40), -300)
 
-    # Clear screen when done
+    # Ryd skærmen igen
     display.clear()
     display.update()
 
-# ───────── Client Handler ─────────
+
+# ───────── Client-handler ─────────
 
 def handle_client(conn, addr):
+    """
+    Kører i en separat tråd for hver ny forbindelse.
+    Modtager præcis én \n-termineret JSON-linje og prøver at behandle den
+    som enten kort “turn/drive” eller længere “path/heading”.
+    Sender tilbage “OK\n” eller “DONE\n” ved succes, ellers “ERROR\n”.
+    """
     global robot_heading_deg
-    print(f"[TCP Server] Client connected: {addr}")
+    print("[TCP Server] Client connected: {}".format(addr))
 
-    # Read exactly one JSON object (terminated by newline)
+    # 1) Læs én linje (slutter ved '\n')
     data_buffer = ""
     while True:
         chunk = conn.recv(1024)
         if not chunk:
-            print("[TCP Server] Client disconnected before sending data.")
+            print("[TCP Server] Client {} disconnected før data.".format(addr))
             conn.close()
             return
         data_buffer += chunk.decode("utf-8")
@@ -114,63 +127,86 @@ def handle_client(conn, addr):
             json_str, _ = data_buffer.split("\n", 1)
             break
 
-    # Parse JSON
+    # 2) Parse JSON
     try:
         request = json.loads(json_str)
+
+        # 2A) Hvis vi har "turn" + "drive" → kort kommando
+        if "turn" in request and "drive" in request:
+            turn_val  = float(request["turn"])
+            drive_val = float(request["drive"])
+            drive_and_collect(turn_val, drive_val)
+            conn.sendall(b"OK\n")
+            print("[TCP Server] turn/drive udført")
+            conn.close()
+            return
+
+        # 2B) Ellers hent path + heading
         path    = request.get("path", [])
-        heading = request.get("heading", "E")
+        heading = request.get("heading", "E").upper()
+
     except Exception as e:
-        print(f"[TCP Server] JSON parse error: {e}")
+        print("[TCP Server] JSON parse error: {}".format(e))
         conn.sendall(b"ERROR\n")
         conn.close()
         return
 
-    # Map heading letter to degrees
+    # 3) Hvis path har færre end 2 punkter, gør ingenting
+    if len(path) < 2:
+        conn.sendall(b"DONE\n")
+        print("[TCP Server] Tomt eller enkelt-punkts path – DONE uden bevægelse.")
+        conn.close()
+        return
+
+    # 4) Konverter heading-bogstav til grader
     heading_map = {
         "E": 0.0,
         "N": 90.0,
         "W": 180.0,
-        "S": -90.0,
+        "S": -90.0
     }
-    robot_heading_deg = heading_map.get(heading.upper(), 0.0)
-    print(f"[TCP Server] Received path: {path}, initial heading: {robot_heading_deg}°")
+    robot_heading_deg = heading_map.get(heading, 0.0)
+    print("[TCP Server] Received path: {}, initial heading: {}°"
+          .format(path, robot_heading_deg))
 
-    # Iterate through consecutive grid cells
+    # 5) Følg path-parrene
     for i in range(len(path) - 1):
         gx1, gy1 = path[i]
         gx2, gy2 = path[i + 1]
+
         x1_cm, y1_cm = grid_to_cm(gx1, gy1)
         x2_cm, y2_cm = grid_to_cm(gx2, gy2)
 
         dx = x2_cm - x1_cm
         dy = y2_cm - y1_cm
 
-        # Compute turn angle and perform turn
+        # Drej mod ny vinkel
         delta_deg = compute_turn_angle(dx, dy, robot_heading_deg)
-        drive_and_collect(delta_deg, 0)  # turn first (distance=0)
+        drive_and_collect(delta_deg, 0)
         robot_heading_deg = (robot_heading_deg + delta_deg) % 360.0
 
-        # Drive straight the required distance
+        # Kør frem, aktiver collector, bak 30 cm
         distance_cm = math.hypot(dx, dy)
-        drive_and_collect(0, distance_cm)  # drive forward, then collect & back
+        drive_and_collect(0, distance_cm)
 
-    # Entire path completed
+    # 6) Udført – send DONE tilbage
     conn.sendall(b"DONE\n")
     print("[TCP Server] Path execution complete; sent DONE.")
     conn.close()
-    print(f"[TCP Server] Client {addr} disconnected.")
+    print("[TCP Server] Client {} disconnected.".format(addr))
 
-# ───────── Main Server Loop ─────────
+
+# ───────── Main-serverloop ─────────
 
 def main():
-    HOST = ""        # Listen on all interfaces
-    PORT = 12345     # Must match the PC’s send_path port
+    HOST = ""      # Lyt på alle interfaces
+    PORT = 12345   # Skal matche PC-klientens port
 
-    print(f"[TCP Server] Starting on port {PORT} …")
+    print("[TCP Server] Starting on port {} …".format(PORT))
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.bind((HOST, PORT))
     server_sock.listen(1)
-    print(f"[TCP Server] Listening for incoming connections on port {PORT}…")
+    print("[TCP Server] Listening for incoming connections on port {}…".format(PORT))
 
     try:
         while True:
@@ -185,6 +221,7 @@ def main():
         print("\n[TCP Server] Shutting down…")
     finally:
         server_sock.close()
+
 
 if __name__ == "__main__":
     main()
