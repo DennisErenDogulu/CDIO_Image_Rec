@@ -26,14 +26,16 @@ import math
 
 from ev3dev2.motor    import OUTPUT_B, OUTPUT_C, OUTPUT_A, MediumMotor
 from ev3dev2.motor    import MoveDifferential, SpeedRPM
-from ev3dev2.wheel    import EV3Tire
+from ev3dev2.wheel    import Wheel
 from ev3dev2.display  import Display
 
 # ───────── Hardware-opsætning ─────────
-AXLE_TRACK_MM = 104                    # Akselafstand (mm)
-mdiff         = MoveDifferential(
-    OUTPUT_B, OUTPUT_C, EV3Tire, AXLE_TRACK_MM
-)
+AXLE_TRACK_MM = 160   
+WHEEL_DIAM_MM  = 80            
+
+mdiff = MoveDifferential(OUTPUT_B, OUTPUT_C, 
+                         Wheel(diameter_mm=WHEEL_DIAM_MM), 
+                         AXLE_TRACK_MM)
 collector     = MediumMotor(OUTPUT_A)   # Collector-motor
 display       = Display()              # EV3-skærm
 
