@@ -120,9 +120,9 @@ class RoboFlowGridTest:
         self.class_colors = {}
 
         # Video capture (OpenCV)
-        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
-            logger.error("Kunne ikke åbne kamera #%d", 0)
+            logger.error("Kunne ikke åbne kamera #%d", 1)
             raise SystemExit(1)
         # Bredde/højde, hvis I vil bruge fuld HD. 
         # Bemærk: Roboflow‐model tager 416 × 416 som input, så vi skalerer alligevel.
