@@ -30,19 +30,31 @@ from ev3dev2.wheel    import Wheel
 from ev3dev2.display  import Display
 
 # ───────── Hardware-opsætning ─────────
-AXLE_TRACK_MM = 160   
-WHEEL_DIAM_MM  = 80            
+AXLE_TRACK_MM   = 160    # Akselafstand i mm
+WHEEL_DIAM_MM   = 80     # Hjuldiameter i mm
+WHEEL_WIDTH_MM  = 16     # Hjulbredde i mm (indsæt den faktiske bredde på dine hjul)
 
-mdiff = MoveDifferential(OUTPUT_B, OUTPUT_C, 
-                         Wheel(diameter_mm=WHEEL_DIAM_MM), 
-                         AXLE_TRACK_MM)
-collector     = MediumMotor(OUTPUT_A)   # Collector-motor
-display       = Display()              # EV3-skærm
+# Opret en lille Wheel-subklasse, så MoveDifferential kan kalde MyWheel()
+class MyWheel(Wheel):
+    def __init__(self):
+        super().__init__(diameter_mm=WHEEL_DIAM_MM,
+                         width_mm=WHEEL_WIDTH_MM)
+
+# MoveDifferential forventer et "wheel_class", altså en callable der giver et Wheel-objekt
+mdiff = MoveDifferential(
+    OUTPUT_B,
+    OUTPUT_C,
+    MyWheel,          # Når mdiff initialiseres, kalder den MyWheel() for at få et Wheel
+    AXLE_TRACK_MM
+)
+
+collector = MediumMotor(OUTPUT_A)   # Collector-motor
+display   = Display()              # EV3-skærm
 
 # Global state
-robot_heading_deg = 0.0                # Aktuel robot-heading i grader (0° = +X, CCW positiv)
+robot_heading_deg = 0.0             # Aktuel robot-heading i grader (0° = +X, CCW positiv)
 
-APPROACH_DIST_CM = 5
+
 # ───────── Hjælpefunktioner ─────────
 
 def grid_to_cm(gx, gy):
@@ -66,66 +78,43 @@ def compute_turn_angle(dx, dy, current_heading):
     return delta
 
 
-def drive_and_collect(turn_deg, dist_cm, slow_approach=False):
+def drive_and_collect(turn_deg, dist_cm):
     """
-    Udfør én “drej og kør”-sekvens, men hvis slow_approach=True,
-    så deles fremadkørslen op i to faser:
-      1) Kør (dist_cm - APPROACH_DIST_CM) cm ved normal speed (uden collector).
-      2) Tænd collectoren, kør APPROACH_DIST_CM cm ved lav speed.
-    Sluk collectoren, og bak 30 cm til sidst.
-    
-    Hvis slow_approach=False: som før – kør hele dist_cm med SpeedRPM(40),
-    tænd collector i præcis 0.8 s, bak 30 cm.
+    Udfør én “drej og kør”-sekvens:
+      1. Drej med turn_deg grader (positiv = CCW).
+      2. Kør dist_cm cm fremad.
+      3. Aktiver collector-motor i 0.8 s (50% hastighed).
+      4. Bak 30 cm (med samme hastighed).
+    Skriver status til EV3-skærmen vha. text_pixels().
     """
     # Vis på EV3-skærmen
     display.clear()
-    display.text_pixels(f"TURN {turn_deg:.1f}\u00B0",
-                        x=10, y=10, text_color='white')
-    display.text_pixels(f"DRIVE {dist_cm:.1f} cm",
-                        x=10, y=40, text_color='white')
-    if slow_approach:
-        display.text_pixels(f"(SLOW APPROACH)",
-                            x=10, y=70, text_color='white')
+    display.text_pixels(
+        "TURN {:.1f}\u00B0".format(turn_deg),
+        x=10, y=10, text_color='white'
+    )
+    display.text_pixels(
+        "DRIVE {:.1f} cm".format(dist_cm),
+        x=10, y=40, text_color='white'
+    )
     display.update()
 
-    # 1) Drej altid med SpeedRPM(40)
+    # 1) Drej
     mdiff.turn_degrees(SpeedRPM(40), turn_deg)
 
-    # 2) Hvis distancen er 0 (kun drej), så gør ikke noget med fremkørsel/collector/bak
-    if dist_cm <= 0:
-        display.clear()
-        display.update()
-        return
+    # 2) Kør frem (cm → mm)
+    mdiff.on_for_distance(SpeedRPM(40), dist_cm * 10)
 
-    if not slow_approach or dist_cm <= APPROACH_DIST_CM:
-        # ─────────────── Standard-opførsel ───────────────
-        # Kør hele distancen med SpeedRPM(40), tænd collector i 0.8 s, bak 30 cm.
-        mdiff.on_for_distance(SpeedRPM(40), dist_cm * 10)
-        collector.on_for_seconds(50, 0.8)
-        mdiff.on_for_distance(SpeedRPM(40), -300)
-    else:
-        # ─────────────── Slow-approach-opførsel ───────────────
-        fast_dist  = dist_cm - APPROACH_DIST_CM
-        slow_dist  = APPROACH_DIST_CM
+    # 3) Aktiver collector i 0.8 s
+    collector.on_for_seconds(50, 0.8)
 
-        # 2A) Kør hurtig del uden collector
-        mdiff.on_for_distance(SpeedRPM(40), fast_dist * 10)
+    # 4) Bak 30 cm (→ 300 mm)
+    mdiff.on_for_distance(SpeedRPM(40), -300)
 
-        # 2B) Start collector (indtil videre kørende “on”)
-        collector.on(50)  # 50% power – kør indsamler hele slow-fasen
-        
-        # 2C) Kør den sidste “slowing” distance ved lavere fart
-        mdiff.on_for_distance(SpeedRPM(10), slow_dist * 10)
-
-        # 2D) Sluk collectoren
-        collector.off()
-
-        # 2E) Bak 30 cm som normalt
-        mdiff.on_for_distance(SpeedRPM(40), -300)
-
-    # Ryd skærmen
+    # Ryd skærmen igen
     display.clear()
     display.update()
+
 
 # ───────── Client-handler ─────────
 
@@ -185,9 +174,9 @@ def handle_client(conn, addr):
 
     # 4) Konverter heading-bogstav til grader
     heading_map = {
-        "E": 0.0,
-        "N": 90.0,
-        "W": 180.0,
+        "E":  0.0,
+        "N":  90.0,
+        "W":  180.0,
         "S": -90.0
     }
     robot_heading_deg = heading_map.get(heading, 0.0)
