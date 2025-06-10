@@ -56,7 +56,7 @@ class BallCollector:
         self.model = self.project.version(RF_VERSION).model
         
         # Initialize camera
-        self.cap = cv2.VideoCapture(1)
+        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
         
