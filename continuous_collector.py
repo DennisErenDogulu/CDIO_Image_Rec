@@ -19,6 +19,7 @@ import logging
 import numpy as np
 from typing import List, Tuple, Optional
 from roboflow import Roboflow
+import time
 
 # Configuration
 EV3_IP = "172.20.10.6"
@@ -73,44 +74,45 @@ class BallCollector:
         self.calibration_points = []
         self.homography_matrix = None
 
-    def send_command(self, command: dict) -> bool:
-        """Send a command to the EV3 robot"""
+    def send_command(self, command: str, **params) -> bool:
+        """Send a command to the EV3 server"""
         try:
-            with socket.create_connection((EV3_IP, EV3_PORT), timeout=5) as s:
-                message = json.dumps(command) + "\n"
-                s.sendall(message.encode("utf-8"))
-                response = s.recv(32).decode("utf-8").strip()
+            with socket.create_connection((EV3_IP, EV3_PORT), timeout=15) as s:  # Increased timeout for longer movements
+                # Prepare command
+                message = {
+                    "command": command,
+                    **params
+                }
+                
+                # Send command
+                s.sendall((json.dumps(message) + "\n").encode("utf-8"))
+                
+                # Get response
+                response = s.recv(1024).decode("utf-8").strip()
                 return response == "OK"
+                
+        except socket.timeout:
+            logger.error("Command timed out - robot might still be moving")
+            return False
         except Exception as e:
-            logger.error(f"Failed to send command: {e}")
+            logger.error("Failed to send command: {}".format(e))
             return False
 
     def move(self, distance_cm: float) -> bool:
         """Move forward/backward by distance_cm"""
-        return self.send_command({
-            "command": "MOVE",
-            "distance": distance_cm
-        })
+        return self.send_command("MOVE", distance=distance_cm)
 
     def turn(self, angle_deg: float) -> bool:
         """Turn by angle_deg (positive = CCW)"""
-        return self.send_command({
-            "command": "TURN",
-            "angle": angle_deg
-        })
+        return self.send_command("TURN", angle=angle_deg)
 
     def collect(self, distance_cm: float) -> bool:
         """Move forward slowly while collecting"""
-        return self.send_command({
-            "command": "COLLECT",
-            "distance": distance_cm
-        })
+        return self.send_command("COLLECT", distance=distance_cm)
 
     def stop(self) -> bool:
         """Stop all motors"""
-        return self.send_command({
-            "command": "STOP"
-        })
+        return self.send_command("STOP")
 
     def calibrate(self):
         """Perform camera calibration by clicking 4 corners"""
@@ -312,6 +314,8 @@ class BallCollector:
     def collect_balls(self):
         """Main ball collection loop"""
         cv2.namedWindow("Path Planning")
+        last_plan_time = 0
+        last_plan_positions = []
         
         while True:
             try:
@@ -325,147 +329,165 @@ class BallCollector:
 
                 # Detect balls
                 balls = self.detect_balls()
-                if not balls:
-                    logger.info("No balls detected")
-                    cv2.imshow("Path Planning", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                current_time = time.time()
+                
+                # Only replan if:
+                # 1. We have balls AND
+                # 2. Either:
+                #    a) It's been at least 3 seconds since last plan OR
+                #    b) Ball positions have changed significantly
+                should_replan = False
+                if balls:
+                    if current_time - last_plan_time >= 3:  # Minimum 3 seconds between plans
+                        should_replan = True
+                    elif last_plan_positions:
+                        # Check if any ball has moved more than 10cm
+                        for ball in balls:
+                            if not any(math.hypot(ball[0] - old[0], ball[1] - old[1]) < 10 
+                                     for old in last_plan_positions):
+                                should_replan = True
+                                break
+                    else:
+                        should_replan = True
+
+                if should_replan:
+                    last_plan_time = current_time
+                    last_plan_positions = [(b[0], b[1]) for b in balls]
+                    logger.info("Planning to collect {} balls".format(len(balls)))
+
+                    # Sort balls by distance from robot
+                    balls.sort(key=lambda b: math.hypot(
+                        b[0] - self.robot_pos[0],
+                        b[1] - self.robot_pos[1]
+                    ))
+
+                    # Take up to MAX_BALLS_PER_TRIP closest balls
+                    current_batch = balls[:MAX_BALLS_PER_TRIP]
+
+                    # Plan path through all balls in the batch
+                    path = []
+                    current_pos = self.robot_pos
+                    remaining_balls = current_batch.copy()
+
+                    # Add balls to path in nearest-neighbor order
+                    while remaining_balls:
+                        closest_ball = min(remaining_balls, 
+                                         key=lambda b: math.hypot(
+                                             b[0] - current_pos[0],
+                                             b[1] - current_pos[1]
+                                         ))
+                        remaining_balls.remove(closest_ball)
+                        
+                        ball_pos = (closest_ball[0], closest_ball[1])
+                        approach_pos, target_angle = self.get_approach_vector(ball_pos)
+                        
+                        path.append({
+                            'type': 'approach',
+                            'pos': approach_pos,
+                            'angle': target_angle
+                        })
+                        path.append({
+                            'type': 'collect',
+                            'pos': ball_pos,
+                            'ball_type': closest_ball[2]
+                        })
+                        
+                        current_pos = ball_pos
+
+                    # Add goal position to path
+                    goal_x = FIELD_WIDTH_CM - 10
+                    goal_y = FIELD_HEIGHT_CM / 2
+                    goal_pos = (goal_x, goal_y)
+                    
+                    dx = goal_x - current_pos[0]
+                    dy = goal_y - current_pos[1]
+                    goal_angle = math.degrees(math.atan2(dy, dx))
+                    
+                    path.append({
+                        'type': 'goal',
+                        'pos': goal_pos,
+                        'angle': goal_angle
+                    })
+
+                    # Draw path on frame
+                    frame_with_path = self.draw_path(frame, path)
+                    
+                    # Add key command help
+                    help_text = [
+                        "Commands:",
+                        "SPACE - Execute path",
+                        "Q - Quit",
+                        "R - Reset robot position"
+                    ]
+                    y = 150
+                    for text in help_text:
+                        cv2.putText(frame_with_path, text,
+                                  (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                  0.5, (255, 255, 255), 1)
+                        y += 20
+                    
+                    cv2.imshow("Path Planning", frame_with_path)
+                    
+                    # Handle key commands
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
                         break
-                    continue
-
-                # Sort balls by distance from robot
-                balls.sort(key=lambda b: math.hypot(
-                    b[0] - self.robot_pos[0],
-                    b[1] - self.robot_pos[1]
-                ))
-
-                # Take up to MAX_BALLS_PER_TRIP closest balls
-                current_batch = balls[:MAX_BALLS_PER_TRIP]
-                logger.info(f"Planning to collect {len(current_batch)} balls")
-
-                # Plan path through all balls in the batch
-                path = []
-                current_pos = self.robot_pos
-                remaining_balls = current_batch.copy()
-
-                # Add balls to path in nearest-neighbor order
-                while remaining_balls:
-                    closest_ball = min(remaining_balls, 
-                                     key=lambda b: math.hypot(
-                                         b[0] - current_pos[0],
-                                         b[1] - current_pos[1]
-                                     ))
-                    remaining_balls.remove(closest_ball)
-                    
-                    ball_pos = (closest_ball[0], closest_ball[1])
-                    approach_pos, target_angle = self.get_approach_vector(ball_pos)
-                    
-                    path.append({
-                        'type': 'approach',
-                        'pos': approach_pos,
-                        'angle': target_angle
-                    })
-                    path.append({
-                        'type': 'collect',
-                        'pos': ball_pos,
-                        'ball_type': closest_ball[2]
-                    })
-                    
-                    current_pos = ball_pos
-
-                # Add goal position to path
-                goal_x = FIELD_WIDTH_CM - 10
-                goal_y = FIELD_HEIGHT_CM / 2
-                goal_pos = (goal_x, goal_y)
-                
-                dx = goal_x - current_pos[0]
-                dy = goal_y - current_pos[1]
-                goal_angle = math.degrees(math.atan2(dy, dx))
-                
-                path.append({
-                    'type': 'goal',
-                    'pos': goal_pos,
-                    'angle': goal_angle
-                })
-
-                # Draw path on frame
-                frame_with_path = self.draw_path(frame, path)
-                
-                # Add key command help
-                help_text = [
-                    "Commands:",
-                    "SPACE - Execute path",
-                    "Q - Quit",
-                    "R - Reset robot position"
-                ]
-                y = 150
-                for text in help_text:
-                    cv2.putText(frame_with_path, text,
-                              (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                              0.5, (255, 255, 255), 1)
-                    y += 20
-                
-                cv2.imshow("Path Planning", frame_with_path)
-                
-                # Handle key commands
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('r'):
-                    # Reset robot position to start
-                    self.robot_pos = (20.0, 20.0)
-                    self.robot_heading = 0.0
-                    logger.info("Reset robot position to start")
-                elif key == ord(' '):
-                    # Execute the planned path
-                    logger.info(f"Executing path with {len(path)} points")
-                    
-                    try:
-                        for point in path:
-                            # Calculate turn angle from current heading
-                            target_pos = point['pos']
-                            dx = target_pos[0] - self.robot_pos[0]
-                            dy = target_pos[1] - self.robot_pos[1]
-                            target_angle = math.degrees(math.atan2(dy, dx))
-                            
-                            # Turn to face target
-                            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                            if abs(angle_diff) > 5:
-                                logger.info(f"Turning {angle_diff:.1f} degrees")
-                                if not self.turn(angle_diff):
-                                    raise Exception("Turn command failed")
-                                self.robot_heading = target_angle
-                            
-                            # Move to target position
-                            distance = math.hypot(dx, dy)
-                            
-                            if point['type'] == 'collect':
-                                logger.info(f"Collecting {point['ball_type']} ball")
-                                if not self.collect(COLLECTION_DISTANCE_CM):
-                                    raise Exception("Collect command failed")
-                            else:
-                                logger.info(f"Moving {distance:.1f} cm")
-                                if not self.move(distance):
-                                    raise Exception("Move command failed")
-                            
-                            # Update robot position
-                            self.robot_pos = target_pos
-                            
-                            # Update visualization
-                            ret, frame = self.cap.read()
-                            if ret:
-                                frame = self.draw_status(frame)
-                                frame_with_path = self.draw_path(frame, path)
-                                cv2.imshow("Path Planning", frame_with_path)
-                                cv2.waitKey(1)
+                    elif key == ord('r'):
+                        # Reset robot position to start
+                        self.robot_pos = (20.0, 20.0)
+                        self.robot_heading = 0.0
+                        logger.info("Reset robot position to start")
+                    elif key == ord(' '):
+                        # Execute the planned path
+                        logger.info(f"Executing path with {len(path)} points")
                         
-                        # Pause briefly to let balls settle
-                        cv2.waitKey(1000)
-                        
-                    except Exception as e:
-                        logger.error(f"Path execution failed: {e}")
-                        self.stop()  # Emergency stop
-                        cv2.waitKey(2000)  # Pause to show error
-                
+                        try:
+                            for point in path:
+                                # Calculate turn angle from current heading
+                                target_pos = point['pos']
+                                dx = target_pos[0] - self.robot_pos[0]
+                                dy = target_pos[1] - self.robot_pos[1]
+                                target_angle = math.degrees(math.atan2(dy, dx))
+                                
+                                # Turn to face target
+                                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                                if abs(angle_diff) > 5:
+                                    logger.info(f"Turning {angle_diff:.1f} degrees")
+                                    if not self.turn(angle_diff):
+                                        raise Exception("Turn command failed")
+                                    self.robot_heading = target_angle
+                                
+                                # Move to target position
+                                distance = math.hypot(dx, dy)
+                                
+                                if point['type'] == 'collect':
+                                    logger.info(f"Collecting {point['ball_type']} ball")
+                                    if not self.collect(COLLECTION_DISTANCE_CM):
+                                        raise Exception("Collect command failed")
+                                else:
+                                    logger.info(f"Moving {distance:.1f} cm")
+                                    if not self.move(distance):
+                                        raise Exception("Move command failed")
+                                
+                                # Update robot position
+                                self.robot_pos = target_pos
+                                
+                                # Update visualization
+                                ret, frame = self.cap.read()
+                                if ret:
+                                    frame = self.draw_status(frame)
+                                    frame_with_path = self.draw_path(frame, path)
+                                    cv2.imshow("Path Planning", frame_with_path)
+                                    cv2.waitKey(1)
+                            
+                            # Pause briefly to let balls settle
+                            cv2.waitKey(1000)
+                            
+                        except Exception as e:
+                            logger.error(f"Path execution failed: {e}")
+                            self.stop()  # Emergency stop
+                            cv2.waitKey(2000)  # Pause to show error
+                    
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
                 cv2.waitKey(1000)
