@@ -11,9 +11,9 @@ from ev3dev2.display import Display
 from ev3dev2.power import PowerSupply
 
 # ───────── Hardware Setup ─────────
-AXLE_TRACK_MM = 160    # Axle distance in mm
-WHEEL_DIAM_MM = 80     # Wheel diameter in mm
-WHEEL_WIDTH_MM = 16    # Wheel width in mm
+AXLE_TRACK_MM = 150    # Axle distance in mm
+WHEEL_DIAM_MM = 69     # Wheel diameter in mm
+WHEEL_WIDTH_MM = 35    # Wheel width in mm
 
 class MyWheel(Wheel):
     def __init__(self):
@@ -33,12 +33,23 @@ display = Display()                 # EV3 display
 power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
-NORMAL_SPEED_RPM = 40
-SLOW_SPEED_RPM = 20
+NORMAL_SPEED_RPM = 200
+SLOW_SPEED_RPM = 100
 COLLECTOR_SPEED = 50  # Percentage
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
+
+# Robot physical dimensions (in mm)
+WHEEL_DIAMETER_MM = 69  # 6.9 cm
+WHEEL_WIDTH_MM = 35    # 3.5 cm
+AXLE_TRACK_MM = 150   # 15 cm
+
+# Calculate turn factor
+# For a full 360° turn, the wheels need to travel the circumference of the circle made by the axle track
+# circumference = π * axle_track
+# turn_factor = circumference / 360° to get mm per degree
+TURN_FACTOR = (math.pi * AXLE_TRACK_MM) / 360.0
 
 def safe_motor_control(func):
     """Decorator for safe motor control with error handling"""
@@ -71,7 +82,9 @@ def execute_move(distance_cm):
 @safe_motor_control
 def execute_turn(angle_deg):
     """Turn by angle_deg (positive = CCW, negative = CW)"""
-    mdiff.turn_degrees(SpeedRPM(NORMAL_SPEED_RPM), angle_deg)
+    # Calculate the distance each wheel needs to travel for the turn
+    turn_distance = angle_deg * TURN_FACTOR
+    mdiff.turn_degrees(SpeedRPM(NORMAL_SPEED_RPM), angle_deg, use_brake=True)
     return True
 
 @safe_motor_control
