@@ -31,8 +31,9 @@ def calibration_test():
     print("\nMovement Calibration Test")
     print("------------------------")
     print("1. Place the robot at a starting position")
-    print("2. Mark the start point")
-    print("3. Press Enter when ready")
+    print("2. Mark the start point at the CENTER of the drive wheels")
+    print("3. Make sure you have 1.2 meters of clear space ahead")
+    print("4. Press Enter when ready")
     input()
     
     # Move forward 100cm
@@ -41,7 +42,7 @@ def calibration_test():
     
     if success:
         print("\nMovement completed!")
-        print("Please measure the actual distance traveled.")
+        print("Please measure the actual distance traveled from the starting line to the CENTER of the drive wheels.")
         print("\nCalculation:")
         print("If the robot moved X centimeters:")
         print("Adjustment factor = 100/X")
@@ -60,6 +61,11 @@ def calibration_test():
             print('mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_cm * {:.1f})  # adjusted cm to mm'.format(10 * adjustment))
     else:
         print("Error: Movement command failed!")
+
+def change_ip():
+    """Change the EV3 IP address"""
+    global EV3_IP
+    EV3_IP = input("Enter new EV3 IP address: ")
 
 def main():
     print("EV3 Movement Calibration Tool")
@@ -83,8 +89,7 @@ def main():
         if choice == "1":
             calibration_test()
         elif choice == "2":
-            global EV3_IP
-            EV3_IP = input("Enter new EV3 IP address: ")
+            change_ip()
         elif choice == "3":
             break
         else:
