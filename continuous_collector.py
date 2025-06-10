@@ -73,6 +73,11 @@ class BallCollector:
         # Calibration points for homography
         self.calibration_points = []
         self.homography_matrix = None
+        
+        # Goal dimensions and positions
+        self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal
+        self.goal_approach_distance = 20  # Distance to stop in front of goal
+        self.delivery_time = 2.0  # Seconds to run collector in reverse
 
     def send_command(self, command: str, **params) -> bool:
         """Send a command to the EV3 server"""
@@ -188,19 +193,22 @@ class BallCollector:
         
         return balls
 
-    def get_approach_vector(self, ball_pos: Tuple[float, float]) -> Tuple[float, float]:
-        """Calculate best approach vector to ball"""
-        dx = ball_pos[0] - self.robot_pos[0]
-        dy = ball_pos[1] - self.robot_pos[1]
-        angle = math.degrees(math.atan2(dy, dx))
+    def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
+        """Calculate approach position and angle for a target position"""
+        # Get vector from robot to target
+        dx = target_pos[0] - self.robot_pos[0]
+        dy = target_pos[1] - self.robot_pos[1]
+        distance = math.hypot(dx, dy)
         
-        # Calculate approach point (APPROACH_DISTANCE_CM before ball)
-        dist = math.hypot(dx, dy)
-        ratio = (dist - APPROACH_DISTANCE_CM) / dist
+        # Calculate approach point APPROACH_DISTANCE_CM before target
+        ratio = (distance - APPROACH_DISTANCE_CM) / distance if distance > APPROACH_DISTANCE_CM else 0
         approach_x = self.robot_pos[0] + dx * ratio
         approach_y = self.robot_pos[1] + dy * ratio
         
-        return (approach_x, approach_y), angle
+        # Calculate angle to target
+        target_angle = math.degrees(math.atan2(dy, dx))
+        
+        return (approach_x, approach_y), target_angle
 
     def draw_path(self, frame, path):
         """Draw the planned path on the frame"""
@@ -311,6 +319,58 @@ class BallCollector:
         
         return frame
 
+    def deliver_balls(self) -> bool:
+        """Run collector in reverse to deliver balls"""
+        try:
+            message = {
+                "command": "COLLECT_REVERSE",
+                "duration": self.delivery_time
+            }
+            return self.send_command("COLLECT_REVERSE", duration=self.delivery_time)
+        except Exception as e:
+            logger.error("Failed to deliver balls: {}".format(e))
+            return False
+
+    def go_to_goal(self) -> bool:
+        """Move to goal and deliver balls"""
+        try:
+            # Calculate goal position (centered in Y)
+            goal_x = FIELD_WIDTH_CM - self.goal_approach_distance
+            goal_y = self.goal_y_center
+            goal_pos = (goal_x, goal_y)
+            
+            # Get approach vector
+            approach_pos, target_angle = self.get_approach_vector(goal_pos)
+            
+            # Turn to face goal
+            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+            if abs(angle_diff) > 5:
+                logger.info("Turning {:.1f} degrees to face goal".format(angle_diff))
+                if not self.turn(angle_diff):
+                    raise Exception("Turn to goal failed")
+                self.robot_heading = target_angle
+            
+            # Move to goal
+            distance = math.hypot(goal_pos[0] - self.robot_pos[0],
+                                goal_pos[1] - self.robot_pos[1])
+            logger.info("Moving {:.1f} cm to goal".format(distance))
+            if not self.move(distance):
+                raise Exception("Move to goal failed")
+            
+            # Update robot position
+            self.robot_pos = goal_pos
+            
+            # Deliver balls
+            logger.info("Delivering balls")
+            if not self.deliver_balls():
+                raise Exception("Ball delivery failed")
+            
+            return True
+            
+        except Exception as e:
+            logger.error("Goal approach failed: {}".format(e))
+            return False
+
     def collect_balls(self):
         """Main ball collection loop"""
         cv2.namedWindow("Path Planning")
@@ -395,18 +455,10 @@ class BallCollector:
                         current_pos = ball_pos
 
                     # Add goal position to path
-                    goal_x = FIELD_WIDTH_CM - 10
-                    goal_y = FIELD_HEIGHT_CM / 2
-                    goal_pos = (goal_x, goal_y)
-                    
-                    dx = goal_x - current_pos[0]
-                    dy = goal_y - current_pos[1]
-                    goal_angle = math.degrees(math.atan2(dy, dx))
-                    
                     path.append({
                         'type': 'goal',
-                        'pos': goal_pos,
-                        'angle': goal_angle
+                        'pos': (FIELD_WIDTH_CM - self.goal_approach_distance, self.goal_y_center),
+                        'angle': 0  # Face straight ahead at goal
                     })
 
                     # Draw path on frame
@@ -433,13 +485,12 @@ class BallCollector:
                     if key == ord('q'):
                         break
                     elif key == ord('r'):
-                        # Reset robot position to start
                         self.robot_pos = (20.0, 20.0)
                         self.robot_heading = 0.0
                         logger.info("Reset robot position to start")
                     elif key == ord(' '):
                         # Execute the planned path
-                        logger.info(f"Executing path with {len(path)} points")
+                        logger.info("Executing path with {} points".format(len(path)))
                         
                         try:
                             for point in path:
@@ -479,14 +530,19 @@ class BallCollector:
                                     frame_with_path = self.draw_path(frame, path)
                                     cv2.imshow("Path Planning", frame_with_path)
                                     cv2.waitKey(1)
+                                
+                                # If this is the goal point, deliver balls
+                                if point['type'] == 'goal':
+                                    if not self.go_to_goal():
+                                        raise Exception("Goal delivery failed")
                             
-                            # Pause briefly to let balls settle
+                            # Pause briefly after completing the path
                             cv2.waitKey(1000)
                             
                         except Exception as e:
-                            logger.error(f"Path execution failed: {e}")
-                            self.stop()  # Emergency stop
-                            cv2.waitKey(2000)  # Pause to show error
+                            logger.error("Path execution failed: {}".format(e))
+                            self.stop()
+                            cv2.waitKey(2000)
                     
             except Exception as e:
                 logger.error(f"Main loop error: {e}")

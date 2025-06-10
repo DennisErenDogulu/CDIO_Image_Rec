@@ -35,7 +35,7 @@ power = PowerSupply()               # For battery monitoring
 # Movement speeds
 NORMAL_SPEED_RPM = 200
 SLOW_SPEED_RPM = 100
-TURN_SPEED_RPM = 100  # Slower speed for more precise turns
+TURN_SPEED_RPM = 50  # Even slower turns for more precision
 COLLECTOR_SPEED = 50  # Percentage
 
 # Acceleration control (ramp up/down)
@@ -47,9 +47,9 @@ WHEEL_WIDTH_MM = 35    # 3.5 cm
 AXLE_TRACK_MM = 150   # 15 cm
 
 # Calculate turn factor
-# For a differential drive with ball casters, we need to account for some slippage
-# Adding a compensation factor to improve accuracy
-TURN_COMPENSATION = 1.15  # Increase the turning angle by 15%
+# Since motors are balanced, focusing on mechanical compensation
+# Increasing compensation to account for ball caster friction
+TURN_COMPENSATION = 1.25  # 25% compensation for mechanical factors
 TURN_FACTOR = (math.pi * AXLE_TRACK_MM) / 360.0 * TURN_COMPENSATION
 
 def safe_motor_control(func):
@@ -84,20 +84,20 @@ def execute_move(distance_cm):
 def execute_turn(angle_deg):
     """Turn by angle_deg (positive = CCW, negative = CW)"""
     try:
-        # Set slower speed for turns
-        mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 2  # Gentler acceleration for turns
-        mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 2
+        # Set even slower speed and longer acceleration for turns
+        mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 3    # Triple the acceleration time
+        mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 3  # Triple the deceleration time
         
         # For sharper turns:
-        # 1. Stop completely first
+        # 1. Stop completely first with longer pause
         mdiff.off(brake=True)
-        time.sleep(0.2)  # Short pause
+        time.sleep(0.3)  # Longer pause to ensure complete stop
         
-        # 2. Turn with slower speed for more precision
+        # 2. Turn with very slow speed for maximum precision
         mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), angle_deg)
         
-        # 3. Brief pause after turn
-        time.sleep(0.2)
+        # 3. Longer pause after turn
+        time.sleep(0.3)
         
         return True
     except Exception as e:
@@ -126,6 +126,30 @@ def execute_collect(distance_cm):
         return True
     except Exception as e:
         print("Collection error: {}".format(e))
+        collector.off(brake=True)
+        return False
+
+@safe_motor_control
+def execute_collect_reverse(duration):
+    """Run collector in reverse to deliver balls"""
+    try:
+        # Start collector motor in reverse with gradual speed increase
+        for speed in range(0, -COLLECTOR_SPEED - 1, -5):
+            collector.on(speed)
+            time.sleep(0.05)
+        
+        # Run for specified duration
+        time.sleep(duration)
+        
+        # Gradually stop collector
+        for speed in range(-COLLECTOR_SPEED, 1, 5):
+            collector.on(speed)
+            time.sleep(0.05)
+        
+        collector.off(brake=True)
+        return True
+    except Exception as e:
+        print("Reverse collection error: {}".format(e))
         collector.off(brake=True)
         return False
 
@@ -200,6 +224,9 @@ def handle_client(conn, addr):
             
         elif command == "COLLECT" and "distance" in request:
             result = execute_collect(float(request["distance"]))
+            
+        elif command == "COLLECT_REVERSE" and "duration" in request:
+            result = execute_collect_reverse(float(request["duration"]))
             
         elif command == "STOP":
             result = execute_stop()
