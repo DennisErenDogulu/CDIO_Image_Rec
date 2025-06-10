@@ -35,6 +35,7 @@ power = PowerSupply()               # For battery monitoring
 # Movement speeds
 NORMAL_SPEED_RPM = 200
 SLOW_SPEED_RPM = 100
+TURN_SPEED_RPM = 100  # Slower speed for more precise turns
 COLLECTOR_SPEED = 50  # Percentage
 
 # Acceleration control (ramp up/down)
@@ -46,10 +47,10 @@ WHEEL_WIDTH_MM = 35    # 3.5 cm
 AXLE_TRACK_MM = 150   # 15 cm
 
 # Calculate turn factor
-# For a full 360° turn, the wheels need to travel the circumference of the circle made by the axle track
-# circumference = π * axle_track
-# turn_factor = circumference / 360° to get mm per degree
-TURN_FACTOR = (math.pi * AXLE_TRACK_MM) / 360.0
+# For a differential drive with ball casters, we need to account for some slippage
+# Adding a compensation factor to improve accuracy
+TURN_COMPENSATION = 1.15  # Increase the turning angle by 15%
+TURN_FACTOR = (math.pi * AXLE_TRACK_MM) / 360.0 * TURN_COMPENSATION
 
 def safe_motor_control(func):
     """Decorator for safe motor control with error handling"""
@@ -82,10 +83,27 @@ def execute_move(distance_cm):
 @safe_motor_control
 def execute_turn(angle_deg):
     """Turn by angle_deg (positive = CCW, negative = CW)"""
-    # Calculate the distance each wheel needs to travel for the turn
-    turn_distance = angle_deg * TURN_FACTOR
-    mdiff.turn_degrees(SpeedRPM(NORMAL_SPEED_RPM), angle_deg, use_brake=True)
-    return True
+    try:
+        # Set slower speed for turns
+        mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 2  # Gentler acceleration for turns
+        mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 2
+        
+        # For sharper turns:
+        # 1. Stop completely first
+        mdiff.off(brake=True)
+        time.sleep(0.2)  # Short pause
+        
+        # 2. Turn with slower speed for more precision
+        mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), angle_deg)
+        
+        # 3. Brief pause after turn
+        time.sleep(0.2)
+        
+        return True
+    except Exception as e:
+        print("Turn error: {}".format(e))
+        mdiff.off(brake=True)
+        return False
 
 @safe_motor_control
 def execute_collect(distance_cm):
