@@ -65,7 +65,7 @@ def safe_motor_control(func):
 @safe_motor_control
 def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
-    mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_cm * 10)  # cm to mm
+    mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
     return True
 
 @safe_motor_control
@@ -84,7 +84,7 @@ def execute_collect(distance_cm):
             time.sleep(0.05)
         
         # Move forward slowly
-        mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), distance_cm * 10)
+        mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
         
         # Gradually stop collector
         for speed in range(COLLECTOR_SPEED, -1, -5):
