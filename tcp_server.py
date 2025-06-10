@@ -94,7 +94,7 @@ def execute_collect(distance_cm):
         collector.off(brake=True)
         return True
     except Exception as e:
-        print(f"Collection error: {e}")
+        print("Collection error: {}".format(e))
         collector.off(brake=True)
         return False
 
