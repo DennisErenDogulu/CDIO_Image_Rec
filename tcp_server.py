@@ -55,7 +55,7 @@ def safe_motor_control(func):
             mdiff.off(brake=True)
             return result
         except Exception as e:
-            print(f"Motor control error in {func.__name__}: {e}")
+            print("Motor control error in {}: {}".format(func.__name__, e))
             # Emergency stop
             mdiff.off(brake=True)
             collector.off(brake=True)
@@ -126,7 +126,7 @@ def get_status():
         }
         return json.dumps(status)
     except Exception as e:
-        print(f"Status error: {e}")
+        print("Status error: {}".format(e))
         return json.dumps({"error": str(e)})
 
 def handle_client(conn, addr):
@@ -135,7 +135,7 @@ def handle_client(conn, addr):
     Receives exactly one \n-terminated JSON line and processes it
     as a movement command.
     """
-    print(f"[TCP Server] Client connected: {addr}")
+    print("[TCP Server] Client connected: {}".format(addr))
     
     try:
         # Set timeout to prevent hanging
@@ -146,7 +146,7 @@ def handle_client(conn, addr):
         while True:
             chunk = conn.recv(1024)
             if not chunk:
-                print(f"[TCP Server] Client {addr} disconnected before data.")
+                print("[TCP Server] Client {} disconnected before data.".format(addr))
                 return
             
             data_buffer += chunk.decode("utf-8")
@@ -186,7 +186,7 @@ def handle_client(conn, addr):
         conn.sendall(response.encode())
 
     except socket.timeout:
-        print(f"[TCP Server] Connection to {addr} timed out")
+        print("[TCP Server] Connection to {} timed out".format(addr))
         conn.sendall(b"ERROR\n")
     
     except json.JSONDecodeError:
@@ -194,7 +194,7 @@ def handle_client(conn, addr):
         conn.sendall(b"ERROR\n")
     
     except Exception as e:
-        print(f"[TCP Server] Error processing command: {e}")
+        print("[TCP Server] Error processing command: {}".format(e))
         conn.sendall(b"ERROR\n")
     
     finally:
@@ -204,7 +204,7 @@ def main():
     HOST = ""      # Listen on all interfaces
     PORT = 12345   # Must match PC client's port
 
-    print(f"[TCP Server] Starting on port {PORT} …")
+    print("[TCP Server] Starting on port {} …".format(PORT))
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((HOST, PORT))
@@ -213,9 +213,9 @@ def main():
     # Show initial battery status
     voltage = power.measured_voltage
     percentage = voltage / power.max_voltage * 100
-    print(f"[TCP Server] Battery: {voltage:.1f}V ({percentage:.0f}%)")
+    print("[TCP Server] Battery: {:.1f}V ({:.0f}%)".format(voltage, percentage))
     
-    print(f"[TCP Server] Listening for incoming connections on port {PORT}…")
+    print("[TCP Server] Listening for incoming connections on port {}…".format(PORT))
 
     try:
         while True:
