@@ -11,7 +11,7 @@ from ev3dev2.display import Display
 from ev3dev2.power import PowerSupply
 
 # ───────── Hardware Setup ─────────
-AXLE_TRACK_MM = 150    # Axle distance in mm
+AXLE_TRACK_MM = 40    # Axle distance in mm
 WHEEL_DIAM_MM = 69     # Wheel diameter in mm
 WHEEL_WIDTH_MM = 35    # Wheel width in mm
 
@@ -33,18 +33,18 @@ display = Display()                 # EV3 display
 power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
-NORMAL_SPEED_RPM = 200
-SLOW_SPEED_RPM = 100
-TURN_SPEED_RPM = 50  # Even slower turns for more precision
-COLLECTOR_SPEED = 50  # Percentage
+NORMAL_SPEED_RPM = -40
+SLOW_SPEED_RPM = -25
+TURN_SPEED_RPM = -40  # Even slower turns for more precision
+COLLECTOR_SPEED = 25  # Percentage
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
 
 # Robot physical dimensions (in mm)
 WHEEL_DIAMETER_MM = 69  # 6.9 cm
-WHEEL_WIDTH_MM = 35    # 3.5 cm
-AXLE_TRACK_MM = 150   # 15 cm
+WHEEL_WIDTH_MM = 35    # 3.5
+AXLE_TRACK_MM = 450   # 45 cm
 
 # Calculate turn factor
 # Since motors are balanced, focusing on mechanical compensation
