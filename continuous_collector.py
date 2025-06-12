@@ -105,10 +105,14 @@ class BallCollector:
 
     def move(self, distance_cm: float, is_reverse: bool = False) -> bool:
         """Move forward/backward by distance_cm
-        Note: On our robot, negative speed means forward movement"""
-        # For forward movement: keep distance_cm as is (will use negative speed)
-        # For reverse movement: negate distance_cm (will use positive speed)
-        actual_distance = -abs(distance_cm) if is_reverse else abs(distance_cm)
+        Note: On our robot, negative speed means forward movement
+        
+        Args:
+            distance_cm: The distance to move (always positive)
+            is_reverse: If True, move backwards; if False, move forwards
+        """
+        # If moving in reverse, negate the distance to get backward movement
+        actual_distance = -distance_cm if is_reverse else distance_cm
         return self.send_command("MOVE", distance=actual_distance)
 
     def turn(self, angle_deg: float) -> bool:

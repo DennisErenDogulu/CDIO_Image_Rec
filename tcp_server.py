@@ -83,8 +83,10 @@ def execute_move(distance_cm):
         mdiff.ramp_up_sp = accel_time
         mdiff.ramp_down_sp = accel_time
         
-        # Set speed (positive for reverse since our motors are reversed)
-        speed = NORMAL_SPEED_RPM if is_reverse else -NORMAL_SPEED_RPM
+        # Set speed (negative means forward movement on our robot)
+        # If distance is positive (forward), use negative speed
+        # If distance is negative (backward), use positive speed
+        speed = NORMAL_SPEED_RPM if distance_cm > 0 else -NORMAL_SPEED_RPM
         
         # Convert distance to mm (always positive)
         distance_mm = abs(distance_cm) * 11.1  # adjusted cm to mm conversion
