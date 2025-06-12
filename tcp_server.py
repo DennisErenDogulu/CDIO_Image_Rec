@@ -33,13 +33,14 @@ display = Display()                 # EV3 display
 power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
-NORMAL_SPEED_RPM = -40
-SLOW_SPEED_RPM = -25
-TURN_SPEED_RPM = -40  # Even slower turns for more precision
+NORMAL_SPEED_RPM = -40  # Negative for forward movement
+SLOW_SPEED_RPM = -25   # Negative for forward movement
+TURN_SPEED_RPM = -40   # Negative for forward movement
 COLLECTOR_SPEED = 25  # Percentage
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
+REVERSE_ACCEL_FACTOR = 1.5  # Multiplier for reverse movement acceleration
 
 # Robot physical dimensions (in mm)
 WHEEL_DIAMETER_MM = 69  # 6.9 cm
@@ -56,10 +57,6 @@ def safe_motor_control(func):
     """Decorator for safe motor control with error handling"""
     def wrapper(*args, **kwargs):
         try:
-            # Set acceleration time
-            mdiff.ramp_up_sp = ACCELERATION_TIME_MS
-            mdiff.ramp_down_sp = ACCELERATION_TIME_MS
-            
             # Execute motor command
             result = func(*args, **kwargs)
             
@@ -78,19 +75,24 @@ def safe_motor_control(func):
 def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
     try:
-        # Set appropriate speed based on direction
-        speed = NORMAL_SPEED_RPM if distance_cm > 0 else -NORMAL_SPEED_RPM
+        # Determine direction and set appropriate acceleration
+        is_reverse = distance_cm < 0
+        accel_time = ACCELERATION_TIME_MS * REVERSE_ACCEL_FACTOR if is_reverse else ACCELERATION_TIME_MS
         
-        # Convert distance to mm with direction preserved
+        # Set acceleration parameters
+        mdiff.ramp_up_sp = accel_time
+        mdiff.ramp_down_sp = accel_time
+        
+        # Set speed (positive for reverse since our motors are reversed)
+        speed = NORMAL_SPEED_RPM if is_reverse else -NORMAL_SPEED_RPM
+        
+        # Convert distance to mm (always positive)
         distance_mm = abs(distance_cm) * 11.1  # adjusted cm to mm conversion
         
-        # Set slower acceleration for reverse movement
-        if distance_cm < 0:
-            mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 1.5    # 50% longer acceleration for reverse
-            mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 1.5  # 50% longer deceleration for reverse
-        else:
-            mdiff.ramp_up_sp = ACCELERATION_TIME_MS
-            mdiff.ramp_down_sp = ACCELERATION_TIME_MS
+        # Complete stop before changing direction
+        mdiff.off(brake=True)
+        if is_reverse:
+            time.sleep(0.2)  # Extra pause for reverse
         
         # Execute movement
         mdiff.on_for_distance(SpeedRPM(speed), distance_mm)
@@ -109,19 +111,18 @@ def execute_turn(angle_deg):
     """Turn by angle_deg (positive = CCW, negative = CW)"""
     try:
         # Set even slower speed and longer acceleration for turns
-        mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 3    # Triple the acceleration time
-        mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 3  # Triple the deceleration time
+        mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 2    # Double the acceleration time
+        mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 2  # Double the deceleration time
         
-        # For sharper turns:
-        # 1. Stop completely first with longer pause
+        # Complete stop before turning
         mdiff.off(brake=True)
-        time.sleep(0.3)  # Longer pause to ensure complete stop
+        time.sleep(0.2)
         
-        # 2. Turn with very slow speed for maximum precision
-        mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), angle_deg)
+        # Execute turn (using negative speed for forward movement)
+        mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM if angle_deg > 0 else -TURN_SPEED_RPM), abs(angle_deg))
         
-        # 3. Longer pause after turn
-        time.sleep(0.3)
+        # Pause after turn
+        time.sleep(0.2)
         
         return True
     except Exception as e:
@@ -138,8 +139,12 @@ def execute_collect(distance_cm):
             collector.on(speed)
             time.sleep(0.05)
         
-        # Move forward slowly
-        mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
+        # Set slower acceleration for collection
+        mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 1.5
+        mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 1.5
+        
+        # Move forward slowly (negative speed for forward)
+        mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), distance_cm * 11.1)
         
         # Gradually stop collector
         for speed in range(COLLECTOR_SPEED, -1, -5):

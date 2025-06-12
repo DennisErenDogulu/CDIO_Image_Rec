@@ -104,9 +104,11 @@ class BallCollector:
             return False
 
     def move(self, distance_cm: float, is_reverse: bool = False) -> bool:
-        """Move forward/backward by distance_cm"""
-        # If moving in reverse, negate the distance
-        actual_distance = -distance_cm if is_reverse else distance_cm
+        """Move forward/backward by distance_cm
+        Note: On our robot, negative speed means forward movement"""
+        # For forward movement: keep distance_cm as is (will use negative speed)
+        # For reverse movement: negate distance_cm (will use positive speed)
+        actual_distance = -abs(distance_cm) if is_reverse else abs(distance_cm)
         return self.send_command("MOVE", distance=actual_distance)
 
     def turn(self, angle_deg: float) -> bool:
@@ -398,35 +400,45 @@ class BallCollector:
                 target_pos = point['pos']
                 dx = target_pos[0] - self.robot_pos[0]
                 dy = target_pos[1] - self.robot_pos[1]
+                distance = math.hypot(dx, dy)
                 
-                # Determine if we should move in reverse
+                # Determine movement direction
                 use_reverse = point.get('reverse', False)
                 target_angle = math.degrees(math.atan2(dy, dx))
                 if use_reverse:
                     target_angle = (target_angle + 180) % 360
                 
-                # Turn to face target
+                # Turn to face target (if needed)
                 angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
                 if abs(angle_diff) > 5:
                     logger.info(f"Turning {angle_diff:.1f} degrees")
                     if not self.turn(angle_diff):
                         raise Exception("Turn command failed")
                     self.robot_heading = target_angle
+                    time.sleep(0.2)  # Small pause after turn
                 
-                # Move to target position
-                distance = math.hypot(dx, dy)
-                
+                # Execute movement based on point type
                 if point['type'] == 'collect':
                     logger.info(f"Collecting {point['ball_type']} ball")
                     if not self.collect(COLLECTION_DISTANCE_CM):
                         raise Exception("Collect command failed")
                 else:
-                    logger.info(f"Moving {distance:.1f} cm {'backwards' if use_reverse else 'forwards'}")
+                    movement_type = "backwards" if use_reverse else "forwards"
+                    logger.info(f"Moving {distance:.1f} cm {movement_type}")
                     if not self.move(distance, use_reverse):
                         raise Exception("Move command failed")
+                    time.sleep(0.1)  # Small pause after movement
                 
                 # Update robot position
                 self.robot_pos = target_pos
+                
+                # Update visualization
+                ret, frame = self.cap.read()
+                if ret:
+                    frame = self.draw_status(frame)
+                    frame_with_path = self.draw_path(frame, path)
+                    cv2.imshow("Path Planning", frame_with_path)
+                    cv2.waitKey(1)
                 
                 # If this is the goal point, deliver balls
                 if point['type'] == 'goal':
