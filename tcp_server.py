@@ -77,8 +77,32 @@ def safe_motor_control(func):
 @safe_motor_control
 def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
-    mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
-    return True
+    try:
+        # Set appropriate speed based on direction
+        speed = NORMAL_SPEED_RPM if distance_cm > 0 else -NORMAL_SPEED_RPM
+        
+        # Convert distance to mm with direction preserved
+        distance_mm = abs(distance_cm) * 11.1  # adjusted cm to mm conversion
+        
+        # Set slower acceleration for reverse movement
+        if distance_cm < 0:
+            mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 1.5    # 50% longer acceleration for reverse
+            mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 1.5  # 50% longer deceleration for reverse
+        else:
+            mdiff.ramp_up_sp = ACCELERATION_TIME_MS
+            mdiff.ramp_down_sp = ACCELERATION_TIME_MS
+        
+        # Execute movement
+        mdiff.on_for_distance(SpeedRPM(speed), distance_mm)
+        
+        # Brief pause after movement
+        time.sleep(0.1)
+        
+        return True
+    except Exception as e:
+        print("Move error: {}".format(e))
+        mdiff.off(brake=True)
+        return False
 
 @safe_motor_control
 def execute_turn(angle_deg):
