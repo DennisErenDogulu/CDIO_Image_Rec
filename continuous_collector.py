@@ -454,54 +454,71 @@ class BallCollector:
     def deliver_balls(self) -> bool:
         """Run collector in reverse to deliver balls"""
         try:
-            message = {
-                "command": "COLLECT_REVERSE",
-                "duration": self.delivery_time
-            }
             return self.send_command("COLLECT_REVERSE", duration=self.delivery_time)
         except Exception as e:
             logger.error("Failed to deliver balls: {}".format(e))
             return False
 
-    def go_to_goal(self) -> bool:
-        """Move to goal and deliver balls"""
-        try:
-            # Calculate goal position (centered in Y)
-            goal_x = FIELD_WIDTH_CM - self.goal_approach_distance
-            goal_y = self.goal_y_center
-            goal_pos = (goal_x, goal_y)
-            
-            # Get approach vector
-            approach_pos, target_angle = self.get_approach_vector(goal_pos)
-            
-            # Turn to face goal
-            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-            if abs(angle_diff) > 5:
-                logger.info("Turning {:.1f} degrees to face goal".format(angle_diff))
-                if not self.turn(angle_diff):
-                    raise Exception("Turn to goal failed")
-                self.robot_heading = target_angle
-            
-            # Move to goal
-            distance = math.hypot(goal_pos[0] - self.robot_pos[0],
-                                goal_pos[1] - self.robot_pos[1])
-            logger.info("Moving {:.1f} cm to goal".format(distance))
-            if not self.move(distance):
-                raise Exception("Move to goal failed")
-            
-            # Update robot position
-            self.robot_pos = goal_pos
-            
-            # Deliver balls
-            logger.info("Delivering balls")
-            if not self.deliver_balls():
-                raise Exception("Ball delivery failed")
-            
-            return True
-            
-        except Exception as e:
-            logger.error("Goal approach failed: {}".format(e))
-            return False
+    def calculate_goal_approach_path(self, current_pos, current_heading):
+        """Calculate a smooth path to the goal using intermediate points"""
+        goal_x = FIELD_WIDTH_CM - self.goal_approach_distance
+        goal_y = self.goal_y_center
+        
+        # Calculate direct distance and angle to goal
+        dx = goal_x - current_pos[0]
+        dy = goal_y - current_pos[1]
+        direct_distance = math.hypot(dx, dy)
+        angle_to_goal = math.degrees(math.atan2(dy, dx))
+        
+        # If we're already well-aligned with the goal (within 15 degrees), just go straight
+        angle_diff = (angle_to_goal - current_heading + 180) % 360 - 180
+        if abs(angle_diff) < 15 and not check_wall_collision(current_pos, (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
+            return [{
+                'type': 'goal',
+                'pos': (goal_x, goal_y),
+                'angle': 0  # Face straight ahead at goal
+            }]
+        
+        # Otherwise, calculate a curved approach path
+        # First point: swing out to create better approach angle
+        swing_distance = min(50, direct_distance * 0.4)  # Don't swing out too far
+        
+        # If we're to the left of the goal, swing right, and vice versa
+        swing_direction = 1 if current_pos[1] < goal_y else -1
+        swing_angle = current_heading + (45 * swing_direction)  # 45-degree swing
+        
+        # Calculate swing point
+        swing_x = current_pos[0] + swing_distance * math.cos(math.radians(swing_angle))
+        swing_y = current_pos[1] + swing_distance * math.sin(math.radians(swing_angle))
+        
+        # Second point: intermediate approach point
+        approach_x = goal_x - (self.goal_approach_distance * 1.5)  # Further back from goal
+        approach_y = goal_y  # Aligned with goal
+        
+        # Check if points are reachable
+        path = []
+        if not check_wall_collision(current_pos, (swing_x, swing_y), self.walls, WALL_SAFETY_MARGIN):
+            path.append({
+                'type': 'approach',
+                'pos': (swing_x, swing_y),
+                'angle': swing_angle
+            })
+        
+        if not check_wall_collision((swing_x, swing_y), (approach_x, approach_y), self.walls, WALL_SAFETY_MARGIN):
+            path.append({
+                'type': 'approach',
+                'pos': (approach_x, approach_y),
+                'angle': 0  # Align with goal
+            })
+        
+        if not check_wall_collision((approach_x, approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
+            path.append({
+                'type': 'goal',
+                'pos': (goal_x, goal_y),
+                'angle': 0
+            })
+        
+        return path
 
     def collect_balls(self):
         """Main ball collection loop"""
@@ -562,6 +579,7 @@ class BallCollector:
                     # Plan path through all balls in the batch
                     path = []
                     current_pos = self.robot_pos
+                    current_heading = self.robot_heading
                     remaining_balls = current_batch.copy()
 
                     # Add balls to path in nearest-neighbor order
@@ -598,19 +616,13 @@ class BallCollector:
                         })
                         
                         current_pos = ball_pos
+                        current_heading = target_angle
                         remaining_balls.remove(closest_ball)
 
-                    # Add goal position to path if we have collected any balls
+                    # Add goal approach path if we have collected any balls
                     if path:
-                        goal_pos = (FIELD_WIDTH_CM - self.goal_approach_distance, self.goal_y_center)
-                        if not check_wall_collision(current_pos, goal_pos, self.walls, WALL_SAFETY_MARGIN):
-                            path.append({
-                                'type': 'goal',
-                                'pos': goal_pos,
-                                'angle': 0  # Face straight ahead at goal
-                            })
-                        else:
-                            logger.warning("Path to goal blocked by wall")
+                        goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
+                        path.extend(goal_path)
 
                     # Draw path on frame
                     frame_with_path = self.draw_path(frame, path)
