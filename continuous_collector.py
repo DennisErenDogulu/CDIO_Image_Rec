@@ -29,6 +29,10 @@ RF_WORKSPACE = "cdio-nczdp"
 RF_PROJECT = "cdio-golfbot2025"
 RF_VERSION = 12
 
+# Wall configuration
+WALL_SAFETY_MARGIN = 3  # cm, minimum distance to keep from walls
+GOAL_WIDTH = 30  # cm, width of the goal area to keep clear
+
 # Physical constraints
 FIELD_WIDTH_CM = 180
 FIELD_HEIGHT_CM = 120
@@ -48,6 +52,58 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def point_to_line_distance(point, line_start, line_end):
+    """Calculate the shortest distance from a point to a line segment"""
+    x, y = point
+    x1, y1 = line_start
+    x2, y2 = line_end
+    
+    # Vector from line start to end
+    line_vec = (x2 - x1, y2 - y1)
+    # Vector from line start to point
+    point_vec = (x - x1, y - y1)
+    # Length of line
+    line_len = math.hypot(line_vec[0], line_vec[1])
+    
+    if line_len == 0:
+        return math.hypot(point_vec[0], point_vec[1])
+    
+    # Project point vector onto line vector to get distance along line
+    t = max(0, min(1, (point_vec[0] * line_vec[0] + point_vec[1] * line_vec[1]) / (line_len * line_len)))
+    
+    # Calculate projection point
+    proj_x = x1 + t * line_vec[0]
+    proj_y = y1 + t * line_vec[1]
+    
+    return math.hypot(x - proj_x, y - proj_y)
+
+def check_wall_collision(start_pos, end_pos, walls, safety_margin):
+    """Check if a path between two points collides with any walls"""
+    for wall_start_x, wall_start_y, wall_end_x, wall_end_y in walls:
+        # Check if either endpoint is too close to the wall
+        if (point_to_line_distance(start_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin or
+            point_to_line_distance(end_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin):
+            return True
+            
+        # Check if path intersects with wall
+        # Using line segment intersection formula
+        x1, y1 = start_pos
+        x2, y2 = end_pos
+        x3, y3 = wall_start_x, wall_start_y
+        x4, y4 = wall_end_x, wall_end_y
+        
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if denom == 0:  # Lines are parallel
+            continue
+            
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+        
+        if 0 <= t <= 1 and 0 <= u <= 1:
+            return True
+            
+    return False
 
 class BallCollector:
     def __init__(self):
@@ -74,10 +130,83 @@ class BallCollector:
         self.calibration_points = []
         self.homography_matrix = None
         
+        # Wall configuration
+        self.walls = []  # Will be set after calibration
+        
         # Goal dimensions and positions
         self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal
         self.goal_approach_distance = 20  # Distance to stop in front of goal
         self.delivery_time = 2.0  # Seconds to run collector in reverse
+
+    def setup_walls(self):
+        """Set up wall segments based on calibration points, excluding goal areas"""
+        if len(self.calibration_points) != 4:
+            return
+
+        # Calculate goal positions (in cm)
+        goal_y_min = (FIELD_HEIGHT_CM / 2) - (GOAL_WIDTH / 2)
+        goal_y_max = (FIELD_HEIGHT_CM / 2) + (GOAL_WIDTH / 2)
+
+        # Create wall segments with small safety margin
+        margin = WALL_SAFETY_MARGIN
+        self.walls = [
+            # Bottom wall (excluding goal)
+            (margin, margin, FIELD_WIDTH_CM - margin, margin),
+            
+            # Top wall (excluding goal)
+            (margin, FIELD_HEIGHT_CM - margin, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin),
+            
+            # Left wall (split into two parts to exclude goal)
+            (margin, margin, margin, goal_y_min),
+            (margin, goal_y_max, margin, FIELD_HEIGHT_CM - margin),
+            
+            # Right wall (split into two parts to exclude goal)
+            (FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_y_min),
+            (FIELD_WIDTH_CM - margin, goal_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin)
+        ]
+
+    def draw_walls(self, frame):
+        """Draw walls and safety margins on the frame"""
+        if not self.homography_matrix is None and self.walls:
+            # Create a semi-transparent overlay
+            overlay = frame.copy()
+            
+            # Draw each wall segment
+            for wall in self.walls:
+                # Convert wall endpoints from cm to pixels
+                start_cm = np.array([[[wall[0], wall[1]]]], dtype="float32")
+                end_cm = np.array([[[wall[2], wall[3]]]], dtype="float32")
+                
+                start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
+                end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
+                
+                # Draw the wall line
+                cv2.line(overlay, tuple(start_px), tuple(end_px), (0, 0, 255), 2)
+                
+                # Draw safety margin area (semi-transparent)
+                margin_pts = []
+                angle = math.atan2(end_px[1] - start_px[1], end_px[0] - start_px[0])
+                margin_px = int(WALL_SAFETY_MARGIN * 10)  # Convert cm to approximate pixels
+                
+                # Calculate margin points
+                dx = int(margin_px * math.sin(angle))
+                dy = int(margin_px * math.cos(angle))
+                
+                margin_pts = np.array([
+                    [start_px[0] - dx, start_px[1] + dy],
+                    [end_px[0] - dx, end_px[1] + dy],
+                    [end_px[0] + dx, end_px[1] - dy],
+                    [start_px[0] + dx, start_px[1] - dy]
+                ], np.int32)
+                
+                # Draw safety margin area
+                cv2.fillPoly(overlay, [margin_pts], (0, 0, 255, 128))
+            
+            # Blend the overlay with the original frame
+            alpha = 0.3
+            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        
+        return frame
 
     def send_command(self, command: str, **params) -> bool:
         """Send a command to the EV3 server"""
@@ -137,7 +266,10 @@ class BallCollector:
                     ], dtype="float32")
                     src_pts = np.array(self.calibration_points, dtype="float32")
                     self.homography_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
-                    logger.info("✅ Homography calibration complete")
+                    
+                    # Set up walls after calibration
+                    self.setup_walls()
+                    logger.info("✅ Calibration and wall setup complete")
 
         cv2.namedWindow("Calibration")
         cv2.setMouseCallback("Calibration", mouse_callback)
@@ -384,6 +516,9 @@ class BallCollector:
                 if not ret:
                     continue
 
+                # Draw walls and safety margins
+                frame = self.draw_walls(frame)
+
                 # Add status overlay
                 frame = self.draw_status(frame)
 
@@ -436,10 +571,20 @@ class BallCollector:
                                              b[0] - current_pos[0],
                                              b[1] - current_pos[1]
                                          ))
-                        remaining_balls.remove(closest_ball)
                         
                         ball_pos = (closest_ball[0], closest_ball[1])
                         approach_pos, target_angle = self.get_approach_vector(ball_pos)
+                        
+                        # Check for wall collisions
+                        if check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
+                            logger.warning(f"Path to ball at {ball_pos} blocked by wall, skipping")
+                            remaining_balls.remove(closest_ball)
+                            continue
+                        
+                        if check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
+                            logger.warning(f"Approach to ball at {ball_pos} blocked by wall, skipping")
+                            remaining_balls.remove(closest_ball)
+                            continue
                         
                         path.append({
                             'type': 'approach',
@@ -453,13 +598,19 @@ class BallCollector:
                         })
                         
                         current_pos = ball_pos
+                        remaining_balls.remove(closest_ball)
 
-                    # Add goal position to path
-                    path.append({
-                        'type': 'goal',
-                        'pos': (FIELD_WIDTH_CM - self.goal_approach_distance, self.goal_y_center),
-                        'angle': 0  # Face straight ahead at goal
-                    })
+                    # Add goal position to path if we have collected any balls
+                    if path:
+                        goal_pos = (FIELD_WIDTH_CM - self.goal_approach_distance, self.goal_y_center)
+                        if not check_wall_collision(current_pos, goal_pos, self.walls, WALL_SAFETY_MARGIN):
+                            path.append({
+                                'type': 'goal',
+                                'pos': goal_pos,
+                                'angle': 0  # Face straight ahead at goal
+                            })
+                        else:
+                            logger.warning("Path to goal blocked by wall")
 
                     # Draw path on frame
                     frame_with_path = self.draw_path(frame, path)
