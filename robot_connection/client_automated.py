@@ -9,18 +9,15 @@ logger.setLevel(logging.INFO)
 def send_path(
     ip: str,
     port: int,
-    path: List[Tuple[int, int]],
+    path: List[dict],            # <─ NOW list of dicts, not tuples
     ball_cells: List[Tuple[int, int]],
     heading: str
 ) -> bool:
     """
-    Sender en JSON-melding til EV3s TCP-server:
-        {
-          "path":       [[gx1, gy1], [gx2, gy2], …],
-          "ball_cells": [[bx1, by1], [bx2, by2], …],
-          "heading":    "<E|N|S|W>"
-        }
-    Returnerer True, hvis EV3 svarer "DONE\n", ellers False.
+    Sends     { "path":[{"x":gx,"y":gy,"rev":false}, …],
+                "ball_cells":[[bx,by], …],
+                "heading":"E" }
+    Waits for "DONE\n" from the EV3.
     """
     payload = {
         "path":       path,
@@ -30,14 +27,15 @@ def send_path(
     message = json.dumps(payload) + "\n"
 
     try:
-        logger.info("Forbinder til EV3 %s:%d…", ip, port)
+        logger.info("Connecting to EV3 %s:%d…", ip, port)
         with socket.create_connection((ip, port), timeout=5) as s:
             s.sendall(message.encode("utf-8"))
-            logger.info("Sendt JSON → %s", message.strip())
+            logger.info("JSON sent → %s", message.strip())
 
             data = s.recv(32).decode("utf-8").strip()
-            logger.info("Modtog svar fra EV3: %s", data)
+            logger.info("Reply from EV3: %s", data)
             return data == "DONE"
     except Exception as e:
-        logger.error("Fejl ved send_path: %s", e)
+        logger.error("send_path error: %s", e)
         return False
+
