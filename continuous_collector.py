@@ -666,7 +666,14 @@ class BallCollector:
                                     logger.info(f"Collecting {point['ball_type']} ball")
                                     if not self.collect(COLLECTION_DISTANCE_CM):
                                         raise Exception("Collect command failed")
-                                else:
+                                elif point['type'] == 'goal':
+                                    logger.info(f"Moving {distance:.1f} cm to goal")
+                                    if not self.move(distance):
+                                        raise Exception("Move command failed")
+                                    # After reaching goal position, deliver balls
+                                    if not self.deliver_balls():
+                                        raise Exception("Ball delivery failed")
+                                else:  # approach point
                                     logger.info(f"Moving {distance:.1f} cm")
                                     if not self.move(distance):
                                         raise Exception("Move command failed")
@@ -681,11 +688,6 @@ class BallCollector:
                                     frame_with_path = self.draw_path(frame, path)
                                     cv2.imshow("Path Planning", frame_with_path)
                                     cv2.waitKey(1)
-                                
-                                # If this is the goal point, deliver balls
-                                if point['type'] == 'goal':
-                                    if not self.go_to_goal():
-                                        raise Exception("Goal delivery failed")
                             
                             # Pause briefly after completing the path
                             cv2.waitKey(1000)
