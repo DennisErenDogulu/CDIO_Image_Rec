@@ -183,26 +183,21 @@ class BallCollector:
         scale_x = frame.shape[1] / 416
         scale_y = frame.shape[0] / 416
         
-        # List of valid ball classes (add or remove classes as needed)
-        VALID_BALL_CLASSES = {'golf ball', 'tennis ball', 'ball'}
-        
         for pred in predictions.get('predictions', []):
-            # Only process if it's a ball class
-            if pred['class'].lower() in VALID_BALL_CLASSES:
-                x_px = int(pred['x'] * scale_x)
-                y_px = int(pred['y'] * scale_y)
+            x_px = int(pred['x'] * scale_x)
+            y_px = int(pred['y'] * scale_y)
+            
+            # Convert to cm using homography
+            if self.homography_matrix is not None:
+                pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                pt_cm = cv2.perspectiveTransform(pt_px, 
+                                               np.linalg.inv(self.homography_matrix))[0][0]
+                x_cm, y_cm = pt_cm
                 
-                # Convert to cm using homography
-                if self.homography_matrix is not None:
-                    pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-                    pt_cm = cv2.perspectiveTransform(pt_px, 
-                                                   np.linalg.inv(self.homography_matrix))[0][0]
-                    x_cm, y_cm = pt_cm
-                    
-                    # Check if ball is in ignored area
-                    if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                           IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                        balls.append((x_cm, y_cm, pred['class']))
+                # Check if ball is in ignored area
+                if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                    balls.append((x_cm, y_cm, pred['class']))
         
         return balls
 
