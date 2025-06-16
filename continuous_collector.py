@@ -35,40 +35,12 @@ FIELD_HEIGHT_CM = 120
 COLLECTION_DISTANCE_CM = 20  # Distance to move forward when collecting
 APPROACH_DISTANCE_CM = 30    # Distance to keep from ball for approach
 MAX_BALLS_PER_TRIP = 3
-WALL_BOUNDARY_CM = 2        # Safety boundary from walls
-GOAL_WIDTH_CM = 30          # Width of the goal area where boundary is ignored
 
 # Ignored area (center obstacle)
 IGNORED_AREA = {
     "x_min": 50, "x_max": 100,
     "y_min": 50, "y_max": 100
 }
-
-# Wall boundaries (excluding goals)
-WALL_BOUNDARIES = {
-    "top": {"y_min": 0, "y_max": WALL_BOUNDARY_CM},  # Top wall
-    "bottom": {"y_min": FIELD_HEIGHT_CM - WALL_BOUNDARY_CM, "y_max": FIELD_HEIGHT_CM},  # Bottom wall
-    "left": {"x_min": 0, "x_max": WALL_BOUNDARY_CM},  # Left wall
-    # Right wall is excluded as it contains the goals
-}
-
-def is_in_wall_boundary(x_cm: float, y_cm: float) -> bool:
-    """Check if a point is within the wall boundary zone (excluding goals)"""
-    # Check if point is near the goal area
-    goal_y_min = (FIELD_HEIGHT_CM - GOAL_WIDTH_CM) / 2
-    goal_y_max = (FIELD_HEIGHT_CM + GOAL_WIDTH_CM) / 2
-    near_goal = (x_cm > FIELD_WIDTH_CM - WALL_BOUNDARY_CM * 3 and 
-                goal_y_min < y_cm < goal_y_max)
-    
-    if near_goal:
-        return False
-        
-    # Check boundaries
-    in_top_wall = y_cm < WALL_BOUNDARIES["top"]["y_max"]
-    in_bottom_wall = y_cm > WALL_BOUNDARIES["bottom"]["y_min"]
-    in_left_wall = x_cm < WALL_BOUNDARIES["left"]["x_max"]
-    
-    return in_top_wall or in_bottom_wall or in_left_wall
 
 # Setup logging
 logging.basicConfig(
@@ -131,17 +103,9 @@ class BallCollector:
             logger.error("Failed to send command: {}".format(e))
             return False
 
-    def move(self, distance_cm: float, is_reverse: bool = False) -> bool:
-        """Move forward/backward by distance_cm
-        Note: On our robot, negative speed means forward movement
-        
-        Args:
-            distance_cm: The distance to move (always positive)
-            is_reverse: If True, move backwards; if False, move forwards
-        """
-        # If moving in reverse, negate the distance to get backward movement
-        actual_distance = -distance_cm if is_reverse else distance_cm
-        return self.send_command("MOVE", distance=actual_distance)
+    def move(self, distance_cm: float) -> bool:
+        """Move forward/backward by distance_cm"""
+        return self.send_command("MOVE", distance=distance_cm)
 
     def turn(self, angle_deg: float) -> bool:
         """Turn by angle_deg (positive = CCW)"""
@@ -222,110 +186,40 @@ class BallCollector:
                                                np.linalg.inv(self.homography_matrix))[0][0]
                 x_cm, y_cm = pt_cm
                 
-                # Check if ball is in ignored area or wall boundary
+                # Check if ball is in ignored area
                 if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]) and \
-                   not is_in_wall_boundary(x_cm, y_cm):
+                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
                     balls.append((x_cm, y_cm, pred['class']))
         
         return balls
 
-    def get_approach_vector(self, target_pos: Tuple[float, float], allow_reverse: bool = True) -> Tuple[Tuple[float, float], float, bool]:
-        """Calculate approach position and angle for a target position, with optional reverse movement
-        
-        Returns:
-            Tuple containing:
-            - approach_pos: (x, y) position to move to
-            - target_angle: angle to face in degrees
-            - use_reverse: whether to move in reverse
-        """
+    def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
+        """Calculate approach position and angle for a target position"""
         # Get vector from robot to target
         dx = target_pos[0] - self.robot_pos[0]
         dy = target_pos[1] - self.robot_pos[1]
         distance = math.hypot(dx, dy)
-        
-        # Calculate forward and reverse angles to target
-        forward_angle = math.degrees(math.atan2(dy, dx))
-        reverse_angle = (forward_angle + 180) % 360
         
         # Calculate approach point APPROACH_DISTANCE_CM before target
         ratio = (distance - APPROACH_DISTANCE_CM) / distance if distance > APPROACH_DISTANCE_CM else 0
         approach_x = self.robot_pos[0] + dx * ratio
         approach_y = self.robot_pos[1] + dy * ratio
         
-        if not allow_reverse:
-            return (approach_x, approach_y), forward_angle, False
-            
-        # Enhanced reverse movement decision logic:
-        # 1. Compare angle differences for forward vs reverse
-        forward_diff = abs((forward_angle - self.robot_heading + 180) % 360 - 180)
-        reverse_diff = abs((reverse_angle - self.robot_heading + 180) % 360 - 180)
+        # Calculate angle to target
+        target_angle = math.degrees(math.atan2(dy, dx))
         
-        # 2. Consider current robot position relative to target
-        # If robot is facing away from target (>90 degrees), favor reverse
-        facing_away = forward_diff > 90
-        
-        # 3. Consider distance - for very short movements, use current orientation
-        short_movement = distance < APPROACH_DISTANCE_CM * 1.5
-        
-        # Decide whether to use reverse based on all factors
-        use_reverse = allow_reverse and (
-            (facing_away and not short_movement) or  # Use reverse if facing away and not too close
-            (reverse_diff < forward_diff - 45)       # Use reverse if it requires significantly less turning
-        )
-        
-        return (approach_x, approach_y), (reverse_angle if use_reverse else forward_angle), use_reverse
+        return (approach_x, approach_y), target_angle
 
     def draw_path(self, frame, path):
         """Draw the planned path on the frame"""
         if not self.homography_matrix is None:
             overlay = frame.copy()
             
-            # Draw wall boundaries
-            if self.homography_matrix is not None:
-                # Draw top and bottom walls
-                for y in [0, FIELD_HEIGHT_CM]:
-                    pts_cm = np.array([[[0, y], [FIELD_WIDTH_CM, y]]], dtype="float32")
-                    pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
-                    cv2.line(overlay, tuple(map(int, pts_px[0])), tuple(map(int, pts_px[1])), (0, 0, 255), 2)
-                
-                # Draw left wall
-                pts_cm = np.array([[[0, 0], [0, FIELD_HEIGHT_CM]]], dtype="float32")
-                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
-                cv2.line(overlay, tuple(map(int, pts_px[0])), tuple(map(int, pts_px[1])), (0, 0, 255), 2)
-                
-                # Draw boundary zones (semi-transparent)
-                alpha = 0.3
-                boundary_overlay = overlay.copy()
-                
-                # Top boundary
-                pts_cm = np.array([[[0, 0], [FIELD_WIDTH_CM, 0], 
-                                  [FIELD_WIDTH_CM, WALL_BOUNDARY_CM], [0, WALL_BOUNDARY_CM]]], dtype="float32")
-                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
-                cv2.fillPoly(boundary_overlay, [pts_px.astype(int)], (0, 0, 255))
-                
-                # Bottom boundary
-                pts_cm = np.array([[[0, FIELD_HEIGHT_CM - WALL_BOUNDARY_CM], 
-                                  [FIELD_WIDTH_CM, FIELD_HEIGHT_CM - WALL_BOUNDARY_CM],
-                                  [FIELD_WIDTH_CM, FIELD_HEIGHT_CM], [0, FIELD_HEIGHT_CM]]], dtype="float32")
-                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
-                cv2.fillPoly(boundary_overlay, [pts_px.astype(int)], (0, 0, 255))
-                
-                # Left boundary
-                pts_cm = np.array([[[0, 0], [WALL_BOUNDARY_CM, 0],
-                                  [WALL_BOUNDARY_CM, FIELD_HEIGHT_CM], [0, FIELD_HEIGHT_CM]]], dtype="float32")
-                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
-                cv2.fillPoly(boundary_overlay, [pts_px.astype(int)], (0, 0, 255))
-                
-                # Blend boundary overlay
-                cv2.addWeighted(boundary_overlay, alpha, overlay, 1 - alpha, 0, overlay)
-            
             # Colors for different point types
             colors = {
                 'approach': (0, 255, 255),  # Yellow
                 'collect': (0, 255, 0),     # Green
-                'goal': (0, 0, 255),        # Red
-                'reverse': (255, 128, 0)    # Orange for reverse movements
+                'goal': (0, 0, 255)         # Red
             }
             
             # Draw lines between points
@@ -337,10 +231,8 @@ class BallCollector:
                 start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
                 end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
                 
-                # Draw line with different color for reverse movements
-                is_reverse = path[i].get('reverse', False)
-                line_color = colors['reverse'] if is_reverse else (150, 150, 150)
-                cv2.line(overlay, tuple(start_px), tuple(end_px), line_color, 2)
+                # Draw line
+                cv2.line(overlay, tuple(start_px), tuple(end_px), (150, 150, 150), 2)
             
             # Draw points
             for point in path:
@@ -356,8 +248,7 @@ class BallCollector:
                     angle_rad = math.radians(point['angle'])
                     end_x = pt_px[0] + int(20 * math.cos(angle_rad))
                     end_y = pt_px[1] + int(20 * math.sin(angle_rad))
-                    arrow_color = colors['reverse'] if point.get('reverse', False) else color
-                    cv2.arrowedLine(overlay, tuple(pt_px), (end_x, end_y), arrow_color, 2)
+                    cv2.arrowedLine(overlay, tuple(pt_px), (end_x, end_y), color, 2)
                 
                 # Add labels
                 if point['type'] == 'collect':
@@ -381,8 +272,7 @@ class BallCollector:
             end_x = robot_px[0] + int(25 * math.cos(angle_rad))
             end_y = robot_px[1] + int(25 * math.sin(angle_rad))
             cv2.arrowedLine(frame, tuple(robot_px), (end_x, end_y), (255, 0, 0), 2)
-            
-            return frame
+        
         return frame
 
     def get_robot_status(self) -> dict:
@@ -450,7 +340,7 @@ class BallCollector:
             goal_pos = (goal_x, goal_y)
             
             # Get approach vector
-            approach_pos, target_angle, use_reverse = self.get_approach_vector(goal_pos)
+            approach_pos, target_angle = self.get_approach_vector(goal_pos)
             
             # Turn to face goal
             angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
@@ -479,66 +369,6 @@ class BallCollector:
             
         except Exception as e:
             logger.error("Goal approach failed: {}".format(e))
-            return False
-
-    def execute_path(self, path: List[dict]) -> bool:
-        """Execute a planned path with support for reverse movement"""
-        try:
-            for point in path:
-                # Calculate turn angle from current heading
-                target_pos = point['pos']
-                dx = target_pos[0] - self.robot_pos[0]
-                dy = target_pos[1] - self.robot_pos[1]
-                distance = math.hypot(dx, dy)
-                
-                # Determine movement direction
-                use_reverse = point.get('reverse', False)
-                target_angle = math.degrees(math.atan2(dy, dx))
-                if use_reverse:
-                    target_angle = (target_angle + 180) % 360
-                
-                # Turn to face target (if needed)
-                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                if abs(angle_diff) > 5:
-                    logger.info(f"Turning {angle_diff:.1f} degrees")
-                    if not self.turn(angle_diff):
-                        raise Exception("Turn command failed")
-                    self.robot_heading = target_angle
-                    time.sleep(0.2)  # Small pause after turn
-                
-                # Execute movement based on point type
-                if point['type'] == 'collect':
-                    logger.info(f"Collecting {point['ball_type']} ball")
-                    if not self.collect(COLLECTION_DISTANCE_CM):
-                        raise Exception("Collect command failed")
-                else:
-                    movement_type = "backwards" if use_reverse else "forwards"
-                    logger.info(f"Moving {distance:.1f} cm {movement_type}")
-                    if not self.move(distance, use_reverse):
-                        raise Exception("Move command failed")
-                    time.sleep(0.1)  # Small pause after movement
-                
-                # Update robot position
-                self.robot_pos = target_pos
-                
-                # Update visualization
-                ret, frame = self.cap.read()
-                if ret:
-                    frame = self.draw_status(frame)
-                    frame_with_path = self.draw_path(frame, path)
-                    cv2.imshow("Path Planning", frame_with_path)
-                    cv2.waitKey(1)
-                
-                # If this is the goal point, deliver balls
-                if point['type'] == 'goal':
-                    if not self.go_to_goal():
-                        raise Exception("Goal delivery failed")
-            
-            return True
-            
-        except Exception as e:
-            logger.error("Path execution failed: {}".format(e))
-            self.stop()
             return False
 
     def collect_balls(self):
@@ -609,13 +439,12 @@ class BallCollector:
                         remaining_balls.remove(closest_ball)
                         
                         ball_pos = (closest_ball[0], closest_ball[1])
-                        approach_pos, target_angle, use_reverse = self.get_approach_vector(ball_pos)
+                        approach_pos, target_angle = self.get_approach_vector(ball_pos)
                         
                         path.append({
                             'type': 'approach',
                             'pos': approach_pos,
-                            'angle': target_angle,
-                            'reverse': use_reverse
+                            'angle': target_angle
                         })
                         path.append({
                             'type': 'collect',
@@ -664,12 +493,52 @@ class BallCollector:
                         logger.info("Executing path with {} points".format(len(path)))
                         
                         try:
-                            if self.execute_path(path):
-                                # Pause briefly after completing the path
-                                cv2.waitKey(1000)
-                            else:
-                                raise Exception("Path execution failed")
-                        
+                            for point in path:
+                                # Calculate turn angle from current heading
+                                target_pos = point['pos']
+                                dx = target_pos[0] - self.robot_pos[0]
+                                dy = target_pos[1] - self.robot_pos[1]
+                                target_angle = math.degrees(math.atan2(dy, dx))
+                                
+                                # Turn to face target
+                                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                                if abs(angle_diff) > 5:
+                                    logger.info(f"Turning {angle_diff:.1f} degrees")
+                                    if not self.turn(angle_diff):
+                                        raise Exception("Turn command failed")
+                                    self.robot_heading = target_angle
+                                
+                                # Move to target position
+                                distance = math.hypot(dx, dy)
+                                
+                                if point['type'] == 'collect':
+                                    logger.info(f"Collecting {point['ball_type']} ball")
+                                    if not self.collect(COLLECTION_DISTANCE_CM):
+                                        raise Exception("Collect command failed")
+                                else:
+                                    logger.info(f"Moving {distance:.1f} cm")
+                                    if not self.move(distance):
+                                        raise Exception("Move command failed")
+                                
+                                # Update robot position
+                                self.robot_pos = target_pos
+                                
+                                # Update visualization
+                                ret, frame = self.cap.read()
+                                if ret:
+                                    frame = self.draw_status(frame)
+                                    frame_with_path = self.draw_path(frame, path)
+                                    cv2.imshow("Path Planning", frame_with_path)
+                                    cv2.waitKey(1)
+                                
+                                # If this is the goal point, deliver balls
+                                if point['type'] == 'goal':
+                                    if not self.go_to_goal():
+                                        raise Exception("Goal delivery failed")
+                            
+                            # Pause briefly after completing the path
+                            cv2.waitKey(1000)
+                            
                         except Exception as e:
                             logger.error("Path execution failed: {}".format(e))
                             self.stop()
