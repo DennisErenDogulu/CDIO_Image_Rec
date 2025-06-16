@@ -34,8 +34,10 @@ power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
 NORMAL_SPEED_RPM = -40  # Negative for forward movement
+REVERSE_SPEED_RPM = 40  # Positive for backward movement
 SLOW_SPEED_RPM = -25   # Negative for forward movement
-TURN_SPEED_RPM = -40   # Negative for forward movement
+SLOW_REVERSE_SPEED_RPM = 25  # Positive for backward movement
+TURN_SPEED_RPM = -40   # For turning
 COLLECTOR_SPEED = 25  # Percentage
 
 # Acceleration control (ramp up/down)
@@ -83,10 +85,10 @@ def execute_move(distance_cm):
         mdiff.ramp_up_sp = accel_time
         mdiff.ramp_down_sp = accel_time
         
-        # Set speed (negative means forward movement on our robot)
-        # If distance is positive (forward), use negative speed
-        # If distance is negative (backward), use positive speed
-        speed = NORMAL_SPEED_RPM if distance_cm > 0 else -NORMAL_SPEED_RPM
+        # Set speed based on direction
+        # For forward (positive distance): use NORMAL_SPEED_RPM (negative)
+        # For backward (negative distance): use REVERSE_SPEED_RPM (positive)
+        speed = REVERSE_SPEED_RPM if is_reverse else NORMAL_SPEED_RPM
         
         # Convert distance to mm (always positive)
         distance_mm = abs(distance_cm) * 11.1  # adjusted cm to mm conversion

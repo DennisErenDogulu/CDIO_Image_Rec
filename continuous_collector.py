@@ -183,26 +183,38 @@ class BallCollector:
         scale_x = frame.shape[1] / 416
         scale_y = frame.shape[0] / 416
         
+        # List of valid ball classes (add or remove classes as needed)
+        VALID_BALL_CLASSES = {'golf ball', 'tennis ball', 'ball'}
+        
         for pred in predictions.get('predictions', []):
-            x_px = int(pred['x'] * scale_x)
-            y_px = int(pred['y'] * scale_y)
-            
-            # Convert to cm using homography
-            if self.homography_matrix is not None:
-                pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(pt_px, 
-                                               np.linalg.inv(self.homography_matrix))[0][0]
-                x_cm, y_cm = pt_cm
+            # Only process if it's a ball class
+            if pred['class'].lower() in VALID_BALL_CLASSES:
+                x_px = int(pred['x'] * scale_x)
+                y_px = int(pred['y'] * scale_y)
                 
-                # Check if ball is in ignored area
-                if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                    balls.append((x_cm, y_cm, pred['class']))
+                # Convert to cm using homography
+                if self.homography_matrix is not None:
+                    pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                    pt_cm = cv2.perspectiveTransform(pt_px, 
+                                                   np.linalg.inv(self.homography_matrix))[0][0]
+                    x_cm, y_cm = pt_cm
+                    
+                    # Check if ball is in ignored area
+                    if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                           IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                        balls.append((x_cm, y_cm, pred['class']))
         
         return balls
 
     def get_approach_vector(self, target_pos: Tuple[float, float], allow_reverse: bool = True) -> Tuple[Tuple[float, float], float, bool]:
-        """Calculate approach position and angle for a target position, with optional reverse movement"""
+        """Calculate approach position and angle for a target position, with optional reverse movement
+        
+        Returns:
+            Tuple containing:
+            - approach_pos: (x, y) position to move to
+            - target_angle: angle to face in degrees
+            - use_reverse: whether to move in reverse
+        """
         # Get vector from robot to target
         dx = target_pos[0] - self.robot_pos[0]
         dy = target_pos[1] - self.robot_pos[1]
@@ -220,13 +232,23 @@ class BallCollector:
         if not allow_reverse:
             return (approach_x, approach_y), forward_angle, False
             
-        # Determine if reverse movement would be more efficient
-        # Compare the angle difference for forward vs reverse movement
+        # Enhanced reverse movement decision logic:
+        # 1. Compare angle differences for forward vs reverse
         forward_diff = abs((forward_angle - self.robot_heading + 180) % 360 - 180)
         reverse_diff = abs((reverse_angle - self.robot_heading + 180) % 360 - 180)
         
-        # Choose reverse if it requires less turning
-        use_reverse = allow_reverse and reverse_diff < forward_diff
+        # 2. Consider current robot position relative to target
+        # If robot is facing away from target (>90 degrees), favor reverse
+        facing_away = forward_diff > 90
+        
+        # 3. Consider distance - for very short movements, use current orientation
+        short_movement = distance < APPROACH_DISTANCE_CM * 1.5
+        
+        # Decide whether to use reverse based on all factors
+        use_reverse = allow_reverse and (
+            (facing_away and not short_movement) or  # Use reverse if facing away and not too close
+            (reverse_diff < forward_diff - 45)       # Use reverse if it requires significantly less turning
+        )
         
         return (approach_x, approach_y), (reverse_angle if use_reverse else forward_angle), use_reverse
 
