@@ -11,7 +11,7 @@ from ev3dev2.display import Display
 from ev3dev2.power import PowerSupply
 
 # ───────── Hardware Setup ─────────
-AXLE_TRACK_MM = 150    # Axle distance in mm
+AXLE_TRACK_MM = 570    # Axle distance in mm
 WHEEL_DIAM_MM = 69     # Wheel diameter in mm
 WHEEL_WIDTH_MM = 35    # Wheel width in mm
 
@@ -36,7 +36,7 @@ power = PowerSupply()               # For battery monitoring
 NORMAL_SPEED_RPM = -40
 SLOW_SPEED_RPM = -25
 TURN_SPEED_RPM = -50  # Even slower turns for more precision
-COLLECTOR_SPEED = -50  # Percentage
+COLLECTOR_SPEED = 50  # Percentage
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
@@ -84,20 +84,36 @@ def execute_move(distance_cm):
 def execute_turn(angle_deg):
     """Turn by angle_deg (positive = CCW, negative = CW)"""
     try:
-        # Set even slower speed and longer acceleration for turns
-        mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 3    # Triple the acceleration time
-        mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 3  # Triple the deceleration time
+        # Set even slower speed for turns
+        turn_speed = TURN_SPEED_RPM / 2  # Half the normal turn speed for more precision
         
-        # For sharper turns:
-        # 1. Stop completely first with longer pause
-        mdiff.off(brake=True)
-        time.sleep(0.3)  # Longer pause to ensure complete stop
-        
-        # 2. Turn with very slow speed for maximum precision
-        mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), angle_deg)
-        
-        # 3. Longer pause after turn
-        time.sleep(0.3)
+        # For sharp turns (> 45 degrees), use tank-style turning
+        if abs(angle_deg) > 45:
+            # Stop completely first
+            mdiff.off(brake=True)
+            time.sleep(0.5)  # Longer pause to ensure complete stop
+            
+            # Calculate turn duration based on angle
+            # Empirically determined: ~90 degrees takes about 2 seconds at half speed
+            duration = abs(angle_deg) * (2.0 / 90.0)
+            
+            # Set opposite speeds for tank turn
+            if angle_deg > 0:  # CCW
+                mdiff.left_motor.on(SpeedRPM(-turn_speed))
+                mdiff.right_motor.on(SpeedRPM(turn_speed))
+            else:  # CW
+                mdiff.left_motor.on(SpeedRPM(turn_speed))
+                mdiff.right_motor.on(SpeedRPM(-turn_speed))
+            
+            # Hold the turn
+            time.sleep(duration)
+            
+            # Stop with brake
+            mdiff.off(brake=True)
+            time.sleep(0.5)  # Pause after turn
+        else:
+            # For gentle turns, use the normal turn_degrees method
+            mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), angle_deg)
         
         return True
     except Exception as e:
