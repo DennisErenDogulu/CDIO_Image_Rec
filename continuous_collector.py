@@ -21,7 +21,7 @@ from typing import List, Tuple,Dict ,Optional
 from roboflow import Roboflow
 import time
 
-from client_automated import send_path 
+from robot_connection.client_automated import send_path 
 
 # Configuration
 EV3_IP = "172.20.10.6"
