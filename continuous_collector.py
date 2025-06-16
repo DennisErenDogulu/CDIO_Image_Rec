@@ -35,12 +35,40 @@ FIELD_HEIGHT_CM = 120
 COLLECTION_DISTANCE_CM = 20  # Distance to move forward when collecting
 APPROACH_DISTANCE_CM = 30    # Distance to keep from ball for approach
 MAX_BALLS_PER_TRIP = 3
+WALL_BOUNDARY_CM = 2        # Safety boundary from walls
+GOAL_WIDTH_CM = 30          # Width of the goal area where boundary is ignored
 
 # Ignored area (center obstacle)
 IGNORED_AREA = {
     "x_min": 50, "x_max": 100,
     "y_min": 50, "y_max": 100
 }
+
+# Wall boundaries (excluding goals)
+WALL_BOUNDARIES = {
+    "top": {"y_min": 0, "y_max": WALL_BOUNDARY_CM},  # Top wall
+    "bottom": {"y_min": FIELD_HEIGHT_CM - WALL_BOUNDARY_CM, "y_max": FIELD_HEIGHT_CM},  # Bottom wall
+    "left": {"x_min": 0, "x_max": WALL_BOUNDARY_CM},  # Left wall
+    # Right wall is excluded as it contains the goals
+}
+
+def is_in_wall_boundary(x_cm: float, y_cm: float) -> bool:
+    """Check if a point is within the wall boundary zone (excluding goals)"""
+    # Check if point is near the goal area
+    goal_y_min = (FIELD_HEIGHT_CM - GOAL_WIDTH_CM) / 2
+    goal_y_max = (FIELD_HEIGHT_CM + GOAL_WIDTH_CM) / 2
+    near_goal = (x_cm > FIELD_WIDTH_CM - WALL_BOUNDARY_CM * 3 and 
+                goal_y_min < y_cm < goal_y_max)
+    
+    if near_goal:
+        return False
+        
+    # Check boundaries
+    in_top_wall = y_cm < WALL_BOUNDARIES["top"]["y_max"]
+    in_bottom_wall = y_cm > WALL_BOUNDARIES["bottom"]["y_min"]
+    in_left_wall = x_cm < WALL_BOUNDARIES["left"]["x_max"]
+    
+    return in_top_wall or in_bottom_wall or in_left_wall
 
 # Setup logging
 logging.basicConfig(
@@ -194,9 +222,10 @@ class BallCollector:
                                                np.linalg.inv(self.homography_matrix))[0][0]
                 x_cm, y_cm = pt_cm
                 
-                # Check if ball is in ignored area
+                # Check if ball is in ignored area or wall boundary
                 if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]) and \
+                   not is_in_wall_boundary(x_cm, y_cm):
                     balls.append((x_cm, y_cm, pred['class']))
         
         return balls
@@ -251,6 +280,45 @@ class BallCollector:
         """Draw the planned path on the frame"""
         if not self.homography_matrix is None:
             overlay = frame.copy()
+            
+            # Draw wall boundaries
+            if self.homography_matrix is not None:
+                # Draw top and bottom walls
+                for y in [0, FIELD_HEIGHT_CM]:
+                    pts_cm = np.array([[[0, y], [FIELD_WIDTH_CM, y]]], dtype="float32")
+                    pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
+                    cv2.line(overlay, tuple(map(int, pts_px[0])), tuple(map(int, pts_px[1])), (0, 0, 255), 2)
+                
+                # Draw left wall
+                pts_cm = np.array([[[0, 0], [0, FIELD_HEIGHT_CM]]], dtype="float32")
+                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
+                cv2.line(overlay, tuple(map(int, pts_px[0])), tuple(map(int, pts_px[1])), (0, 0, 255), 2)
+                
+                # Draw boundary zones (semi-transparent)
+                alpha = 0.3
+                boundary_overlay = overlay.copy()
+                
+                # Top boundary
+                pts_cm = np.array([[[0, 0], [FIELD_WIDTH_CM, 0], 
+                                  [FIELD_WIDTH_CM, WALL_BOUNDARY_CM], [0, WALL_BOUNDARY_CM]]], dtype="float32")
+                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
+                cv2.fillPoly(boundary_overlay, [pts_px.astype(int)], (0, 0, 255))
+                
+                # Bottom boundary
+                pts_cm = np.array([[[0, FIELD_HEIGHT_CM - WALL_BOUNDARY_CM], 
+                                  [FIELD_WIDTH_CM, FIELD_HEIGHT_CM - WALL_BOUNDARY_CM],
+                                  [FIELD_WIDTH_CM, FIELD_HEIGHT_CM], [0, FIELD_HEIGHT_CM]]], dtype="float32")
+                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
+                cv2.fillPoly(boundary_overlay, [pts_px.astype(int)], (0, 0, 255))
+                
+                # Left boundary
+                pts_cm = np.array([[[0, 0], [WALL_BOUNDARY_CM, 0],
+                                  [WALL_BOUNDARY_CM, FIELD_HEIGHT_CM], [0, FIELD_HEIGHT_CM]]], dtype="float32")
+                pts_px = cv2.perspectiveTransform(pts_cm, self.homography_matrix)[0]
+                cv2.fillPoly(boundary_overlay, [pts_px.astype(int)], (0, 0, 255))
+                
+                # Blend boundary overlay
+                cv2.addWeighted(boundary_overlay, alpha, overlay, 1 - alpha, 0, overlay)
             
             # Colors for different point types
             colors = {
