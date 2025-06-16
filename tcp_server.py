@@ -47,6 +47,7 @@ CM_TO_MM   = 11.1               # 1 cm ≅ 11.1 mm (calibration)
 TURN_FACTOR = (math.pi * AXLE_TRACK_MM) / 360.0 * 1.25   # with compensation
 
 # ───────── Safe wrappers ─────────
+
 def safe_motor_control(func):
     def wrapper(*args, **kw):
         try:
@@ -54,7 +55,7 @@ def safe_motor_control(func):
             mdiff.off(brake=True)
             return result
         except Exception as e:
-            print(f"[Motor] {func.__name__}: {e}")
+            print("[Motor] {}: {}".format(func.__name__, e))
             mdiff.off(brake=True)
             collector.off(brake=True)
             return False
@@ -116,6 +117,7 @@ def execute_stop():
     return True
 
 # ───────── STATUS helper ─────────
+
 def get_status():
     try:
         return json.dumps({
@@ -139,6 +141,7 @@ def get_status():
         return json.dumps({"error": str(e)})
 
 # ───────── ★ NEW : waypoint executor ─────────
+
 def drive_path(path):
     """
     Drive the list of waypoints.
@@ -168,15 +171,16 @@ def drive_path(path):
     return True
 
 # ───────── Connection handler ─────────
+
 def handle_client(conn, addr):
-    print(f"[TCP] Client {addr} connected")
+    print("[TCP] Client {} connected".format(addr))
     try:
         conn.settimeout(5.0)
         data_buffer = ""
         while True:
             chunk = conn.recv(1024)
             if not chunk:
-                print(f"[TCP] Client {addr} disconnected before data.")
+                print("[TCP] Client {} disconnected before data.".format(addr))
                 return
             data_buffer += chunk.decode()
             if "\n" in data_buffer:
@@ -214,25 +218,27 @@ def handle_client(conn, addr):
             conn.sendall(get_status().encode() + b"\n")
             return
         else:
-            print(f"[TCP] Unknown command {cmd}")
+            print("[TCP] Unknown command {}".format(cmd))
 
         conn.sendall(b"OK\n" if ok else b"ERROR\n")
 
     except socket.timeout:
-        print(f"[TCP] Timeout with {addr}")
+        print("[TCP] Timeout with {}".format(addr))
         conn.sendall(b"ERROR\n")
     except Exception as e:
-        print(f"[TCP] {addr} error: {e}")
+        print("[TCP] {} error: {}".format(addr, e))
         conn.sendall(b"ERROR\n")
     finally:
         conn.close()
 
 # ───────── Main server loop ─────────
+
 def main():
     HOST, PORT = "", 12345
-    print(f"[TCP] Server on port {PORT}")
-    print(f"[TCP] Battery: {power.measured_voltage:.1f} V "
-          f"({power.measured_voltage / power.max_voltage * 100:.0f} %)")
+    print("[TCP] Server on port {}".format(PORT))
+    print("[TCP] Battery: {:.1f} V ({:.0f} %)".format(
+          power.measured_voltage,
+          power.measured_voltage / power.max_voltage * 100))
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
