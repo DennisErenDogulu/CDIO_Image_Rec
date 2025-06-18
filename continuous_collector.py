@@ -27,11 +27,16 @@ RF_WORKSPACE = "cdio-nczdp"
 RF_PROJECT = "cdio-golfbot2025" 
 RF_VERSION = 13
 
-# Color detection ranges (HSV)
+# Color detection ranges (HSV) - Only for markers, balls will use adaptive thresholding
 GREEN_LOWER = np.array([35, 50, 50])
 GREEN_UPPER = np.array([85, 255, 255])
 PINK_LOWER = np.array([145, 50, 50])
 PINK_UPPER = np.array([175, 255, 255])
+# Add ball color ranges
+WHITE_LOWER = np.array([0, 0, 200])  # High value, low saturation for white
+WHITE_UPPER = np.array([180, 30, 255])
+ORANGE_LOWER = np.array([5, 150, 150])  # Orange hue range
+ORANGE_UPPER = np.array([15, 255, 255])
 
 # Marker dimensions
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
@@ -64,6 +69,13 @@ IGNORED_AREA = {
     "x_min": 50, "x_max": 100,
     "y_min": 50, "y_max": 100
 }
+
+# Field sampling configuration
+SAMPLE_REGIONS = 9  # 3x3 grid of sampling regions
+SAMPLES_PER_REGION = 100  # Number of random samples per region
+WHITE_THRESHOLD = 1.3  # Multiplier for white ball detection (higher than field average)
+ORANGE_HUE_RANGE = 15  # +/- range around orange hue
+ORANGE_SAT_MULT = 1.5  # Multiplier for orange saturation threshold
 
 # Setup logging
 logging.basicConfig(
@@ -126,11 +138,6 @@ def check_wall_collision(start_pos, end_pos, walls, safety_margin):
 
 class BallCollector:
     def __init__(self):
-        # Initialize Roboflow
-        self.rf = Roboflow(api_key=ROBOFLOW_API_KEY)
-        self.project = self.rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
-        self.model = self.project.version(RF_VERSION).model
-        
         # Initialize camera
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
         if not self.cap.isOpened():
@@ -171,6 +178,13 @@ class BallCollector:
         self.collected_balls = 0
         self.delivery_time = 2.0  # Seconds to run collector in reverse
 
+        # Add debug window flag
+        self.show_debug = True
+
+        # Add field HSV reference values
+        self.field_hsv_avg = None
+        self.field_hsv_std = None
+
     def detect_markers(self, frame):
         """Detect green base and pink direction markers"""
         # Convert to HSV color space
@@ -202,7 +216,216 @@ class BallCollector:
                 if M["m00"] != 0:
                     pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
+        # Draw debug visualization if enabled
+        if self.show_debug:
+            debug_frame = frame.copy()
+            if green_center:
+                cv2.circle(debug_frame, green_center, 10, (0, 255, 0), -1)
+                cv2.circle(debug_frame, green_center, 12, (255, 255, 255), 2)
+            if pink_center:
+                cv2.circle(debug_frame, pink_center, 8, (255, 192, 203), -1)
+                cv2.circle(debug_frame, pink_center, 10, (255, 255, 255), 2)
+            if green_center and pink_center:
+                cv2.line(debug_frame, green_center, pink_center, (255, 255, 255), 2)
+            
+            # Show masks and debug frame
+            debug_view = np.hstack([
+                cv2.cvtColor(green_mask, cv2.COLOR_GRAY2BGR),
+                cv2.cvtColor(pink_mask, cv2.COLOR_GRAY2BGR),
+                debug_frame
+            ])
+            cv2.imshow("Marker Detection Debug", debug_view)
+            cv2.waitKey(1)
+        
         return green_center, pink_center
+
+    def sample_field_hsv(self, frame):
+        """Sample HSV values from the field to establish reference values"""
+        if self.homography_matrix is None:
+            return
+            
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        height, width = frame.shape[:2]
+        samples = []
+        
+        # Create a grid of sampling regions
+        grid_h = 3
+        grid_w = 3
+        region_h = height // grid_h
+        region_w = width // grid_w
+        
+        for i in range(grid_h):
+            for j in range(grid_w):
+                # Define region boundaries
+                y1 = i * region_h
+                y2 = (i + 1) * region_h
+                x1 = j * region_w
+                x2 = (j + 1) * region_w
+                
+                # Take random samples from this region
+                for _ in range(SAMPLES_PER_REGION):
+                    x = np.random.randint(x1, x2)
+                    y = np.random.randint(y1, y2)
+                    
+                    # Convert pixel coordinates to field coordinates
+                    pt_px = np.array([[[float(x), float(y)]]], dtype="float32")
+                    pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
+                    
+                    # Only use points within field boundaries and outside ignored area
+                    if (self.is_within_field(pt_cm[0], pt_cm[1]) and
+                        not (IGNORED_AREA["x_min"] <= pt_cm[0] <= IGNORED_AREA["x_max"] and
+                             IGNORED_AREA["y_min"] <= pt_cm[1] <= IGNORED_AREA["y_max"])):
+                        samples.append(hsv[y, x])
+        
+        if samples:
+            samples = np.array(samples)
+            self.field_hsv_avg = np.mean(samples, axis=0)
+            self.field_hsv_std = np.std(samples, axis=0)
+            
+            if self.show_debug:
+                # Visualize sampling points and statistics
+                debug_frame = frame.copy()
+                for i in range(grid_h):
+                    for j in range(grid_w):
+                        cv2.rectangle(debug_frame,
+                                    (j * region_w, i * region_h),
+                                    ((j + 1) * region_w, (i + 1) * region_h),
+                                    (0, 255, 0), 1)
+                
+                # Show HSV statistics
+                stats_text = [
+                    f"Field HSV Avg: {self.field_hsv_avg}",
+                    f"Field HSV Std: {self.field_hsv_std}"
+                ]
+                y = 30
+                for text in stats_text:
+                    cv2.putText(debug_frame, text, (10, y),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    y += 20
+                
+                cv2.imshow("Field Sampling Debug", debug_frame)
+                cv2.waitKey(1)
+
+    def detect_balls(self) -> List[Tuple[float, float, str]]:
+        """Detect balls in current camera view using adaptive HSV thresholding"""
+        ret, frame = self.cap.read()
+        if not ret:
+            return []
+
+        # Update field HSV reference values periodically
+        if self.field_hsv_avg is None:
+            self.sample_field_hsv(frame)
+        
+        # Convert to HSV color space
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        balls = []
+        
+        if self.field_hsv_avg is not None:
+            # Create masks for white and orange balls using adaptive thresholds
+            
+            # White balls: Higher value, lower saturation than field
+            white_mask = cv2.inRange(hsv, 
+                np.array([0,
+                         0,
+                         min(255, self.field_hsv_avg[2] * WHITE_THRESHOLD)]),
+                np.array([180,
+                         max(0, self.field_hsv_avg[1] * 0.5),
+                         255]))
+            
+            # Orange balls: Specific hue range, higher saturation than field
+            orange_center_hue = 10  # Orange hue in HSV
+            orange_mask = cv2.inRange(hsv,
+                np.array([max(0, orange_center_hue - ORANGE_HUE_RANGE),
+                         min(255, self.field_hsv_avg[1] * ORANGE_SAT_MULT),
+                         min(255, self.field_hsv_avg[2] * 0.8)]),
+                np.array([min(180, orange_center_hue + ORANGE_HUE_RANGE),
+                         255,
+                         255]))
+            
+            # Apply noise reduction
+            kernelSize = (5, 5)
+            white_mask = cv2.GaussianBlur(white_mask, kernelSize, 0)
+            orange_mask = cv2.GaussianBlur(orange_mask, kernelSize, 0)
+            
+            white_mask = cv2.erode(white_mask, None, iterations=1)
+            white_mask = cv2.dilate(white_mask, None, iterations=2)
+            
+            orange_mask = cv2.erode(orange_mask, None, iterations=1)
+            orange_mask = cv2.dilate(orange_mask, None, iterations=2)
+            
+            # Process both colors
+            masks = [(white_mask, "white"), (orange_mask, "orange")]
+            
+            for mask, ball_type in masks:
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                for contour in contours:
+                    # Filter small contours
+                    area = cv2.contourArea(contour)
+                    if area < 100:  # Minimum area threshold
+                        continue
+                    
+                    # Get the center of the contour
+                    M = cv2.moments(contour)
+                    if M["m00"] == 0:
+                        continue
+                    
+                    x_px = int(M["m10"] / M["m00"])
+                    y_px = int(M["m01"] / M["m00"])
+                    
+                    # Convert to cm using homography
+                    if self.homography_matrix is not None:
+                        pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                        pt_cm = cv2.perspectiveTransform(pt_px, 
+                                                       np.linalg.inv(self.homography_matrix))[0][0]
+                        x_cm, y_cm = pt_cm
+                        
+                        # Check if ball is within field boundaries and not in ignored area
+                        if (self.is_within_field(x_cm, y_cm) and
+                            not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                                 IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"])):
+                            
+                            # Verify ball color by checking average HSV in the contour
+                            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+                            cv2.drawContours(mask, [contour], -1, 255, -1)
+                            ball_hsv_avg = cv2.mean(hsv, mask=mask)[:3]
+                            
+                            is_valid = False
+                            if ball_type == "white":
+                                # Verify it's actually whiter than the field
+                                is_valid = (ball_hsv_avg[1] < self.field_hsv_avg[1] and  # Lower saturation
+                                          ball_hsv_avg[2] > self.field_hsv_avg[2] * WHITE_THRESHOLD)  # Higher value
+                            else:  # orange
+                                # Verify it's in the orange hue range with high saturation
+                                hue_diff = min((ball_hsv_avg[0] - orange_center_hue) % 180,
+                                             (orange_center_hue - ball_hsv_avg[0]) % 180)
+                                is_valid = (hue_diff < ORANGE_HUE_RANGE and
+                                          ball_hsv_avg[1] > self.field_hsv_avg[1] * ORANGE_SAT_MULT)
+                            
+                            if is_valid:
+                                balls.append((x_cm, y_cm, ball_type))
+                                
+                                # Draw debug visualization if enabled
+                                if self.show_debug:
+                                    color = (255, 255, 255) if ball_type == "white" else (0, 165, 255)
+                                    cv2.drawContours(frame, [contour], -1, color, 2)
+                                    cv2.circle(frame, (x_px, y_px), 5, color, -1)
+                                    cv2.putText(frame, 
+                                              f"{ball_type}: ({x_cm:.1f}, {y_cm:.1f})",
+                                              (x_px + 10, y_px + 10),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Show debug window if enabled
+            if self.show_debug:
+                debug_frame = np.hstack([
+                    cv2.cvtColor(white_mask, cv2.COLOR_GRAY2BGR),
+                    cv2.cvtColor(orange_mask, cv2.COLOR_GRAY2BGR),
+                    frame
+                ])
+                cv2.imshow("Ball Detection Debug", debug_frame)
+                cv2.waitKey(1)
+        
+        return balls
 
     def update_robot_position(self, frame):
         """Update robot position and heading based on visual markers"""
@@ -409,56 +632,6 @@ class BallCollector:
         margin = 1
         return (margin <= x_cm <= FIELD_WIDTH_CM - margin and 
                 margin <= y_cm <= FIELD_HEIGHT_CM - margin)
-
-    def detect_balls(self) -> List[Tuple[float, float, str]]:
-        """Detect balls in current camera view, return list of (x_cm, y_cm, label)"""
-        ret, frame = self.cap.read()
-        if not ret:
-            return []
-
-        # Resize for Roboflow model
-        small = cv2.resize(frame, (416, 416))
-        
-        # Get predictions
-        predictions = self.model.predict(small, confidence=30, overlap=20).json()
-        
-        balls = []
-        scale_x = frame.shape[1] / 416
-        scale_y = frame.shape[0] / 416
-        
-        for pred in predictions.get('predictions', []):
-            x_px = int(pred['x'] * scale_x)
-            y_px = int(pred['y'] * scale_y)
-            
-            # Convert to cm using homography
-            if self.homography_matrix is not None:
-                pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(pt_px, 
-                                               np.linalg.inv(self.homography_matrix))[0][0]
-                x_cm, y_cm = pt_cm
-                
-                # Check if ball is within field boundaries and not in ignored area
-                if (self.is_within_field(x_cm, y_cm) and
-                    not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                         IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"])):
-                    # Check if ball is not in or behind any goal area
-                    is_in_goal = False
-                    for goal in self.goals:
-                        goal_x, goal_y = goal['position']
-                        half_width = goal['width'] / 2
-                        
-                        # For left goal, check if ball is at x ≤ 0
-                        # For right goal, check if ball is at x ≥ FIELD_WIDTH_CM
-                        if ((goal_x == 0 and x_cm <= 0) or 
-                            (goal_x == FIELD_WIDTH_CM and x_cm >= FIELD_WIDTH_CM)) and \
-                           (goal_y - half_width <= y_cm <= goal_y + half_width):
-                            is_in_goal = True
-                            break
-                    
-                    if not is_in_goal:
-                        balls.append((x_cm, y_cm, pred['class']))
-        
-        return balls
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
         """Calculate approach position and angle for a target position"""
@@ -801,17 +974,13 @@ class BallCollector:
                     cv2.putText(frame, "Robot markers not detected!", 
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                               0.7, (0, 0, 255), 2)
-                    frame = self.draw_field(frame)  # Still show field even without robot
+                    frame = self.draw_field(frame)
                 else:
                     # Detect balls
                     balls = self.detect_balls()
                     current_time = time.time()
                     
-                    # Only replan if:
-                    # 1. We have balls AND robot markers are detected AND
-                    # 2. Either:
-                    #    a) It's been at least 3 seconds since last plan OR
-                    #    b) Ball positions have changed significantly
+                    # Only replan if needed
                     should_replan = False
                     if balls:
                         if current_time - last_plan_time >= 3:
@@ -830,23 +999,27 @@ class BallCollector:
                         last_plan_time = current_time
                         last_plan_positions = [(b[0], b[1]) for b in balls]
                         
-                        # Sort balls by distance from current robot position
-                        balls.sort(key=lambda b: math.hypot(
-                            b[0] - self.robot_pos[0],
-                            b[1] - self.robot_pos[1]
-                        ))
-
-                        # Take only the closest ball
-                        current_batch = balls[:1]
+                        # Group nearby balls for efficient collection
                         path = []
+                        remaining_balls = balls.copy()
+                        current_pos = self.robot_pos
+                        current_heading = self.robot_heading
                         
-                        if current_batch:
-                            closest_ball = current_batch[0]
-                            ball_pos = (closest_ball[0], closest_ball[1])
+                        while remaining_balls and self.collected_balls < MAX_BALLS_PER_TRIP:
+                            # Find nearest ball from current position
+                            nearest_idx = min(range(len(remaining_balls)), 
+                                           key=lambda i: math.hypot(
+                                               remaining_balls[i][0] - current_pos[0],
+                                               remaining_balls[i][1] - current_pos[1]
+                                           ))
+                            nearest_ball = remaining_balls[nearest_idx]
+                            
+                            # Get approach vector for this ball
+                            ball_pos = (nearest_ball[0], nearest_ball[1])
                             approach_pos, target_angle = self.get_approach_vector(ball_pos)
                             
                             # Check for wall collisions
-                            if not check_wall_collision(self.robot_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN) and \
+                            if not check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN) and \
                                not check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
                                 
                                 path.append({
@@ -857,14 +1030,65 @@ class BallCollector:
                                 path.append({
                                     'type': 'collect',
                                     'pos': ball_pos,
-                                    'ball_type': closest_ball[2]
+                                    'ball_type': nearest_ball[2]
                                 })
                                 
-                                # If this will be our third ball, add path to goal
-                                if self.collected_balls >= 2:  # Already have 2, this will be the third
-                                    goal_path = self.calculate_goal_approach_path(ball_pos, target_angle)
-                                    path.extend(goal_path)
-
+                                # Update current position and remove collected ball
+                                current_pos = ball_pos
+                                current_heading = target_angle
+                                remaining_balls.pop(nearest_idx)
+                                
+                                # Look for nearby balls that can be collected without major direction change
+                                if remaining_balls and self.collected_balls < MAX_BALLS_PER_TRIP - 1:
+                                    nearby_balls = []
+                                    for i, ball in enumerate(remaining_balls):
+                                        ball_angle = math.degrees(math.atan2(
+                                            ball[1] - current_pos[1],
+                                            ball[0] - current_pos[0]
+                                        ))
+                                        angle_diff = abs((ball_angle - current_heading + 180) % 360 - 180)
+                                        distance = math.hypot(
+                                            ball[0] - current_pos[0],
+                                            ball[1] - current_pos[1]
+                                        )
+                                        
+                                        # Consider balls within 45 degrees and 50cm
+                                        if angle_diff < 45 and distance < 50:
+                                            nearby_balls.append((i, distance, ball))
+                                    
+                                    # Sort nearby balls by distance
+                                    nearby_balls.sort(key=lambda x: x[1])
+                                    
+                                    # Try to collect nearest nearby ball
+                                    if nearby_balls:
+                                        idx, _, ball = nearby_balls[0]
+                                        ball_pos = (ball[0], ball[1])
+                                        approach_pos, target_angle = self.get_approach_vector(ball_pos)
+                                        
+                                        if not check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN) and \
+                                           not check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
+                                            
+                                            path.append({
+                                                'type': 'approach',
+                                                'pos': approach_pos,
+                                                'angle': target_angle
+                                            })
+                                            path.append({
+                                                'type': 'collect',
+                                                'pos': ball_pos,
+                                                'ball_type': ball[2]
+                                            })
+                                            
+                                            current_pos = ball_pos
+                                            current_heading = target_angle
+                                            remaining_balls.pop(idx)
+                            
+                            # If we've collected enough balls or can't collect more, head to goal
+                            if self.collected_balls >= MAX_BALLS_PER_TRIP - 1:
+                                goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
+                                path.extend(goal_path)
+                                break
+                        
                         # Draw path on frame
                         frame_with_path = self.draw_path(frame, path)
                         
