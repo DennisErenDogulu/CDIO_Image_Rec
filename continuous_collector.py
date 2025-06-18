@@ -26,11 +26,11 @@ EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 ROBOFLOW_API_KEY = "qJTLU5ku2vpBGQUwjBx2"
 RF_WORKSPACE = "cdio-nczdp"
-RF_PROJECT = "cdio-golfbot2025"
-RF_VERSION = 12
+RF_PROJECT = "cdio-golfbot2025" 
+RF_VERSION = 13
 
 # Wall configuration
-WALL_SAFETY_MARGIN = 3  # cm, minimum distance to keep from walls
+WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
 GOAL_WIDTH = 30  # cm, width of the goal area to keep clear
 
 # Robot configuration
@@ -171,50 +171,6 @@ class BallCollector:
             (FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_y_min),
             (FIELD_WIDTH_CM - margin, goal_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin)
         ]
-
-    def draw_starting_box(self, frame):
-        """Draw the robot starting position box with alignment markers"""
-        if not self.homography_matrix is None:
-            # Create points for robot box corners
-            half_width = ROBOT_WIDTH / 2
-            half_length = ROBOT_LENGTH / 2
-            
-            # Box corners in cm (centered on starting position)
-            box_corners_cm = np.array([
-                [[ROBOT_START_X - half_width, ROBOT_START_Y - half_length]],  # Back left
-                [[ROBOT_START_X + half_width, ROBOT_START_Y - half_length]],  # Back right
-                [[ROBOT_START_X + half_width, ROBOT_START_Y + half_length]],  # Front right
-                [[ROBOT_START_X - half_width, ROBOT_START_Y + half_length]]   # Front left
-            ], dtype="float32")
-            
-            # Convert to pixel coordinates
-            box_corners_px = cv2.perspectiveTransform(box_corners_cm, self.homography_matrix)
-            box_corners_px = box_corners_px.astype(int)
-            
-            # Draw semi-transparent box
-            overlay = frame.copy()
-            cv2.fillPoly(overlay, [box_corners_px], (0, 255, 0, 128))
-            cv2.polylines(overlay, [box_corners_px], True, (0, 255, 0), 2)
-            
-            # Add direction marker (arrow pointing forward)
-            center_cm = np.array([[[ROBOT_START_X, ROBOT_START_Y]]], dtype="float32")
-            front_cm = np.array([[[ROBOT_START_X + ROBOT_LENGTH, ROBOT_START_Y]]], dtype="float32")
-            
-            center_px = cv2.perspectiveTransform(center_cm, self.homography_matrix)[0][0].astype(int)
-            front_px = cv2.perspectiveTransform(front_cm, self.homography_matrix)[0][0].astype(int)
-            
-            cv2.arrowedLine(overlay, tuple(center_px), tuple(front_px), (0, 255, 0), 2)
-            
-            # Add alignment text
-            cv2.putText(overlay, "Robot Start", 
-                       (center_px[0] - 40, center_px[1] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            # Blend overlay with original frame
-            alpha = 0.4
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-        
-        return frame
 
     def draw_walls(self, frame):
         """Draw walls, safety margins, and starting box on the frame"""
