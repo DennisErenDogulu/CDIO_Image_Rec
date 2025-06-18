@@ -787,7 +787,6 @@ class BallCollector:
         cv2.namedWindow("Path Planning")
         last_plan_time = 0
         last_plan_positions = []
-        current_path = []  # Store current path for continuous display
         
         while True:
             try:
@@ -796,24 +795,14 @@ class BallCollector:
                 if not ret:
                     continue
 
-                # Create base visualization frame
-                display_frame = frame.copy()
-                
                 # Update robot position from visual markers
                 if not self.update_robot_position(frame):
                     logger.warning("Could not detect robot markers")
-                    cv2.putText(display_frame, "Robot markers not detected!", 
+                    cv2.putText(frame, "Robot markers not detected!", 
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                               0.7, (0, 0, 255), 2)
-                    display_frame = self.draw_field(display_frame)
+                    frame = self.draw_field(frame)  # Still show field even without robot
                 else:
-                    # Always draw the current path on every frame
-                    if current_path:
-                        display_frame = self.draw_path(display_frame, current_path)
-                    else:
-                        display_frame = self.draw_field(display_frame)
-                        display_frame = self.draw_robot_markers(display_frame)
-                    
                     # Detect balls
                     balls = self.detect_balls()
                     current_time = time.time()
@@ -849,7 +838,7 @@ class BallCollector:
 
                         # Take only the closest ball
                         current_batch = balls[:1]
-                        new_path = []
+                        path = []
                         
                         if current_batch:
                             closest_ball = current_batch[0]
@@ -860,12 +849,12 @@ class BallCollector:
                             if not check_wall_collision(self.robot_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN) and \
                                not check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
                                 
-                                new_path.append({
+                                path.append({
                                     'type': 'approach',
                                     'pos': approach_pos,
                                     'angle': target_angle
                                 })
-                                new_path.append({
+                                path.append({
                                     'type': 'collect',
                                     'pos': ball_pos,
                                     'ball_type': closest_ball[2]
@@ -874,103 +863,102 @@ class BallCollector:
                                 # If this will be our third ball, add path to goal
                                 if self.collected_balls >= 2:  # Already have 2, this will be the third
                                     goal_path = self.calculate_goal_approach_path(ball_pos, target_angle)
-                                    new_path.extend(goal_path)
-                        
-                        # Update current path
-                        current_path = new_path
-                        
-                        # Draw new path immediately
-                        display_frame = self.draw_path(display_frame, current_path)
-                
-                # Always show status and help text
-                help_text = [
-                    f"Balls Collected: {self.collected_balls}/3",
-                    "Commands:",
-                    "SPACE - Execute path",
-                    "Q - Quit"
-                ]
-                y = 150
-                for text in help_text:
-                    cv2.putText(display_frame, text,
-                              (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                              0.5, (255, 255, 255), 1)
-                    y += 20
+                                    path.extend(goal_path)
 
-                # Show the frame
-                cv2.imshow("Path Planning", display_frame)
-                
-                # Handle key commands
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord(' ') and current_path:  # Only execute if we have a path
-                    # Execute the planned path
-                    logger.info("Executing path with {} points".format(len(current_path)))
-                    
-                    try:
-                        for point in current_path:
-                            # Wait for visual marker detection
-                            retries = 0
-                            while not self.update_robot_position(frame) and retries < 10:
-                                ret, frame = self.cap.read()
-                                retries += 1
-                                time.sleep(0.1)
+                        # Draw path on frame
+                        frame_with_path = self.draw_path(frame, path)
+                        
+                        # Add collection counter and key command help
+                        help_text = [
+                            f"Balls Collected: {self.collected_balls}/3",
+                            "Commands:",
+                            "SPACE - Execute path",
+                            "Q - Quit"
+                        ]
+                        y = 150
+                        for text in help_text:
+                            cv2.putText(frame_with_path, text,
+                                      (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                      0.5, (255, 255, 255), 1)
+                            y += 20
+                        
+                        cv2.imshow("Path Planning", frame_with_path)
+                        
+                        # Handle key commands
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
+                            break
+                        elif key == ord(' '):
+                            # Execute the planned path
+                            logger.info("Executing path with {} points".format(len(path)))
                             
-                            if retries >= 10:
-                                raise Exception("Lost robot marker tracking")
+                            try:
+                                for point in path:
+                                    # Wait for visual marker detection
+                                    retries = 0
+                                    while not self.update_robot_position(frame) and retries < 10:
+                                        ret, frame = self.cap.read()
+                                        retries += 1
+                                        time.sleep(0.1)
+                                    
+                                    if retries >= 10:
+                                        raise Exception("Lost robot marker tracking")
 
-                            # Calculate turn angle from current heading
-                            target_pos = point['pos']
-                            dx = target_pos[0] - self.robot_pos[0]
-                            dy = target_pos[1] - self.robot_pos[1]
-                            target_angle = math.degrees(math.atan2(dy, dx))
-                            
-                            # Turn to face target
-                            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                            if abs(angle_diff) > 5:
-                                logger.info(f"Turning {angle_diff:.1f} degrees")
-                                if not self.turn(angle_diff):
-                                    raise Exception("Turn command failed")
-                            
-                            # Move to target position
-                            distance = math.hypot(dx, dy)
-                            
-                            if point['type'] == 'collect':
-                                logger.info(f"Collecting {point['ball_type']} ball")
-                                if not self.collect(COLLECTION_DISTANCE_CM):
-                                    raise Exception("Collect command failed")
-                                self.collected_balls += 1  # Increment counter after successful collection
-                            elif point['type'] == 'goal':
-                                logger.info(f"Moving {distance:.1f} cm to goal")
-                                if not self.move(distance):
-                                    raise Exception("Move command failed")
-                                # After reaching goal position, deliver balls
-                                if not self.deliver_balls():
-                                    raise Exception("Ball delivery failed")
-                                self.collected_balls = 0  # Reset counter after delivery
-                            else:  # approach point
-                                logger.info(f"Moving {distance:.1f} cm")
-                                if not self.move(distance):
-                                    raise Exception("Move command failed")
-                            
-                            # Update visualization
-                            ret, frame = self.cap.read()
-                            if ret:
-                                self.update_robot_position(frame)
-                                frame = self.draw_status(frame)
-                                frame = self.draw_robot_markers(frame)
-                                frame = self.draw_path(frame, current_path)
-                                cv2.imshow("Path Planning", frame)
-                                cv2.waitKey(1)
+                                    # Calculate turn angle from current heading
+                                    target_pos = point['pos']
+                                    dx = target_pos[0] - self.robot_pos[0]
+                                    dy = target_pos[1] - self.robot_pos[1]
+                                    target_angle = math.degrees(math.atan2(dy, dx))
+                                    
+                                    # Turn to face target
+                                    angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                                    if abs(angle_diff) > 5:
+                                        logger.info(f"Turning {angle_diff:.1f} degrees")
+                                        if not self.turn(angle_diff):
+                                            raise Exception("Turn command failed")
+                                    
+                                    # Move to target position
+                                    distance = math.hypot(dx, dy)
+                                    
+                                    if point['type'] == 'collect':
+                                        logger.info(f"Collecting {point['ball_type']} ball")
+                                        if not self.collect(COLLECTION_DISTANCE_CM):
+                                            raise Exception("Collect command failed")
+                                        self.collected_balls += 1  # Increment counter after successful collection
+                                    elif point['type'] == 'goal':
+                                        logger.info(f"Moving {distance:.1f} cm to goal")
+                                        if not self.move(distance):
+                                            raise Exception("Move command failed")
+                                        # After reaching goal position, deliver balls
+                                        if not self.deliver_balls():
+                                            raise Exception("Ball delivery failed")
+                                        self.collected_balls = 0  # Reset counter after delivery
+                                    else:  # approach point
+                                        logger.info(f"Moving {distance:.1f} cm")
+                                        if not self.move(distance):
+                                            raise Exception("Move command failed")
+                                    
+                                    # Update visualization
+                                    ret, frame = self.cap.read()
+                                    if ret:
+                                        self.update_robot_position(frame)
+                                        frame = self.draw_status(frame)
+                                        frame = self.draw_robot_markers(frame)
+                                        frame_with_path = self.draw_path(frame, path)
+                                        cv2.imshow("Path Planning", frame_with_path)
+                                        cv2.waitKey(1)
+                                
+                                # Pause briefly after completing the path
+                                cv2.waitKey(1000)
+                                
+                            except Exception as e:
+                                logger.error("Path execution failed: {}".format(e))
+                                self.stop()
+                                cv2.waitKey(2000)
                         
-                        # Clear the path after execution
-                        current_path = []
-                        
-                    except Exception as e:
-                        logger.error("Path execution failed: {}".format(e))
-                        self.stop()
-                        current_path = []  # Clear path on failure
-                        cv2.waitKey(2000)
+                    # Show frame even when not replanning
+                    cv2.imshow("Path Planning", frame)
+                    cv2.waitKey(1)
                     
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
