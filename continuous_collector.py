@@ -39,7 +39,9 @@ PINK_MARKER_WIDTH_CM = 5    # Width of pink direction marker
 
 # Wall configuration
 WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
-GOAL_WIDTH = 30  # cm, width of the goal area to keep clear
+GOAL_WIDTH_SMALL = 8  # cm (80mm)
+GOAL_WIDTH_LARGE = 20  # cm (200mm)
+GOAL_WIDTH = GOAL_WIDTH_SMALL  # Default to small goal
 
 # Robot configuration
 ROBOT_START_X = 20  # cm from left edge
@@ -151,7 +153,9 @@ class BallCollector:
         # Goal dimensions and positions
         self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal
         self.goal_approach_distance = 20  # Distance to stop in front of goal
-        self.delivery_time = 2.0  # Seconds to run collector in reverse
+        self.delivery_time = 10.0  # Seconds to run collector in reverse
+        self.current_goal_width = GOAL_WIDTH_SMALL  # Start with small goal
+        self.is_small_goal = True  # Track which goal is selected
 
         # Color ranges for marker detection
         self.green_lower = GREEN_LOWER
@@ -288,8 +292,8 @@ class BallCollector:
             return
 
         # Calculate goal positions (in cm)
-        goal_y_min = (FIELD_HEIGHT_CM / 2) - (GOAL_WIDTH / 2)
-        goal_y_max = (FIELD_HEIGHT_CM / 2) + (GOAL_WIDTH / 2)
+        goal_y_min = (FIELD_HEIGHT_CM / 2) - (self.current_goal_width / 2)
+        goal_y_max = (FIELD_HEIGHT_CM / 2) + (self.current_goal_width / 2)
 
         # Create wall segments with small safety margin
         margin = WALL_SAFETY_MARGIN
@@ -783,10 +787,12 @@ class BallCollector:
                     # Draw path on frame
                     frame_with_path = self.draw_path(frame, path)
                     
-                    # Add key command help
+                    # Add key command help and goal status
                     help_text = [
                         "Commands:",
                         "SPACE - Execute path",
+                        "G - Toggle goal size (current: {} mm)".format(
+                            80 if self.is_small_goal else 200),
                         "Q - Quit"
                     ]
                     y = 150
@@ -802,6 +808,13 @@ class BallCollector:
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord('q'):
                         break
+                    elif key == ord('g'):
+                        # Toggle between goal sizes
+                        self.is_small_goal = not self.is_small_goal
+                        self.current_goal_width = GOAL_WIDTH_SMALL if self.is_small_goal else GOAL_WIDTH_LARGE
+                        # Update walls for new goal size
+                        self.setup_walls()
+                        logger.info(f"Switched to {'small' if self.is_small_goal else 'large'} goal ({self.current_goal_width*10} mm)")
                     elif key == ord(' '):
                         # Execute the planned path
                         logger.info("Executing path with {} points".format(len(path)))
