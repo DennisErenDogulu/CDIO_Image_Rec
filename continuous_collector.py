@@ -25,7 +25,7 @@ EV3_PORT = 12345
 ROBOFLOW_API_KEY = "qJTLU5ku2vpBGQUwjBx2"
 RF_WORKSPACE = "cdio-nczdp"
 RF_PROJECT = "cdio-golfbot2025" 
-RF_VERSION = 13
+RF_VERSION = 12
 
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
@@ -261,9 +261,7 @@ class BallCollector:
     def draw_walls(self, frame):
         """Draw walls, safety margins, and starting box on the frame"""
         if not self.homography_matrix is None and self.walls:
-            # First draw the starting box
-            frame = self.draw_starting_box(frame)
-            
+           
             # Create a semi-transparent overlay for walls
             overlay = frame.copy()
             
