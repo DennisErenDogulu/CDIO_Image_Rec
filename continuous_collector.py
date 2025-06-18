@@ -94,8 +94,8 @@ class CameraThread(threading.Thread):
             raise RuntimeError("Could not open camera")
         
         # Set camera properties for better performance
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)  # Back to higher resolution
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -228,61 +228,41 @@ class BallCollector:
         cv2.namedWindow("Marker Debug")
 
     def detect_markers(self, frame):
-        """
-        Detect green base and pink direction markers with improved robustness.
-        """
+        """Detect green base and pink direction markers"""
         # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Create debug image
-        debug_frame = frame.copy()
-
-        # Detect green base marker with adaptive thresholding
+        # Detect green base marker
         green_mask = cv2.inRange(hsv, self.green_lower, self.green_upper)
         kernel = np.ones((5,5), np.uint8)
         green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
         green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
         
-        # Find green contours
         green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Sort green contours by area
-        green_contours = sorted(green_contours, key=cv2.contourArea, reverse=True)
-        
-        # Find pink direction marker
+        # Detect pink direction marker
         pink_mask = cv2.inRange(hsv, self.pink_lower, self.pink_upper)
         pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
         pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
         
-        # Find pink contours
         pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Sort pink contours by area
-        pink_contours = sorted(pink_contours, key=cv2.contourArea, reverse=True)
         
         # Find green marker center and orientation
         green_center = None
         green_rect = None
         if green_contours:
-            largest_green = green_contours[0]
+            largest_green = max(green_contours, key=cv2.contourArea)
             area = cv2.contourArea(largest_green)
-            if area > 1000:  # Increased minimum area threshold
+            if area > 1000:  # Minimum area threshold
                 green_rect = cv2.minAreaRect(largest_green)
                 green_center = (int(green_rect[0][0]), int(green_rect[0][1]))
-                
-                # Draw green detection on debug frame
-                cv2.drawContours(debug_frame, [np.int32(cv2.boxPoints(green_rect))], 0, (0, 255, 0), 2)
-                cv2.circle(debug_frame, green_center, 5, (0, 255, 0), -1)
-                cv2.putText(debug_frame, f"Green Area: {area:.0f}", (10, 30), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         # Find pink marker endpoints
         pink_endpoints = None
         if pink_contours:
-            largest_pink = pink_contours[0]
+            largest_pink = max(pink_contours, key=cv2.contourArea)
             area = cv2.contourArea(largest_pink)
-            if area > 100:  # Minimum area threshold for pink marker
-                # Get the endpoints of the pink marker
+            if area > 100:  # Minimum area threshold
                 pink_points = largest_pink.squeeze()
                 if len(pink_points.shape) >= 2:
                     # Find the two points furthest apart
@@ -296,26 +276,6 @@ class BallCollector:
                                     tuple(pink_points[i]),
                                     tuple(pink_points[j])
                                 )
-                    
-                    # Draw pink detection on debug frame
-                    if pink_endpoints:
-                        cv2.line(debug_frame, pink_endpoints[0], pink_endpoints[1], (255, 192, 203), 2)
-                        cv2.circle(debug_frame, pink_endpoints[0], 3, (255, 192, 203), -1)
-                        cv2.circle(debug_frame, pink_endpoints[1], 3, (255, 192, 203), -1)
-                        cv2.putText(debug_frame, f"Pink Area: {area:.0f}", (10, 60), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 192, 203), 2)
-                        cv2.putText(debug_frame, f"Pink Length: {max_dist:.0f}", (10, 90), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 192, 203), 2)
-
-        # Show masks in debug window
-        if self.debug_window:
-            masks_debug = np.hstack([
-                cv2.cvtColor(green_mask, cv2.COLOR_GRAY2BGR),
-                cv2.cvtColor(pink_mask, cv2.COLOR_GRAY2BGR),
-                debug_frame
-            ])
-            cv2.imshow("Marker Debug", masks_debug)
-            cv2.waitKey(1)
 
         return green_center, green_rect, pink_endpoints
 
