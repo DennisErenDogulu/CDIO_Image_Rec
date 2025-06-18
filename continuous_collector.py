@@ -474,24 +474,36 @@ class BallCollector:
         
         return balls
 
-    def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
-        """Calculate approach position and angle for a target position"""
+    def get_approach_vector(self, target_pos: Tuple[float, float], try_reverse: bool = True) -> Tuple[Tuple[float, float], float, bool]:
+        """Calculate approach position and angle for a target position, with optional reverse movement"""
         # Get vector from robot to target
         dx = target_pos[0] - self.robot_pos[0]
         dy = target_pos[1] - self.robot_pos[1]
         distance = math.hypot(dx, dy)
         
-        # Calculate approach point APPROACH_DISTANCE_CM before target
+        # Try forward approach first
+        forward_angle = math.degrees(math.atan2(dy, dx))
+        forward_diff = (forward_angle - self.robot_heading + 180) % 360 - 180
+        
+        # If reverse is allowed, also try reverse approach
+        if try_reverse:
+            reverse_angle = (forward_angle + 180) % 360
+            reverse_diff = (reverse_angle - self.robot_heading + 180) % 360 - 180
+            
+            # Use reverse if it requires less turning
+            if abs(reverse_diff) < abs(forward_diff):
+                ratio = (distance + APPROACH_DISTANCE_CM) / distance if distance > 0 else 1
+                approach_x = self.robot_pos[0] + dx * ratio
+                approach_y = self.robot_pos[1] + dy * ratio
+                return (approach_x, approach_y), reverse_angle, True
+        
+        # Default to forward approach
         ratio = (distance - APPROACH_DISTANCE_CM) / distance if distance > APPROACH_DISTANCE_CM else 0
         approach_x = self.robot_pos[0] + dx * ratio
         approach_y = self.robot_pos[1] + dy * ratio
-        
-        # Calculate angle to target
-        target_angle = math.degrees(math.atan2(dy, dx))
-        
-        return (approach_x, approach_y), target_angle
+        return (approach_x, approach_y), forward_angle, False
 
-    def draw_path(self, frame, path):
+    def draw_path(self, frame, path, preview_mode=False):
         """Draw the planned path on the frame"""
         if not self.homography_matrix is None:
             overlay = frame.copy()
@@ -500,7 +512,8 @@ class BallCollector:
             colors = {
                 'approach': (0, 255, 255),  # Yellow
                 'collect': (0, 255, 0),     # Green
-                'goal': (0, 0, 255)         # Red
+                'goal': (0, 0, 255),        # Red
+                'reverse': (255, 0, 255)    # Purple for reverse movements
             }
             
             # Draw lines between points
@@ -512,8 +525,23 @@ class BallCollector:
                 start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
                 end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
                 
-                # Draw line
-                cv2.line(overlay, tuple(start_px), tuple(end_px), (150, 150, 150), 2)
+                # Draw line (dashed if preview mode)
+                if preview_mode:
+                    # Draw dashed line
+                    dash_length = 10
+                    dx = end_px[0] - start_px[0]
+                    dy = end_px[1] - start_px[1]
+                    dist = math.hypot(dx, dy)
+                    if dist > 0:
+                        num_dashes = int(dist / (2 * dash_length))
+                        for j in range(num_dashes):
+                            x1 = int(start_px[0] + dx * (2*j) / (2*num_dashes))
+                            y1 = int(start_px[1] + dy * (2*j) / (2*num_dashes))
+                            x2 = int(start_px[0] + dx * (2*j+1) / (2*num_dashes))
+                            y2 = int(start_px[1] + dy * (2*j+1) / (2*num_dashes))
+                            cv2.line(overlay, (x1, y1), (x2, y2), (150, 150, 150), 2)
+                else:
+                    cv2.line(overlay, tuple(start_px), tuple(end_px), (150, 150, 150), 2)
             
             # Draw points
             for point in path:
@@ -521,7 +549,8 @@ class BallCollector:
                 pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
                 
                 # Draw point
-                color = colors[point['type']]
+                point_type = 'reverse' if point.get('is_reverse', False) else point['type']
+                color = colors[point_type]
                 cv2.circle(overlay, tuple(pt_px), 5, color, -1)
                 
                 # Draw direction for approach points
@@ -534,6 +563,10 @@ class BallCollector:
                 # Add labels
                 if point['type'] == 'collect':
                     cv2.putText(overlay, point['ball_type'], 
+                              (pt_px[0] + 10, pt_px[1] + 10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                elif point.get('is_reverse', False):
+                    cv2.putText(overlay, "R", 
                               (pt_px[0] + 10, pt_px[1] + 10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
@@ -553,6 +586,12 @@ class BallCollector:
             end_x = robot_px[0] + int(25 * math.cos(angle_rad))
             end_y = robot_px[1] + int(25 * math.sin(angle_rad))
             cv2.arrowedLine(frame, tuple(robot_px), (end_x, end_y), (255, 0, 0), 2)
+
+            if preview_mode:
+                # Add preview mode text
+                cv2.putText(frame, "PREVIEW MODE - Press ENTER to execute, ESC to cancel", 
+                          (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 
+                          0.7, (0, 255, 255), 2)
         
         return frame
 
@@ -674,6 +713,7 @@ class BallCollector:
         cv2.namedWindow("Path Planning")
         last_plan_time = 0
         last_plan_positions = []
+        preview_path = None
         
         while True:
             try:
@@ -697,6 +737,31 @@ class BallCollector:
 
                 # Add status overlay
                 frame = self.draw_status(frame)
+
+                # If in preview mode, show the preview path
+                if preview_path is not None:
+                    frame = self.draw_path(frame, preview_path, preview_mode=True)
+                    
+                    # Handle preview mode keys
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 13:  # Enter key
+                        # Execute the previewed path
+                        logger.info("Executing previewed path with {} points".format(len(preview_path)))
+                        path = preview_path
+                        preview_path = None
+                        try:
+                            self._execute_path(path, frame)
+                        except Exception as e:
+                            logger.error("Path execution failed: {}".format(e))
+                            self.stop()
+                            cv2.waitKey(2000)
+                    elif key == 27:  # Escape key
+                        # Cancel preview
+                        logger.info("Path preview cancelled")
+                        preview_path = None
+                    
+                    cv2.imshow("Path Planning", frame)
+                    continue
 
                 # Detect balls
                 balls = self.detect_balls()
@@ -751,7 +816,7 @@ class BallCollector:
                                          ))
                         
                         ball_pos = (closest_ball[0], closest_ball[1])
-                        approach_pos, target_angle = self.get_approach_vector(ball_pos)
+                        approach_pos, target_angle, is_reverse = self.get_approach_vector(ball_pos)
                         
                         # Check for wall collisions
                         if check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
@@ -767,12 +832,14 @@ class BallCollector:
                         path.append({
                             'type': 'approach',
                             'pos': approach_pos,
-                            'angle': target_angle
+                            'angle': target_angle,
+                            'is_reverse': is_reverse
                         })
                         path.append({
                             'type': 'collect',
                             'pos': ball_pos,
-                            'ball_type': closest_ball[2]
+                            'ball_type': closest_ball[2],
+                            'is_reverse': is_reverse
                         })
                         
                         current_pos = ball_pos
@@ -790,7 +857,7 @@ class BallCollector:
                     # Add key command help and goal status
                     help_text = [
                         "Commands:",
-                        "SPACE - Execute path",
+                        "SPACE - Preview path",
                         "G - Toggle goal size (current: {} mm)".format(
                             80 if self.is_small_goal else 200),
                         "Q - Quit"
@@ -816,71 +883,10 @@ class BallCollector:
                         self.setup_walls()
                         logger.info(f"Switched to {'small' if self.is_small_goal else 'large'} goal ({self.current_goal_width*10} mm)")
                     elif key == ord(' '):
-                        # Execute the planned path
-                        logger.info("Executing path with {} points".format(len(path)))
-                        
-                        try:
-                            for point in path:
-                                # Wait for visual marker detection
-                                retries = 0
-                                while not self.update_robot_position(frame) and retries < 10:
-                                    ret, frame = self.cap.read()
-                                    retries += 1
-                                    time.sleep(0.1)
-                                
-                                if retries >= 10:
-                                    raise Exception("Lost robot marker tracking")
-
-                                # Calculate turn angle from current heading
-                                target_pos = point['pos']
-                                dx = target_pos[0] - self.robot_pos[0]
-                                dy = target_pos[1] - self.robot_pos[1]
-                                target_angle = math.degrees(math.atan2(dy, dx))
-                                
-                                # Turn to face target
-                                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                                if abs(angle_diff) > 5:
-                                    logger.info(f"Turning {angle_diff:.1f} degrees")
-                                    if not self.turn(angle_diff):
-                                        raise Exception("Turn command failed")
-                                
-                                # Move to target position
-                                distance = math.hypot(dx, dy)
-                                
-                                if point['type'] == 'collect':
-                                    logger.info(f"Collecting {point['ball_type']} ball")
-                                    if not self.collect(COLLECTION_DISTANCE_CM):
-                                        raise Exception("Collect command failed")
-                                elif point['type'] == 'goal':
-                                    logger.info(f"Moving {distance:.1f} cm to goal")
-                                    if not self.move(distance):
-                                        raise Exception("Move command failed")
-                                    # After reaching goal position, deliver balls
-                                    if not self.deliver_balls():
-                                        raise Exception("Ball delivery failed")
-                                else:  # approach point
-                                    logger.info(f"Moving {distance:.1f} cm")
-                                    if not self.move(distance):
-                                        raise Exception("Move command failed")
-                                
-                                # Update visualization
-                                ret, frame = self.cap.read()
-                                if ret:
-                                    self.update_robot_position(frame)
-                                    frame = self.draw_status(frame)
-                                    frame = self.draw_robot_markers(frame)
-                                    frame_with_path = self.draw_path(frame, path)
-                                    cv2.imshow("Path Planning", frame_with_path)
-                                    cv2.waitKey(1)
-                            
-                            # Pause briefly after completing the path
-                            cv2.waitKey(1000)
-                            
-                        except Exception as e:
-                            logger.error("Path execution failed: {}".format(e))
-                            self.stop()
-                            cv2.waitKey(2000)
-                    
+                        # Enter preview mode
+                        preview_path = path
+                        logger.info("Entering preview mode - press ENTER to execute or ESC to cancel")
+                
                 # Show frame even when not replanning
                 cv2.imshow("Path Planning", frame)
                 cv2.waitKey(1)
@@ -890,6 +896,65 @@ class BallCollector:
                 cv2.waitKey(1000)
 
         cv2.destroyWindow("Path Planning")
+
+    def _execute_path(self, path, frame):
+        """Execute a planned path"""
+        for point in path:
+            # Wait for visual marker detection
+            retries = 0
+            while not self.update_robot_position(frame) and retries < 10:
+                ret, frame = self.cap.read()
+                retries += 1
+                time.sleep(0.1)
+            
+            if retries >= 10:
+                raise Exception("Lost robot marker tracking")
+
+            # Calculate turn angle from current heading
+            target_pos = point['pos']
+            dx = target_pos[0] - self.robot_pos[0]
+            dy = target_pos[1] - self.robot_pos[1]
+            target_angle = math.degrees(math.atan2(dy, dx))
+            
+            # Adjust angle for reverse movement
+            if point.get('is_reverse', False):
+                target_angle = (target_angle + 180) % 360
+            
+            # Turn to face target
+            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+            if abs(angle_diff) > 5:
+                logger.info(f"Turning {angle_diff:.1f} degrees")
+                if not self.turn(angle_diff):
+                    raise Exception("Turn command failed")
+            
+            # Move to target position
+            distance = math.hypot(dx, dy)
+            
+            if point['type'] == 'collect':
+                logger.info(f"Collecting {point['ball_type']} ball")
+                if not self.collect(COLLECTION_DISTANCE_CM):
+                    raise Exception("Collect command failed")
+            elif point['type'] == 'goal':
+                logger.info(f"Moving {distance:.1f} cm to goal")
+                if not self.move(distance):
+                    raise Exception("Move command failed")
+                # After reaching goal position, deliver balls
+                if not self.deliver_balls():
+                    raise Exception("Ball delivery failed")
+            else:  # approach point
+                logger.info(f"Moving {distance:.1f} cm {'backwards' if point.get('is_reverse', False) else 'forwards'}")
+                if not self.move(-distance if point.get('is_reverse', False) else distance):
+                    raise Exception("Move command failed")
+            
+            # Update visualization
+            ret, frame = self.cap.read()
+            if ret:
+                self.update_robot_position(frame)
+                frame = self.draw_status(frame)
+                frame = self.draw_robot_markers(frame)
+                frame_with_path = self.draw_path(frame, path)
+                cv2.imshow("Path Planning", frame_with_path)
+                cv2.waitKey(1)
 
     def run(self):
         """Main run loop"""
