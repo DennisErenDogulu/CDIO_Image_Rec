@@ -11,7 +11,7 @@ from ev3dev2.display import Display
 from ev3dev2.power import PowerSupply
 
 # ───────── Hardware Setup ─────────
-AXLE_TRACK_MM = 150    # Axle distance in mm
+AXLE_TRACK_MM = 530    # Axle distance in mm
 WHEEL_DIAM_MM = 69     # Wheel diameter in mm
 WHEEL_WIDTH_MM = 35    # Wheel width in mm
 
@@ -33,22 +33,18 @@ display = Display()                 # EV3 display
 power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
-NORMAL_SPEED_RPM = 200
-SLOW_SPEED_RPM = 100
-TURN_SPEED_RPM = 50  # Even slower turns for more precision
-COLLECTOR_SPEED = 50  # Percentage
+NORMAL_SPEED_RPM = 40
+SLOW_SPEED_RPM = 25
+TURN_SPEED_RPM = 25  # Even slower turns for more precision
+COLLECTOR_SPEED = 30  # Percentage
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
 
-# Robot physical dimensions (in mm)
-WHEEL_DIAMETER_MM = 69  # 6.9 cm
-WHEEL_WIDTH_MM = 35    # 3.5 cm
-AXLE_TRACK_MM = 150   # 15 cm
-
-# Calculate turn factor
-# Since motors are balanced, focusing on mechanical compensation
-# Increasing compensation to account for ball caster friction
+# Turn calibration factors
+# Based on testing: right turns too much, left turns too little
+LEFT_TURN_FACTOR = 1.10   # Increase left turns by 10%
+RIGHT_TURN_FACTOR = 0.90  # Decrease right turns by 10%
 TURN_COMPENSATION = 1.25  # 25% compensation for mechanical factors
 TURN_FACTOR = (math.pi * AXLE_TRACK_MM) / 360.0 * TURN_COMPENSATION
 
@@ -82,8 +78,16 @@ def execute_move(distance_cm):
 
 @safe_motor_control
 def execute_turn(angle_deg):
-    """Turn by angle_deg (positive = CCW, negative = CW)"""
+    """Turn by angle_deg (positive = CCW/left, negative = CW/right) with calibration"""
     try:
+        # Apply calibration factors based on turn direction
+        if angle_deg > 0:  # Left turn (CCW) - needs more
+            calibrated_angle = angle_deg * LEFT_TURN_FACTOR
+            print("[Turn] Left turn: {} -> {:.1f} degrees".format(angle_deg, calibrated_angle))
+        else:  # Right turn (CW) - needs less
+            calibrated_angle = angle_deg * RIGHT_TURN_FACTOR
+            print("[Turn] Right turn: {} -> {:.1f} degrees".format(angle_deg, calibrated_angle))
+        
         # Set even slower speed and longer acceleration for turns
         mdiff.ramp_up_sp = ACCELERATION_TIME_MS * 3    # Triple the acceleration time
         mdiff.ramp_down_sp = ACCELERATION_TIME_MS * 3  # Triple the deceleration time
@@ -93,8 +97,8 @@ def execute_turn(angle_deg):
         mdiff.off(brake=True)
         time.sleep(0.3)  # Longer pause to ensure complete stop
         
-        # 2. Turn with very slow speed for maximum precision
-        mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), angle_deg)
+        # 2. Turn with calibrated angle and very slow speed for maximum precision
+        mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), calibrated_angle)
         
         # 3. Longer pause after turn
         time.sleep(0.3)

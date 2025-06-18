@@ -23,8 +23,9 @@ EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 
 # Color detection ranges (HSV)
-GREEN_LOWER = np.array([35, 50, 50])
-GREEN_UPPER = np.array([85, 255, 255])
+# Cyan/Teal paper detection (was green) - Expanded range for bright cyan
+CYAN_LOWER = np.array([80, 100, 100])   # Broader cyan hue range: 80-110, higher saturation
+CYAN_UPPER = np.array([110, 255, 255])
 PINK_LOWER = np.array([145, 50, 50])
 PINK_UPPER = np.array([175, 255, 255])
 
@@ -207,18 +208,18 @@ class BallCollector:
         return ranges
 
     def detect_markers(self, frame):
-        """Detect green base paper and pink direction marker"""
+        """Detect cyan base paper and pink direction marker"""
         # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Detect green base marker (paper) - use morphological operations to clean up
-        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+        # Detect cyan base marker (paper) - use morphological operations to clean up
+        cyan_mask = cv2.inRange(hsv, CYAN_LOWER, CYAN_UPPER)
         # Clean up the mask for better paper detection
         kernel = np.ones((5,5), np.uint8)
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)  # Fill holes
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)   # Remove noise
+        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_CLOSE, kernel)  # Fill holes
+        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_OPEN, kernel)   # Remove noise
         
-        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cyan_contours, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Detect pink direction marker (clip)
         pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
@@ -229,16 +230,16 @@ class BallCollector:
         
         pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Find largest green contour (base paper) - lower threshold for larger areas
-        green_center = None
-        if green_contours:
-            largest_green = max(green_contours, key=cv2.contourArea)
-            green_area = cv2.contourArea(largest_green)
-            if green_area > 500:  # Increased threshold for paper (was 100)
+        # Find largest cyan contour (base paper) - lower threshold for larger areas
+        cyan_center = None
+        if cyan_contours:
+            largest_cyan = max(cyan_contours, key=cv2.contourArea)
+            cyan_area = cv2.contourArea(largest_cyan)
+            if cyan_area > 500:  # Increased threshold for paper (was 100)
                 # Use moments to find center of mass
-                M = cv2.moments(largest_green)
+                M = cv2.moments(largest_cyan)
                 if M["m00"] != 0:
-                    green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                    cyan_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
         # Find largest pink contour (direction clip) - keep smaller threshold
         pink_center = None
@@ -250,27 +251,27 @@ class BallCollector:
                 if M["m00"] != 0:
                     pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
-        return green_center, pink_center
+        return cyan_center, pink_center
 
     def update_robot_position(self, frame):
         """Update robot position and heading based on visual markers"""
-        green_center, pink_center = self.detect_markers(frame)
+        cyan_center, pink_center = self.detect_markers(frame)
         
-        if green_center and pink_center and self.homography_matrix is not None:
-            # Convert green center (robot base) to cm coordinates
-            green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
-            green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
+        if cyan_center and pink_center and self.homography_matrix is not None:
+            # Convert cyan center (robot base) to cm coordinates
+            cyan_px = np.array([[[float(cyan_center[0]), float(cyan_center[1])]]], dtype="float32")
+            cyan_cm = cv2.perspectiveTransform(cyan_px, np.linalg.inv(self.homography_matrix))[0][0]
             
             # Convert pink center (direction marker) to cm coordinates
             pink_px = np.array([[[float(pink_center[0]), float(pink_center[1])]]], dtype="float32")
             pink_cm = cv2.perspectiveTransform(pink_px, np.linalg.inv(self.homography_matrix))[0][0]
             
-            # Update robot position (green marker center)
-            self.robot_pos = (green_cm[0], green_cm[1])
+            # Update robot position (cyan marker center)
+            self.robot_pos = (cyan_cm[0], cyan_cm[1])
             
-            # Calculate heading from green to pink marker (front direction)
-            dx = pink_cm[0] - green_cm[0]
-            dy = pink_cm[1] - green_cm[1]
+            # Calculate heading from cyan to pink marker (front direction)
+            dx = pink_cm[0] - cyan_cm[0]
+            dy = pink_cm[1] - cyan_cm[1]
             # Convert to degrees and normalize to [-180, 180]
             heading_raw = math.degrees(math.atan2(dy, dx))
             self.robot_heading = (heading_raw + 180) % 360 - 180
@@ -284,11 +285,11 @@ class BallCollector:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         # Get the masks for debugging
-        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+        cyan_mask = cv2.inRange(hsv, CYAN_LOWER, CYAN_UPPER)
         kernel = np.ones((5,5), np.uint8)
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
-        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_CLOSE, kernel)
+        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_OPEN, kernel)
+        cyan_contours, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
         kernel_small = np.ones((3,3), np.uint8)
@@ -296,27 +297,27 @@ class BallCollector:
         pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel_small)
         pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        green_center, pink_center = self.detect_markers(frame)
+        cyan_center, pink_center = self.detect_markers(frame)
         
-        # Draw all green contours for debugging
-        if green_contours:
-            largest_green = max(green_contours, key=cv2.contourArea)
-            green_area = cv2.contourArea(largest_green)
+        # Draw all cyan contours for debugging
+        if cyan_contours:
+            largest_cyan = max(cyan_contours, key=cv2.contourArea)
+            cyan_area = cv2.contourArea(largest_cyan)
             
-            # Draw the green paper contour
-            cv2.drawContours(frame, [largest_green], -1, (0, 255, 0), 2)
+            # Draw the cyan paper contour
+            cv2.drawContours(frame, [largest_cyan], -1, (255, 255, 0), 2)  # Cyan color in BGR
             
             # Show area info
-            cv2.putText(frame, f"Green area: {green_area:.0f}", 
-                      (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(frame, f"Cyan area: {cyan_area:.0f}", 
+                      (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
-            if green_center:
+            if cyan_center:
                 # Draw center point
-                cv2.circle(frame, green_center, 8, (0, 255, 0), -1)
-                cv2.circle(frame, green_center, 12, (255, 255, 255), 2)
-                cv2.putText(frame, "GREEN CENTER", 
-                          (green_center[0] + 15, green_center[1] - 10), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.circle(frame, cyan_center, 8, (255, 255, 0), -1)
+                cv2.circle(frame, cyan_center, 12, (255, 255, 255), 2)
+                cv2.putText(frame, "CYAN CENTER", 
+                          (cyan_center[0] + 15, cyan_center[1] - 10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
         
         # Draw all pink contours for debugging
         if pink_contours:
@@ -339,14 +340,14 @@ class BallCollector:
                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 192, 203), 2)
         
         # Draw heading line if both markers detected
-        if green_center and pink_center:
+        if cyan_center and pink_center:
             # Draw thick heading line
-            cv2.arrowedLine(frame, green_center, pink_center, (255, 255, 0), 4)
+            cv2.arrowedLine(frame, cyan_center, pink_center, (0, 255, 255), 4)  # Yellow arrow
             
             # Show distance between markers
-            distance = math.hypot(pink_center[0] - green_center[0], pink_center[1] - green_center[1])
+            distance = math.hypot(pink_center[0] - cyan_center[0], pink_center[1] - cyan_center[1])
             cv2.putText(frame, f"Marker distance: {distance:.1f}px", 
-                      (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                      (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
         return frame
 
