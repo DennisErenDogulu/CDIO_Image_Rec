@@ -28,13 +28,13 @@ RF_PROJECT = "cdio-golfbot2025"
 RF_VERSION = 13
 
 # Color detection ranges (HSV)
-GREEN_LOWER = np.array([35, 50, 50])
-GREEN_UPPER = np.array([85, 255, 255])
-PINK_LOWER = np.array([145, 50, 50])
-PINK_UPPER = np.array([175, 255, 255])
+GREEN_LOWER = np.array([35, 50, 50], dtype=np.uint8)
+GREEN_UPPER = np.array([85, 255, 255], dtype=np.uint8)
+PINK_LOWER = np.array([145, 50, 50], dtype=np.uint8)
+PINK_UPPER = np.array([175, 255, 255], dtype=np.uint8)
 # Orange ball HSV range (typical range for orange)
-ORANGE_LOWER = np.array([5, 150, 150])
-ORANGE_UPPER = np.array([15, 255, 255])
+ORANGE_LOWER = np.array([5, 150, 150], dtype=np.uint8)
+ORANGE_UPPER = np.array([15, 255, 255], dtype=np.uint8)
 
 # Marker dimensions
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
@@ -464,9 +464,9 @@ class BallCollector:
         
         # Detect white balls (high value, low saturation)
         if self.field_value_threshold is not None:
-            white_mask = cv2.inRange(hsv, 
-                                   np.array([0, 0, self.field_value_threshold]),
-                                   np.array([180, 30, 255]))
+            white_lower = np.array([0, 0, self.field_value_threshold], dtype=np.uint8)
+            white_upper = np.array([180, 30, 255], dtype=np.uint8)
+            white_mask = cv2.inRange(hsv, white_lower, white_upper)
             
             # Clean up mask
             kernel = np.ones((5,5), np.uint8)
@@ -502,6 +502,7 @@ class BallCollector:
         orange_mask = cv2.inRange(hsv, ORANGE_LOWER, ORANGE_UPPER)
         
         # Clean up mask
+        kernel = np.ones((5,5), np.uint8)
         orange_mask = cv2.morphologyEx(orange_mask, cv2.MORPH_OPEN, kernel)
         orange_mask = cv2.morphologyEx(orange_mask, cv2.MORPH_CLOSE, kernel)
         
@@ -542,9 +543,10 @@ class BallCollector:
         
         # Draw white ball detection
         if self.field_value_threshold is not None:
-            white_mask = cv2.inRange(hsv, 
-                                   np.array([0, 0, self.field_value_threshold]),
-                                   np.array([180, 30, 255]))
+            white_lower = np.array([0, 0, self.field_value_threshold], dtype=np.uint8)
+            white_upper = np.array([180, 30, 255], dtype=np.uint8)
+            white_mask = cv2.inRange(hsv, white_lower, white_upper)
+            
             white_debug = cv2.cvtColor(white_mask, cv2.COLOR_GRAY2BGR)
             white_debug = cv2.addWeighted(frame, 0.7, white_debug, 0.3, 0)
             
