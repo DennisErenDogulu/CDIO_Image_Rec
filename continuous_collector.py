@@ -725,58 +725,19 @@ class BallCollector:
 
     def collect_balls(self):
         """Main ball collection loop"""
-        cv2.namedWindow("Path Planning")
         last_plan_time = 0
         last_plan_positions = []
-        preview_path = None
         
         while True:
             try:
-                # Capture frame for visualization
+                # Get latest processed frame
                 frame_data = self.processing_thread.get_processed_frame()
                 if frame_data is None:
                     continue
 
-                frame = frame_data.frame
-                # Update robot position from visual markers
+                # Update robot position
                 if not self.update_robot_position():
                     logger.warning("Could not detect robot markers")
-                    cv2.putText(frame, "Robot markers not detected!", 
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (0, 0, 255), 2)
-
-                # Draw walls and safety margins
-                frame = self.draw_walls(frame)
-
-                # Draw robot markers
-                frame = self.draw_robot_markers(frame)
-
-                # Add status overlay
-                frame = self.draw_status(frame)
-
-                # If in preview mode, show the preview path
-                if preview_path is not None:
-                    frame = self.draw_path(frame, preview_path, preview_mode=True)
-                    
-                    # Handle preview mode keys
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 13:  # Enter key
-                        # Execute the previewed path
-                        logger.info("Executing previewed path with {} points".format(len(preview_path)))
-                        path = preview_path
-                        preview_path = None
-                        try:
-                            self._execute_path(path, frame)
-                        except Exception as e:
-                            logger.error("Path execution failed: {}".format(e))
-                            self.stop()
-                            cv2.waitKey(2000)
-                    elif key == 27:  # Escape key
-                        # Cancel preview
-                        logger.info("Path preview cancelled")
-                        preview_path = None
-                    
-                    cv2.imshow("Path Planning", frame)
                     continue
 
                 # Detect balls
@@ -866,58 +827,26 @@ class BallCollector:
                     if path:
                         goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
                         path.extend(goal_path)
+                        
+                        # Execute the path
+                        try:
+                            self._execute_path(path, frame_data.frame)
+                        except Exception as e:
+                            logger.error(f"Path execution failed: {e}")
+                            self.stop()
+                            time.sleep(2)
 
-                    # Draw path on frame
-                    frame_with_path = self.draw_path(frame, path)
-                    
-                    # Add key command help and goal status
-                    help_text = [
-                        "Commands:",
-                        "SPACE - Preview path",
-                        "G - Toggle goal size (current: {} mm)".format(
-                            80 if self.is_small_goal else 200),
-                        "Q - Quit"
-                    ]
-                    y = 150
-                    for text in help_text:
-                        cv2.putText(frame_with_path, text,
-                                  (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                                  0.5, (255, 255, 255), 1)
-                        y += 20
-                    
-                    cv2.imshow("Path Planning", frame_with_path)
-                    
-                    # Handle key commands
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('g'):
-                        # Toggle between goal sizes
-                        self.is_small_goal = not self.is_small_goal
-                        self.current_goal_width = GOAL_WIDTH_SMALL if self.is_small_goal else GOAL_WIDTH_LARGE
-                        # Update walls for new goal size
-                        self.setup_walls()
-                        logger.info(f"Switched to {'small' if self.is_small_goal else 'large'} goal ({self.current_goal_width*10} mm)")
-                    elif key == ord(' '):
-                        # Enter preview mode
-                        preview_path = path
-                        logger.info("Entering preview mode - press ENTER to execute or ESC to cancel")
-                
-                # Show frame even when not replanning
-                cv2.imshow("Path Planning", frame)
-                cv2.waitKey(1)
+                time.sleep(0.1)  # Small sleep to prevent CPU overuse
                     
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
-                cv2.waitKey(1000)
-
-        cv2.destroyWindow("Path Planning")
+                time.sleep(0.1)  # Delay on error to prevent rapid error loops
 
     def _execute_path(self, path, frame):
         """Execute a planned path with continuous position updates"""
         for point in path:
             # Initial position update
-            if not self._update_position_with_retry(frame):
+            if not self.update_robot_position():
                 raise Exception("Lost robot marker tracking before movement")
 
             # Calculate initial movement parameters
@@ -940,7 +869,7 @@ class BallCollector:
                 
                 # Multiple position updates after turn
                 for _ in range(3):
-                    if not self._update_position_with_retry(frame):
+                    if not self.update_robot_position():
                         raise Exception("Lost robot marker tracking during turn")
                     # Recalculate angle difference after position update
                     new_angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
@@ -960,7 +889,7 @@ class BallCollector:
                 # Monitor position during collection
                 collection_start_time = time.time()
                 while time.time() - collection_start_time < 5:  # Max 5 seconds for collection
-                    if not self._update_position_with_retry(frame):
+                    if not self.update_robot_position():
                         logger.warning("Position tracking lost during collection")
                     time.sleep(0.1)
             
@@ -974,7 +903,7 @@ class BallCollector:
                 movement_start_time = time.time()
                 last_correction_time = movement_start_time
                 while time.time() - movement_start_time < 10:  # Max 10 seconds for movement
-                    if not self._update_position_with_retry(frame):
+                    if not self.update_robot_position():
                         logger.warning("Position tracking lost during movement")
                         continue
                     
@@ -1011,7 +940,7 @@ class BallCollector:
                 movement_start_time = time.time()
                 last_correction_time = movement_start_time
                 while time.time() - movement_start_time < 10:  # Max 10 seconds for movement
-                    if not self._update_position_with_retry(frame):
+                    if not self.update_robot_position():
                         logger.warning("Position tracking lost during movement")
                         continue
                     
@@ -1030,27 +959,6 @@ class BallCollector:
                         last_correction_time = current_time
                     
                     time.sleep(0.1)
-            
-            # Update visualization more frequently
-            frame_data = self.processing_thread.get_processed_frame()
-            if frame_data is not None:
-                self.robot_pos = frame_data.robot_pos
-                self.robot_heading = frame_data.robot_heading
-                frame = self.draw_status(frame)
-                frame = self.draw_robot_markers(frame)
-                frame_with_path = self.draw_path(frame, path)
-                cv2.imshow("Path Planning", frame_with_path)
-                cv2.waitKey(1)
-
-    def _update_position_with_retry(self, frame, max_retries=5):
-        """Update robot position with multiple retries"""
-        for _ in range(max_retries):
-            frame_data = self.processing_thread.get_processed_frame()
-            if frame_data is not None:
-                if self.update_robot_position():
-                    return True
-            time.sleep(0.1)
-        return False
 
     def run(self):
         """Main run loop"""
