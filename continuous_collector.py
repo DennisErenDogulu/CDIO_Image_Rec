@@ -5,7 +5,7 @@ Continuous Ball Collection Client
 This script implements a continuous ball collection strategy using visual markers:
 1. Track robot position using green base marker
 2. Track robot heading using pink direction marker
-3. Detect balls in the camera view
+3. Detect balls using HSV color detection
 4. Navigate to and collect balls based on visual position tracking
 """
 
@@ -16,22 +16,39 @@ import socket
 import logging
 import numpy as np
 from typing import List, Tuple, Optional
-from roboflow import Roboflow
 import time
 
 # Configuration
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
-ROBOFLOW_API_KEY = "qJTLU5ku2vpBGQUwjBx2"
-RF_WORKSPACE = "cdio-nczdp"
-RF_PROJECT = "cdio-golfbot2025" 
-RF_VERSION = 12
 
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
 GREEN_UPPER = np.array([85, 255, 255])
 PINK_LOWER = np.array([145, 50, 50])
 PINK_UPPER = np.array([175, 255, 255])
+
+# Ball color detection ranges (HSV)
+ORANGE_BALL_LOWER = np.array([5, 100, 100])
+ORANGE_BALL_UPPER = np.array([25, 255, 255])
+WHITE_BALL_LOWER = np.array([0, 0, 200])
+WHITE_BALL_UPPER = np.array([180, 30, 255])
+
+# Wall and obstacle detection ranges (HSV)
+RED_WALL_LOWER = np.array([0, 120, 70])     # Red tape on top
+RED_WALL_UPPER = np.array([10, 255, 255])
+BROWN_WALL_LOWER = np.array([10, 50, 20])   # Wood brown on sides
+BROWN_WALL_UPPER = np.array([20, 255, 200])
+
+# Goal detection ranges (HSV) - assuming goals are white
+WHITE_GOAL_LOWER = np.array([0, 0, 200])
+WHITE_GOAL_UPPER = np.array([180, 30, 255])
+
+# Ball colors mapping (only orange and white)
+BALL_COLORS = {
+    'orange': (ORANGE_BALL_LOWER, ORANGE_BALL_UPPER),
+    'white': (WHITE_BALL_LOWER, WHITE_BALL_UPPER)
+}
 
 # Marker dimensions
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
@@ -60,6 +77,11 @@ IGNORED_AREA = {
     "x_min": 50, "x_max": 100,
     "y_min": 50, "y_max": 100
 }
+
+# Detection parameters
+MIN_BALL_AREA = 100  # Minimum contour area for ball detection
+MIN_WALL_AREA = 500  # Minimum contour area for wall detection
+MIN_GOAL_AREA = 1000  # Minimum contour area for goal detection
 
 # Setup logging
 logging.basicConfig(
@@ -122,11 +144,6 @@ def check_wall_collision(start_pos, end_pos, walls, safety_margin):
 
 class BallCollector:
     def __init__(self):
-        # Initialize Roboflow
-        self.rf = Roboflow(api_key=ROBOFLOW_API_KEY)
-        self.project = self.rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
-        self.model = self.project.version(RF_VERSION).model
-        
         # Initialize camera
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
         if not self.cap.isOpened():
@@ -147,9 +164,12 @@ class BallCollector:
         
         # Wall configuration
         self.walls = []  # Will be set after calibration
+        self.use_detected_walls = False  # Option to use HSV wall detection vs hardcoded
         
         # Goal dimensions and positions
-        self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal
+        self.goal_positions = []  # Will store detected goal positions
+        self.use_detected_goals = False  # Option to use HSV goal detection vs hardcoded
+        self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal (fallback)
         self.goal_approach_distance = 20  # Distance to stop in front of goal
         self.delivery_time = 2.0  # Seconds to run collector in reverse
 
@@ -231,32 +251,37 @@ class BallCollector:
         
         return frame
 
-    def setup_walls(self):
-        """Set up wall segments based on calibration points, excluding goal areas"""
+    def setup_walls(self, frame=None):
+        """Set up wall segments - either hardcoded or detected from camera"""
         if len(self.calibration_points) != 4:
             return
 
-        # Calculate goal positions (in cm)
-        goal_y_min = (FIELD_HEIGHT_CM / 2) - (GOAL_WIDTH / 2)
-        goal_y_max = (FIELD_HEIGHT_CM / 2) + (GOAL_WIDTH / 2)
+        if self.use_detected_walls and frame is not None:
+            # Use HSV detection to find walls
+            self.walls = self.detect_walls(frame)
+            logger.info(f"Detected {len(self.walls)} wall segments")
+        else:
+            # Use hardcoded walls based on field dimensions
+            goal_y_min = (FIELD_HEIGHT_CM / 2) - (GOAL_WIDTH / 2)
+            goal_y_max = (FIELD_HEIGHT_CM / 2) + (GOAL_WIDTH / 2)
 
-        # Create wall segments with small safety margin
-        margin = WALL_SAFETY_MARGIN
-        self.walls = [
-            # Bottom wall (excluding goal)
-            (margin, margin, FIELD_WIDTH_CM - margin, margin),
-            
-            # Top wall (excluding goal)
-            (margin, FIELD_HEIGHT_CM - margin, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin),
-            
-            # Left wall (split into two parts to exclude goal)
-            (margin, margin, margin, goal_y_min),
-            (margin, goal_y_max, margin, FIELD_HEIGHT_CM - margin),
-            
-            # Right wall (split into two parts to exclude goal)
-            (FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_y_min),
-            (FIELD_WIDTH_CM - margin, goal_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin)
-        ]
+            # Create wall segments with small safety margin
+            margin = WALL_SAFETY_MARGIN
+            self.walls = [
+                # Bottom wall (excluding goal)
+                (margin, margin, FIELD_WIDTH_CM - margin, margin),
+                
+                # Top wall (excluding goal)
+                (margin, FIELD_HEIGHT_CM - margin, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin),
+                
+                # Left wall (split into two parts to exclude goal)
+                (margin, margin, margin, goal_y_min),
+                (margin, goal_y_max, margin, FIELD_HEIGHT_CM - margin),
+                
+                # Right wall (split into two parts to exclude goal)
+                (FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_y_min),
+                (FIELD_WIDTH_CM - margin, goal_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin)
+            ]
 
     def draw_walls(self, frame):
         """Draw walls, safety margins, and starting box on the frame"""
@@ -360,10 +385,7 @@ class BallCollector:
                     ], dtype="float32")
                     src_pts = np.array(self.calibration_points, dtype="float32")
                     self.homography_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
-                    
-                    # Set up walls after calibration
-                    self.setup_walls()
-                    logger.info("✅ Calibration and wall setup complete")
+                    logger.info("✅ Calibration complete")
 
         cv2.namedWindow("Calibration")
         cv2.setMouseCallback("Calibration", mouse_callback)
@@ -385,39 +407,263 @@ class BallCollector:
         
         cv2.destroyWindow("Calibration")
 
-    def detect_balls(self) -> List[Tuple[float, float, str]]:
-        """Detect balls in current camera view, return list of (x_cm, y_cm, label)"""
+    def setup_detection(self):
+        """Interactive setup for walls and goals detection mode"""
+        if self.homography_matrix is None:
+            logger.error("Must calibrate first")
+            return
+
+        # Get current frame for detection
         ret, frame = self.cap.read()
         if not ret:
-            return []
+            logger.error("Could not capture frame for setup")
+            return
 
-        # Resize for Roboflow model
-        small = cv2.resize(frame, (416, 416))
+        print("\n" + "="*50)
+        print("DETECTION SETUP")
+        print("="*50)
+        print("1. Press 'w' to toggle wall detection (HSV vs hardcoded)")
+        print("2. Press 'g' to toggle goal detection (HSV vs hardcoded)")
+        print("3. Press 'd' to detect goals in current frame")
+        print("4. Press 'SPACE' to finish setup")
+        print("5. Press 'q' to quit")
+        print("="*50)
+
+        cv2.namedWindow("Detection Setup")
         
-        # Get predictions
-        predictions = self.model.predict(small, confidence=30, overlap=20).json()
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+
+            # Draw current frame with detected objects
+            display_frame = frame.copy()
+            
+            # Show detected balls
+            balls = self.detect_balls(frame)
+            display_frame = self.draw_detected_balls(display_frame, balls)
+            
+            # Show detected walls if enabled
+            if self.use_detected_walls:
+                detected_walls = self.detect_walls(frame)
+                for wall in detected_walls:
+                    # Convert wall endpoints back to pixels for drawing
+                    pt1_cm = np.array([[[wall[0], wall[1]]]], dtype="float32")
+                    pt2_cm = np.array([[[wall[2], wall[3]]]], dtype="float32")
+                    pt1_px = cv2.perspectiveTransform(pt1_cm, self.homography_matrix)[0][0].astype(int)
+                    pt2_px = cv2.perspectiveTransform(pt2_cm, self.homography_matrix)[0][0].astype(int)
+                    cv2.line(display_frame, tuple(pt1_px), tuple(pt2_px), (0, 255, 255), 3)
+
+            # Show detected goals if enabled
+            if self.use_detected_goals:
+                goals = self.detect_goals(frame)
+                for goal_x, goal_y in goals:
+                    pt_cm = np.array([[[goal_x, goal_y]]], dtype="float32")
+                    pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
+                    cv2.circle(display_frame, tuple(pt_px), 25, (255, 255, 0), 3)
+                    cv2.putText(display_frame, "GOAL", (pt_px[0] - 20, pt_px[1] - 30),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+            # Add status text
+            status_y = 30
+            cv2.putText(display_frame, f"Wall Detection: {'HSV' if self.use_detected_walls else 'HARDCODED'}",
+                       (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            status_y += 30
+            cv2.putText(display_frame, f"Goal Detection: {'HSV' if self.use_detected_goals else 'HARDCODED'}",
+                       (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            status_y += 30
+            cv2.putText(display_frame, f"Detected Balls: {len(balls)}",
+                       (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            cv2.imshow("Detection Setup", display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('w'):
+                self.use_detected_walls = not self.use_detected_walls
+                logger.info(f"Wall detection: {'HSV' if self.use_detected_walls else 'HARDCODED'}")
+            elif key == ord('g'):
+                self.use_detected_goals = not self.use_detected_goals
+                logger.info(f"Goal detection: {'HSV' if self.use_detected_goals else 'HARDCODED'}")
+            elif key == ord('d'):
+                if self.use_detected_goals:
+                    self.goal_positions = self.detect_goals(frame)
+                    logger.info(f"Detected {len(self.goal_positions)} goals: {self.goal_positions}")
+                else:
+                    logger.info("Goal detection disabled - using hardcoded goal")
+            elif key == ord(' '):
+                # Finalize setup
+                self.setup_walls(frame)
+                if self.use_detected_goals and not self.goal_positions:
+                    self.goal_positions = self.detect_goals(frame)
+                logger.info("Setup complete!")
+                break
+
+        cv2.destroyWindow("Detection Setup")
+
+    def detect_balls(self, frame=None) -> List[Tuple[float, float, str]]:
+        """Detect balls using HSV color detection, return list of (x_cm, y_cm, color)"""
+        if frame is None:
+            ret, frame = self.cap.read()
+            if not ret:
+                return []
+        
+        # Convert to HSV color space
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         balls = []
-        scale_x = frame.shape[1] / 416
-        scale_y = frame.shape[0] / 416
         
-        for pred in predictions.get('predictions', []):
-            x_px = int(pred['x'] * scale_x)
-            y_px = int(pred['y'] * scale_y)
+        # Detect each ball color
+        for color_name, (lower, upper) in BALL_COLORS.items():
+            # Create mask for this color
+            mask = cv2.inRange(hsv, lower, upper)
+            
+            # Apply morphological operations to clean up the mask
+            kernel = np.ones((3,3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Process each contour
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < MIN_BALL_AREA:
+                    continue
+                
+                # Get center of contour
+                M = cv2.moments(contour)
+                if M["m00"] == 0:
+                    continue
+                
+                x_px = int(M["m10"] / M["m00"])
+                y_px = int(M["m01"] / M["m00"])
+                
+                # Convert to cm using homography
+                if self.homography_matrix is not None:
+                    pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                    pt_cm = cv2.perspectiveTransform(pt_px, 
+                                                   np.linalg.inv(self.homography_matrix))[0][0]
+                    x_cm, y_cm = pt_cm
+                    
+                    # Check if ball is in ignored area
+                    if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                           IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                        balls.append((x_cm, y_cm, color_name))
+        
+        return balls
+
+    def detect_walls(self, frame) -> List[Tuple[float, float, float, float]]:
+        """Detect wall segments using HSV color detection, return list of (x1, y1, x2, y2) in cm"""
+        # Convert to HSV color space
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Create masks for red and brown walls
+        red_mask = cv2.inRange(hsv, RED_WALL_LOWER, RED_WALL_UPPER)
+        brown_mask = cv2.inRange(hsv, BROWN_WALL_LOWER, BROWN_WALL_UPPER)
+        
+        # Combine masks
+        combined_mask = cv2.bitwise_or(red_mask, brown_mask)
+        
+        # Apply morphological operations
+        kernel = np.ones((5,5), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        walls = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < MIN_WALL_AREA:
+                continue
+            
+            # Approximate contour to get main edges
+            epsilon = 0.02 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            # Convert each edge to wall segment in cm
+            if self.homography_matrix is not None:
+                for i in range(len(approx)):
+                    p1 = approx[i][0]
+                    p2 = approx[(i + 1) % len(approx)][0]
+                    
+                    # Convert to cm
+                    pt1_px = np.array([[[float(p1[0]), float(p1[1])]]], dtype="float32")
+                    pt2_px = np.array([[[float(p2[0]), float(p2[1])]]], dtype="float32")
+                    
+                    pt1_cm = cv2.perspectiveTransform(pt1_px, np.linalg.inv(self.homography_matrix))[0][0]
+                    pt2_cm = cv2.perspectiveTransform(pt2_px, np.linalg.inv(self.homography_matrix))[0][0]
+                    
+                    walls.append((pt1_cm[0], pt1_cm[1], pt2_cm[0], pt2_cm[1]))
+        
+        return walls
+
+    def detect_goals(self, frame) -> List[Tuple[float, float]]:
+        """Detect goal positions using HSV color detection, return list of (x_cm, y_cm)"""
+        # Convert to HSV color space
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Create mask for white goals
+        mask = cv2.inRange(hsv, WHITE_GOAL_LOWER, WHITE_GOAL_UPPER)
+        
+        # Apply morphological operations
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        goals = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < MIN_GOAL_AREA:
+                continue
+            
+            # Get center of contour
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            
+            x_px = int(M["m10"] / M["m00"])
+            y_px = int(M["m01"] / M["m00"])
             
             # Convert to cm using homography
             if self.homography_matrix is not None:
                 pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(pt_px, 
-                                               np.linalg.inv(self.homography_matrix))[0][0]
-                x_cm, y_cm = pt_cm
-                
-                # Check if ball is in ignored area
-                if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                    balls.append((x_cm, y_cm, pred['class']))
+                pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
+                goals.append((pt_cm[0], pt_cm[1]))
         
-        return balls
+        return goals
+
+    def draw_detected_balls(self, frame, balls):
+        """Draw detected balls on the frame"""
+        ball_colors_bgr = {
+            'orange': (0, 165, 255),  # Orange in BGR
+            'white': (255, 255, 255)  # White in BGR
+        }
+        
+        for x_cm, y_cm, color_name in balls:
+            if self.homography_matrix is not None:
+                # Convert cm position back to pixels for drawing
+                pt_cm = np.array([[[x_cm, y_cm]]], dtype="float32")
+                pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
+                
+                # Draw ball
+                bgr_color = ball_colors_bgr.get(color_name, (255, 255, 255))
+                cv2.circle(frame, tuple(pt_px), 15, bgr_color, -1)
+                cv2.circle(frame, tuple(pt_px), 17, (255, 255, 255), 2)
+                
+                # Add label
+                cv2.putText(frame, color_name, 
+                          (pt_px[0] + 20, pt_px[1] + 5),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr_color, 2)
+        
+        return frame
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
         """Calculate approach position and angle for a target position"""
@@ -555,8 +801,17 @@ class BallCollector:
 
     def calculate_goal_approach_path(self, current_pos, current_heading):
         """Calculate a smooth path to the goal using intermediate points"""
-        goal_x = FIELD_WIDTH_CM - self.goal_approach_distance
-        goal_y = self.goal_y_center
+        # Use detected goal if available, otherwise use hardcoded position
+        if self.use_detected_goals and self.goal_positions:
+            # Use the closest detected goal
+            closest_goal = min(self.goal_positions, 
+                             key=lambda g: math.hypot(g[0] - current_pos[0], g[1] - current_pos[1]))
+            goal_x = closest_goal[0] - self.goal_approach_distance  # Stay back from goal center
+            goal_y = closest_goal[1]
+        else:
+            # Use hardcoded goal position
+            goal_x = FIELD_WIDTH_CM - self.goal_approach_distance
+            goal_y = self.goal_y_center
         
         # Calculate direct distance and angle to goal
         dx = goal_x - current_pos[0]
@@ -644,8 +899,11 @@ class BallCollector:
                 frame = self.draw_status(frame)
 
                 # Detect balls
-                balls = self.detect_balls()
+                balls = self.detect_balls(frame)
                 current_time = time.time()
+                
+                # Draw detected balls on frame
+                frame = self.draw_detected_balls(frame, balls)
                 
                 # Only replan if:
                 # 1. We have balls AND robot markers are detected AND
@@ -837,6 +1095,10 @@ class BallCollector:
             if self.homography_matrix is None:
                 logger.error("Calibration failed")
                 return
+            
+            # Setup detection methods
+            logger.info("Setting up detection...")
+            self.setup_detection()
             
             # Start continuous collection
             logger.info("Starting ball collection...")
