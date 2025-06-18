@@ -874,10 +874,144 @@ class BallCollector:
 
         cv2.destroyWindow("Path Planning")
 
+    def calibrate_colors(self):
+        """Interactive HSV color calibration for green and pink markers"""
+        cv2.namedWindow("Color Calibration")
+        cv2.namedWindow("Trackbars")
+
+        # Create trackbars for both colors
+        def nothing(x):
+            pass
+
+        # Green trackbars
+        cv2.createTrackbar("Green H Min", "Trackbars", int(GREEN_LOWER[0]), 179, nothing)
+        cv2.createTrackbar("Green H Max", "Trackbars", int(GREEN_UPPER[0]), 179, nothing)
+        cv2.createTrackbar("Green S Min", "Trackbars", int(GREEN_LOWER[1]), 255, nothing)
+        cv2.createTrackbar("Green S Max", "Trackbars", int(GREEN_UPPER[1]), 255, nothing)
+        cv2.createTrackbar("Green V Min", "Trackbars", int(GREEN_LOWER[2]), 255, nothing)
+        cv2.createTrackbar("Green V Max", "Trackbars", int(GREEN_UPPER[2]), 255, nothing)
+
+        # Pink trackbars
+        cv2.createTrackbar("Pink H Min", "Trackbars", int(PINK_LOWER[0]), 179, nothing)
+        cv2.createTrackbar("Pink H Max", "Trackbars", int(PINK_UPPER[0]), 179, nothing)
+        cv2.createTrackbar("Pink S Min", "Trackbars", int(PINK_LOWER[1]), 255, nothing)
+        cv2.createTrackbar("Pink S Max", "Trackbars", int(PINK_UPPER[1]), 255, nothing)
+        cv2.createTrackbar("Pink V Min", "Trackbars", int(PINK_LOWER[2]), 255, nothing)
+        cv2.createTrackbar("Pink V Max", "Trackbars", int(PINK_UPPER[2]), 255, nothing)
+
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+
+            # Convert to HSV
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            # Get current trackbar positions for green
+            green_h_min = cv2.getTrackbarPos("Green H Min", "Trackbars")
+            green_h_max = cv2.getTrackbarPos("Green H Max", "Trackbars")
+            green_s_min = cv2.getTrackbarPos("Green S Min", "Trackbars")
+            green_s_max = cv2.getTrackbarPos("Green S Max", "Trackbars")
+            green_v_min = cv2.getTrackbarPos("Green V Min", "Trackbars")
+            green_v_max = cv2.getTrackbarPos("Green V Max", "Trackbars")
+
+            # Get current trackbar positions for pink
+            pink_h_min = cv2.getTrackbarPos("Pink H Min", "Trackbars")
+            pink_h_max = cv2.getTrackbarPos("Pink H Max", "Trackbars")
+            pink_s_min = cv2.getTrackbarPos("Pink S Min", "Trackbars")
+            pink_s_max = cv2.getTrackbarPos("Pink S Max", "Trackbars")
+            pink_v_min = cv2.getTrackbarPos("Pink V Min", "Trackbars")
+            pink_v_max = cv2.getTrackbarPos("Pink V Max", "Trackbars")
+
+            # Create masks
+            green_lower = np.array([green_h_min, green_s_min, green_v_min])
+            green_upper = np.array([green_h_max, green_s_max, green_v_max])
+            pink_lower = np.array([pink_h_min, pink_s_min, pink_v_min])
+            pink_upper = np.array([pink_h_max, pink_s_max, pink_v_max])
+
+            green_mask = cv2.inRange(hsv, green_lower, green_upper)
+            pink_mask = cv2.inRange(hsv, pink_lower, pink_upper)
+
+            # Clean up masks
+            kernel = np.ones((5,5), np.uint8)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
+            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
+
+            # Create result images
+            green_result = cv2.bitwise_and(frame, frame, mask=green_mask)
+            pink_result = cv2.bitwise_and(frame, frame, mask=pink_mask)
+            combined_result = cv2.addWeighted(green_result, 1, pink_result, 1, 0)
+
+            # Stack images for display
+            display_frame = np.hstack([frame, combined_result])
+
+            # Add instructions
+            instructions = [
+                "Adjust trackbars until markers are clearly visible",
+                "Green marker should be fully detected",
+                "Pink marker should show clear direction",
+                "Press 'q' to save and exit",
+                "Press 'r' to reset to defaults"
+            ]
+
+            y = 30
+            for text in instructions:
+                cv2.putText(display_frame, text, (10, y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                y += 25
+
+            # Show current values
+            cv2.putText(display_frame, 
+                       f"Green HSV: [{green_h_min},{green_s_min},{green_v_min}] - [{green_h_max},{green_s_max},{green_v_max}]",
+                       (10, y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(display_frame,
+                       f"Pink HSV: [{pink_h_min},{pink_s_min},{pink_v_min}] - [{pink_h_max},{pink_s_max},{pink_v_max}]",
+                       (10, y+50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 192, 203), 2)
+
+            cv2.imshow("Color Calibration", display_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                # Save the calibrated values
+                global GREEN_LOWER, GREEN_UPPER, PINK_LOWER, PINK_UPPER
+                GREEN_LOWER = green_lower
+                GREEN_UPPER = green_upper
+                PINK_LOWER = pink_lower
+                PINK_UPPER = pink_upper
+                logger.info("Color calibration saved:")
+                logger.info(f"GREEN_LOWER = np.array([{green_h_min}, {green_s_min}, {green_v_min}])")
+                logger.info(f"GREEN_UPPER = np.array([{green_h_max}, {green_s_max}, {green_v_max}])")
+                logger.info(f"PINK_LOWER = np.array([{pink_h_min}, {pink_s_min}, {pink_v_min}])")
+                logger.info(f"PINK_UPPER = np.array([{pink_h_max}, {pink_s_max}, {pink_v_max}])")
+                break
+            elif key == ord('r'):
+                # Reset to defaults
+                cv2.setTrackbarPos("Green H Min", "Trackbars", int(GREEN_LOWER[0]))
+                cv2.setTrackbarPos("Green H Max", "Trackbars", int(GREEN_UPPER[0]))
+                cv2.setTrackbarPos("Green S Min", "Trackbars", int(GREEN_LOWER[1]))
+                cv2.setTrackbarPos("Green S Max", "Trackbars", int(GREEN_UPPER[1]))
+                cv2.setTrackbarPos("Green V Min", "Trackbars", int(GREEN_LOWER[2]))
+                cv2.setTrackbarPos("Green V Max", "Trackbars", int(GREEN_UPPER[2]))
+                cv2.setTrackbarPos("Pink H Min", "Trackbars", int(PINK_LOWER[0]))
+                cv2.setTrackbarPos("Pink H Max", "Trackbars", int(PINK_UPPER[0]))
+                cv2.setTrackbarPos("Pink S Min", "Trackbars", int(PINK_LOWER[1]))
+                cv2.setTrackbarPos("Pink S Max", "Trackbars", int(PINK_UPPER[1]))
+                cv2.setTrackbarPos("Pink V Min", "Trackbars", int(PINK_LOWER[2]))
+                cv2.setTrackbarPos("Pink V Max", "Trackbars", int(PINK_UPPER[2]))
+
+        cv2.destroyWindow("Color Calibration")
+        cv2.destroyWindow("Trackbars")
+
     def run(self):
         """Main run loop"""
         try:
-            # First calibrate the camera
+            # First calibrate colors
+            logger.info("Starting color calibration...")
+            self.calibrate_colors()
+            
+            # Then calibrate camera perspective
             logger.info("Starting camera calibration...")
             self.calibrate()
             
