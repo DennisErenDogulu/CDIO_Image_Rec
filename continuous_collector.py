@@ -900,51 +900,110 @@ class BallCollector:
     def _execute_path(self, path, frame):
         """Execute a planned path"""
         for point in path:
-            # Wait for visual marker detection
-            retries = 0
-            while not self.update_robot_position(frame) and retries < 10:
-                ret, frame = self.cap.read()
-                retries += 1
-                time.sleep(0.1)
-            
-            if retries >= 10:
-                raise Exception("Lost robot marker tracking")
+            # Initial position update
+            if not self._update_position_with_retry(frame):
+                raise Exception("Lost robot marker tracking before movement")
 
-            # Calculate turn angle from current heading
+            # Calculate initial movement parameters
             target_pos = point['pos']
             dx = target_pos[0] - self.robot_pos[0]
             dy = target_pos[1] - self.robot_pos[1]
+            distance = math.hypot(dx, dy)
             target_angle = math.degrees(math.atan2(dy, dx))
             
             # Adjust angle for reverse movement
             if point.get('is_reverse', False):
                 target_angle = (target_angle + 180) % 360
             
-            # Turn to face target
+            # Turn to face target with position correction
             angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
             if abs(angle_diff) > 5:
                 logger.info(f"Turning {angle_diff:.1f} degrees")
-                if not self.turn(angle_diff):
-                    raise Exception("Turn command failed")
+                
+                # Break turn into smaller segments for better control
+                remaining_angle = angle_diff
+                while abs(remaining_angle) > 5:
+                    turn_amount = min(45, abs(remaining_angle)) * (1 if remaining_angle > 0 else -1)
+                    if not self.turn(turn_amount):
+                        raise Exception("Turn command failed")
+                    
+                    # Update position after each turn segment
+                    if not self._update_position_with_retry(frame):
+                        raise Exception("Lost robot marker tracking during turn")
+                    
+                    # Recalculate remaining angle
+                    dx = target_pos[0] - self.robot_pos[0]
+                    dy = target_pos[1] - self.robot_pos[1]
+                    current_target_angle = math.degrees(math.atan2(dy, dx))
+                    if point.get('is_reverse', False):
+                        current_target_angle = (current_target_angle + 180) % 360
+                    remaining_angle = (current_target_angle - self.robot_heading + 180) % 360 - 180
             
-            # Move to target position
-            distance = math.hypot(dx, dy)
-            
+            # Move to target position with continuous position updates
             if point['type'] == 'collect':
                 logger.info(f"Collecting {point['ball_type']} ball")
                 if not self.collect(COLLECTION_DISTANCE_CM):
                     raise Exception("Collect command failed")
-            elif point['type'] == 'goal':
-                logger.info(f"Moving {distance:.1f} cm to goal")
-                if not self.move(distance):
-                    raise Exception("Move command failed")
-                # After reaching goal position, deliver balls
-                if not self.deliver_balls():
-                    raise Exception("Ball delivery failed")
-            else:  # approach point
-                logger.info(f"Moving {distance:.1f} cm {'backwards' if point.get('is_reverse', False) else 'forwards'}")
-                if not self.move(-distance if point.get('is_reverse', False) else distance):
-                    raise Exception("Move command failed")
+            else:
+                # Calculate movement distance
+                dx = target_pos[0] - self.robot_pos[0]
+                dy = target_pos[1] - self.robot_pos[1]
+                distance = math.hypot(dx, dy)
+                
+                if distance > 0:
+                    logger.info(f"Moving {distance:.1f} cm {'backwards' if point.get('is_reverse', False) else 'forwards'}")
+                    
+                    # Break movement into smaller segments for position correction
+                    SEGMENT_LENGTH = 20  # cm
+                    remaining_distance = distance
+                    
+                    while remaining_distance > 0:
+                        # Update position before each segment
+                        if not self._update_position_with_retry(frame):
+                            raise Exception("Lost robot marker tracking during movement")
+                        
+                        # Recalculate distance and angle to target
+                        dx = target_pos[0] - self.robot_pos[0]
+                        dy = target_pos[1] - self.robot_pos[1]
+                        current_distance = math.hypot(dx, dy)
+                        current_angle = math.degrees(math.atan2(dy, dx))
+                        if point.get('is_reverse', False):
+                            current_angle = (current_angle + 180) % 360
+                        
+                        # Check if we need to correct heading
+                        angle_diff = (current_angle - self.robot_heading + 180) % 360 - 180
+                        if abs(angle_diff) > 10:  # Only correct if off by more than 10 degrees
+                            logger.info(f"Correcting heading by {angle_diff:.1f} degrees")
+                            if not self.turn(angle_diff):
+                                raise Exception("Heading correction failed")
+                        
+                        # Calculate segment distance
+                        segment_distance = min(SEGMENT_LENGTH, remaining_distance)
+                        move_distance = -segment_distance if point.get('is_reverse', False) else segment_distance
+                        
+                        # Execute movement segment
+                        if not self.move(move_distance):
+                            raise Exception("Move command failed")
+                        
+                        remaining_distance = current_distance - segment_distance
+                
+                # After movement, check if we reached target
+                if not self._update_position_with_retry(frame):
+                    raise Exception("Lost robot marker tracking after movement")
+                
+                final_dx = target_pos[0] - self.robot_pos[0]
+                final_dy = target_pos[1] - self.robot_pos[1]
+                final_distance = math.hypot(final_dx, final_dy)
+                
+                if final_distance > 5:  # More than 5cm off target
+                    logger.warning(f"Position error of {final_distance:.1f}cm detected")
+                    if final_distance > 10:  # More than 10cm off target
+                        raise Exception("Position error too large")
+                
+                # For goal point, deliver balls
+                if point['type'] == 'goal':
+                    if not self.deliver_balls():
+                        raise Exception("Ball delivery failed")
             
             # Update visualization
             ret, frame = self.cap.read()
@@ -955,6 +1014,15 @@ class BallCollector:
                 frame_with_path = self.draw_path(frame, path)
                 cv2.imshow("Path Planning", frame_with_path)
                 cv2.waitKey(1)
+
+    def _update_position_with_retry(self, frame, max_retries=5):
+        """Update robot position with multiple retries"""
+        for _ in range(max_retries):
+            ret, frame = self.cap.read()
+            if ret and self.update_robot_position(frame):
+                return True
+            time.sleep(0.1)
+        return False
 
     def run(self):
         """Main run loop"""
