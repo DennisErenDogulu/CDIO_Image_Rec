@@ -32,6 +32,9 @@ GREEN_LOWER = np.array([35, 50, 50])
 GREEN_UPPER = np.array([85, 255, 255])
 PINK_LOWER = np.array([145, 50, 50])
 PINK_UPPER = np.array([175, 255, 255])
+# Orange ball HSV range (typical range for orange)
+ORANGE_LOWER = np.array([5, 150, 150])
+ORANGE_UPPER = np.array([15, 255, 255])
 
 # Marker dimensions
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
@@ -170,6 +173,40 @@ class BallCollector:
         # Add ball collection counter
         self.collected_balls = 0
         self.delivery_time = 2.0  # Seconds to run collector in reverse
+        
+        # Field HSV statistics
+        self.field_hsv_mean = None
+        self.field_value_threshold = None
+
+    def calculate_field_hsv_stats(self, frame):
+        """Calculate average HSV values for the field area"""
+        if self.homography_matrix is None:
+            return
+            
+        # Create a mask for the field area
+        field_corners_cm = np.array([
+            [[0, 0]],
+            [[FIELD_WIDTH_CM, 0]],
+            [[FIELD_WIDTH_CM, FIELD_HEIGHT_CM]],
+            [[0, FIELD_HEIGHT_CM]]
+        ], dtype="float32")
+        field_corners_px = cv2.perspectiveTransform(field_corners_cm, self.homography_matrix)
+        field_corners_px = field_corners_px.astype(int)
+        
+        # Create field mask
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [field_corners_px], 255)
+        
+        # Convert to HSV
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Calculate mean HSV values for the field area
+        self.field_hsv_mean = cv2.mean(hsv, mask=mask)[:3]
+        # Set value threshold above the mean field value
+        self.field_value_threshold = min(255, self.field_hsv_mean[2] * 1.3)  # 30% above mean
+        
+        logger.info(f"Field HSV mean: {self.field_hsv_mean}")
+        logger.info(f"Value threshold: {self.field_value_threshold}")
 
     def detect_markers(self, frame):
         """Detect green base and pink direction markers"""
@@ -411,54 +448,128 @@ class BallCollector:
                 margin <= y_cm <= FIELD_HEIGHT_CM - margin)
 
     def detect_balls(self) -> List[Tuple[float, float, str]]:
-        """Detect balls in current camera view, return list of (x_cm, y_cm, label)"""
+        """Detect white and orange balls using HSV thresholding"""
         ret, frame = self.cap.read()
-        if not ret:
+        if not ret or self.homography_matrix is None:
             return []
 
-        # Resize for Roboflow model
-        small = cv2.resize(frame, (416, 416))
-        
-        # Get predictions
-        predictions = self.model.predict(small, confidence=30, overlap=20).json()
+        # Update field stats periodically
+        if self.field_hsv_mean is None:
+            self.calculate_field_hsv_stats(frame)
+            
+        # Convert to HSV
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         balls = []
-        scale_x = frame.shape[1] / 416
-        scale_y = frame.shape[0] / 416
         
-        for pred in predictions.get('predictions', []):
-            x_px = int(pred['x'] * scale_x)
-            y_px = int(pred['y'] * scale_y)
+        # Detect white balls (high value, low saturation)
+        if self.field_value_threshold is not None:
+            white_mask = cv2.inRange(hsv, 
+                                   np.array([0, 0, self.field_value_threshold]),
+                                   np.array([180, 30, 255]))
             
-            # Convert to cm using homography
-            if self.homography_matrix is not None:
-                pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(pt_px, 
-                                               np.linalg.inv(self.homography_matrix))[0][0]
-                x_cm, y_cm = pt_cm
-                
-                # Check if ball is within field boundaries and not in ignored area
-                if (self.is_within_field(x_cm, y_cm) and
-                    not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                         IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"])):
-                    # Check if ball is not in or behind any goal area
-                    is_in_goal = False
-                    for goal in self.goals:
-                        goal_x, goal_y = goal['position']
-                        half_width = goal['width'] / 2
+            # Clean up mask
+            kernel = np.ones((5,5), np.uint8)
+            white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+            white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Find white ball contours
+            white_contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, 
+                                               cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Process white balls
+            for contour in white_contours:
+                area = cv2.contourArea(contour)
+                if 100 < area < 2000:  # Adjust these thresholds based on your setup
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        x_px = int(M["m10"] / M["m00"])
+                        y_px = int(M["m01"] / M["m00"])
                         
-                        # For left goal, check if ball is at x ≤ 0
-                        # For right goal, check if ball is at x ≥ FIELD_WIDTH_CM
-                        if ((goal_x == 0 and x_cm <= 0) or 
-                            (goal_x == FIELD_WIDTH_CM and x_cm >= FIELD_WIDTH_CM)) and \
-                           (goal_y - half_width <= y_cm <= goal_y + half_width):
-                            is_in_goal = True
-                            break
+                        # Convert to cm using homography
+                        pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                        pt_cm = cv2.perspectiveTransform(pt_px, 
+                                                       np.linalg.inv(self.homography_matrix))[0][0]
+                        x_cm, y_cm = pt_cm
+                        
+                        # Check if ball is within valid area
+                        if (self.is_within_field(x_cm, y_cm) and
+                            not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                                 IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"])):
+                            balls.append((x_cm, y_cm, "white"))
+        
+        # Detect orange balls
+        orange_mask = cv2.inRange(hsv, ORANGE_LOWER, ORANGE_UPPER)
+        
+        # Clean up mask
+        orange_mask = cv2.morphologyEx(orange_mask, cv2.MORPH_OPEN, kernel)
+        orange_mask = cv2.morphologyEx(orange_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Find orange ball contours
+        orange_contours, _ = cv2.findContours(orange_mask, cv2.RETR_EXTERNAL, 
+                                            cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Process orange balls
+        for contour in orange_contours:
+            area = cv2.contourArea(contour)
+            if 100 < area < 2000:  # Adjust these thresholds based on your setup
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    x_px = int(M["m10"] / M["m00"])
+                    y_px = int(M["m01"] / M["m00"])
                     
-                    if not is_in_goal:
-                        balls.append((x_cm, y_cm, pred['class']))
+                    # Convert to cm using homography
+                    pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                    pt_cm = cv2.perspectiveTransform(pt_px, 
+                                                   np.linalg.inv(self.homography_matrix))[0][0]
+                    x_cm, y_cm = pt_cm
+                    
+                    # Check if ball is within valid area
+                    if (self.is_within_field(x_cm, y_cm) and
+                        not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                             IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"])):
+                        balls.append((x_cm, y_cm, "orange"))
         
         return balls
+
+    def draw_debug_view(self, frame):
+        """Draw debug visualization of ball detection"""
+        if self.homography_matrix is None:
+            return frame
+            
+        debug_frame = frame.copy()
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Draw white ball detection
+        if self.field_value_threshold is not None:
+            white_mask = cv2.inRange(hsv, 
+                                   np.array([0, 0, self.field_value_threshold]),
+                                   np.array([180, 30, 255]))
+            white_debug = cv2.cvtColor(white_mask, cv2.COLOR_GRAY2BGR)
+            white_debug = cv2.addWeighted(frame, 0.7, white_debug, 0.3, 0)
+            
+            # Draw white ball contours
+            white_contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, 
+                                               cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(white_debug, white_contours, -1, (0, 255, 0), 2)
+            
+            # Show white detection window
+            cv2.imshow("White Ball Detection", white_debug)
+        
+        # Draw orange ball detection
+        orange_mask = cv2.inRange(hsv, ORANGE_LOWER, ORANGE_UPPER)
+        orange_debug = cv2.cvtColor(orange_mask, cv2.COLOR_GRAY2BGR)
+        orange_debug = cv2.addWeighted(frame, 0.7, orange_debug, 0.3, 0)
+        
+        # Draw orange ball contours
+        orange_contours, _ = cv2.findContours(orange_mask, cv2.RETR_EXTERNAL, 
+                                            cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(orange_debug, orange_contours, -1, (0, 255, 0), 2)
+        
+        # Show orange detection window
+        cv2.imshow("Orange Ball Detection", orange_debug)
+        
+        return debug_frame
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
         """Calculate approach position and angle for a target position"""
