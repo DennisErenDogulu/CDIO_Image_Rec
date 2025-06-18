@@ -28,16 +28,24 @@ GREEN_UPPER = np.array([85, 255, 255])
 PINK_LOWER = np.array([145, 50, 50])
 PINK_UPPER = np.array([175, 255, 255])
 
-# Ball color detection ranges (HSV)
-#ORANGE_BALL_LOWER = np.array([5, 100, 100])
-#ORANGE_BALL_UPPER = np.array([25, 255, 255])
-WHITE_BALL_LOWER = np.array([0, 0, 200])
-WHITE_BALL_UPPER = np.array([180, 30, 255])
+# Ball color detection ranges (HSV) - Optimized for white ball detection
+# Orange detection disabled for now
+# ORANGE_BALL_LOWER = np.array([8, 80, 40])    
+# ORANGE_BALL_UPPER = np.array([22, 255, 255]) 
 
-# Ball colors mapping (only orange and white)
+# Fine-tuned white ball detection ranges
+WHITE_BALL_LOWER_1 = np.array([0, 0, 120])   # Main range - medium brightness, very low saturation
+WHITE_BALL_UPPER_1 = np.array([180, 25, 255])
+WHITE_BALL_LOWER_2 = np.array([0, 0, 90])    # Shadow range - lower brightness
+WHITE_BALL_UPPER_2 = np.array([180, 40, 180])
+WHITE_BALL_LOWER_3 = np.array([0, 0, 160])   # Bright range - high brightness, ultra low saturation
+WHITE_BALL_UPPER_3 = np.array([180, 15, 255])
+
+# Ball colors mapping - Only white balls for now
 BALL_COLORS = {
-    #'orange': (ORANGE_BALL_LOWER, ORANGE_BALL_UPPER),
-    'white': (WHITE_BALL_LOWER, WHITE_BALL_UPPER)
+    'white': (WHITE_BALL_LOWER_1, WHITE_BALL_UPPER_1),
+    'white_shadow': (WHITE_BALL_LOWER_2, WHITE_BALL_UPPER_2),
+    'white_bright': (WHITE_BALL_LOWER_3, WHITE_BALL_UPPER_3)
 }
 
 # Marker dimensions
@@ -71,8 +79,8 @@ IGNORED_AREA = {
     "y_min": 50, "y_max": 100
 }
 
-# Detection parameters
-MIN_BALL_AREA = 100  # Minimum contour area for ball detection
+# Detection parameters - Optimized for white ball detection
+MIN_BALL_AREA = 60   # Minimum contour area for ball detection (optimized for white balls)
 MIN_ROUNDNESS = 0.5  # Minimum roundness (circularity) for ball detection
 MIN_WALL_AREA = 500  # Minimum contour area for wall detection
 MIN_GOAL_AREA = 1000  # Minimum contour area for goal detection
@@ -164,6 +172,10 @@ class BallCollector:
         self.selected_goal = 'A'  # 'A' (small goal) or 'B' (large goal)
         self.goal_ranges = self._build_goal_ranges()
         self.delivery_time = 2.0  # Seconds to run collector in reverse
+
+    def is_point_in_field(self, x_cm: float, y_cm: float) -> bool:
+        """Check if a point in cm coordinates is within the calibrated field bounds"""
+        return (0 <= x_cm <= FIELD_WIDTH_CM and 0 <= y_cm <= FIELD_HEIGHT_CM)
 
     def _build_goal_ranges(self) -> dict:
         """
@@ -364,11 +376,17 @@ class BallCollector:
             
             # Draw goal areas
             for goal_label, goal_points in self.goal_ranges.items():
-                # Color based on selection
-                if goal_label == self.selected_goal:
-                    goal_color = (0, 255, 0)  # Green for selected goal
-                else:
-                    goal_color = (0, 255, 255)  # Yellow for available goal
+                # Color based on goal type and selection
+                if goal_label == 'A':  # Small goal
+                    if goal_label == self.selected_goal:
+                        goal_color = (0, 0, 139)  # Magenta for selected small goal
+                    else:
+                        goal_color = (255, 0, 128)  # Pink for available small goal
+                else:  # Goal B (large goal)
+                    if goal_label == self.selected_goal:
+                        goal_color = (0, 255, 0)  # Green for selected large goal
+                    else:
+                        goal_color = (0, 255, 255)  # Yellow for available large goal
                 
                 # Draw goal points
                 for (x_cm, y_cm) in goal_points:
@@ -489,64 +507,136 @@ class BallCollector:
             if not ret:
                 return []
         
-        # Convert to HSV color space
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # Only detect if we have calibration
+        if self.homography_matrix is None:
+            return []
+        
+        # Advanced image enhancement for white ball detection
+        
+        # 1. Histogram equalization to improve contrast
+        frame_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        frame_lab[:, :, 0] = cv2.equalizeHist(frame_lab[:, :, 0])  # Equalize L channel
+        frame_enhanced = cv2.cvtColor(frame_lab, cv2.COLOR_LAB2BGR)
+        
+        # 2. Apply adaptive gamma correction based on average brightness
+        gray = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2GRAY)
+        avg_brightness = np.mean(gray)
+        gamma = 1.8 if avg_brightness < 100 else 1.3  # More aggressive for darker images
+        frame_enhanced = np.power(frame_enhanced / 255.0, 1.0 / gamma)
+        frame_enhanced = (frame_enhanced * 255).astype(np.uint8)
+        
+        # 3. Convert to HSV color space
+        hsv = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2HSV)
+        
+        # 4. Apply bilateral filter to reduce noise while preserving edges
+        hsv = cv2.bilateralFilter(hsv, 9, 75, 75)
         
         balls = []
         
-        # Detect each ball color
+        # Combine all white ball masks for comprehensive detection
+        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        # Detect each white ball range and combine masks
         for color_name, (lower, upper) in BALL_COLORS.items():
-            # Create mask for this color
+            # Create mask for this color range
             mask = cv2.inRange(hsv, lower, upper)
+            combined_mask = cv2.bitwise_or(combined_mask, mask)
+        
+        # Refined morphological operations for better ball isolation
+        kernel_small = np.ones((3,3), np.uint8)
+        kernel_medium = np.ones((5,5), np.uint8)
+        
+        # Remove small noise more aggressively
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_small, iterations=2)
+        # Fill holes and connect nearby regions
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_medium, iterations=1)
+        # Final cleanup to ensure smooth circular shapes
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+        
+        # Find contours
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Process each contour with refined validation for white balls
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < MIN_BALL_AREA or area > 1500:  # Tighter upper limit
+                continue
             
-            # Apply morphological operations to clean up the mask
-            kernel = np.ones((3,3), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            # Enhanced circularity check with tighter threshold
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+            circularity = 4 * math.pi * area / (perimeter * perimeter)
+            if circularity < 0.6:  # Stricter circularity for white balls
+                continue
             
-            # Find contours
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Bounding box analysis
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = w / h if h > 0 else 0
+            if aspect_ratio < 0.8 or aspect_ratio > 1.2:  # Even stricter aspect ratio
+                continue
             
-            # Process each contour
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area < MIN_BALL_AREA:
+            # Size consistency check - width and height should be similar to expected ball size
+            avg_size = (w + h) / 2
+            if avg_size < 8 or avg_size > 40:  # Expected pixel size range for balls
+                continue
+            
+            # Minimum enclosing circle validation
+            (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+            circle_area = math.pi * radius * radius
+            area_ratio = area / circle_area if circle_area > 0 else 0
+            if area_ratio < 0.65:  # Stricter - contour should fill most of the circle
+                continue
+            
+            # Brightness validation with adaptive threshold
+            roi = frame_enhanced[y:y+h, x:x+w]
+            if roi.size > 0:
+                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                avg_brightness = np.mean(roi_gray)
+                max_brightness = np.max(roi_gray)
+                # Ball should have good brightness and contrast
+                if avg_brightness < 80 or max_brightness < 120:
                     continue
-                
-                # Check roundness (circularity)
-                perimeter = cv2.arcLength(contour, True)
-                if perimeter == 0:
-                    continue
-                circularity = 4 * math.pi * area / (perimeter * perimeter)
-                if circularity < MIN_ROUNDNESS:
-                    continue
-                
-                # Get center of contour
-                M = cv2.moments(contour)
-                if M["m00"] == 0:
-                    continue
-                
-                x_px = int(M["m10"] / M["m00"])
-                y_px = int(M["m01"] / M["m00"])
-                
-                # Convert to cm using homography
-                if self.homography_matrix is not None:
-                    pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-                    pt_cm = cv2.perspectiveTransform(pt_px, 
-                                                   np.linalg.inv(self.homography_matrix))[0][0]
-                    x_cm, y_cm = pt_cm
-                    
-                    # Check if ball is in ignored area
-                    if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                           IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                        balls.append((x_cm, y_cm, color_name))
+            
+            # Get center of contour
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            
+            x_px = int(M["m10"] / M["m00"])
+            y_px = int(M["m01"] / M["m00"])
+            
+            # Convert to cm using homography
+            pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+            pt_cm = cv2.perspectiveTransform(pt_px, 
+                                           np.linalg.inv(self.homography_matrix))[0][0]
+            x_cm, y_cm = pt_cm
+            
+            # Check if ball is within the calibrated field bounds
+            if not self.is_point_in_field(x_cm, y_cm):
+                continue
+            
+            # Check if ball is in ignored area (center obstacle)
+            if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+               IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                continue
+            
+            # Avoid duplicate detections by checking if we already have a ball nearby
+            duplicate = False
+            for existing_x, existing_y, _ in balls:
+                if math.hypot(x_cm - existing_x, y_cm - existing_y) < 3:  # Within 3cm (tighter)
+                    duplicate = True
+                    break
+            
+            if not duplicate:
+                balls.append((x_cm, y_cm, 'white'))
         
         return balls
 
     def draw_detected_balls(self, frame, balls):
         """Draw detected balls on the frame"""
         ball_colors_bgr = {
-            'orange': (0, 165, 255),  # Orange in BGR
+            'orange': (0, 140, 255),  # Orange in BGR
             'white': (255, 255, 255)  # White in BGR
         }
         
@@ -586,7 +676,7 @@ class BallCollector:
         return (approach_x, approach_y), target_angle
 
     def draw_path(self, frame, path):
-        """Draw the planned path on the frame"""
+        """Draw the planned path on the frame with enhanced preview"""
         if not self.homography_matrix is None:
             overlay = frame.copy()
             
@@ -597,42 +687,87 @@ class BallCollector:
                 'goal': (0, 0, 255)         # Red
             }
             
-            # Draw lines between points
+            # Draw grid overlay (light grid lines every 10cm)
+            grid_color = (100, 100, 100)
+            for x_cm in range(0, FIELD_WIDTH_CM + 1, 10):
+                start_cm = np.array([[[x_cm, 0]]], dtype="float32")
+                end_cm = np.array([[[x_cm, FIELD_HEIGHT_CM]]], dtype="float32")
+                start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
+                end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
+                cv2.line(overlay, tuple(start_px), tuple(end_px), grid_color, 1)
+            
+            for y_cm in range(0, FIELD_HEIGHT_CM + 1, 10):
+                start_cm = np.array([[[0, y_cm]]], dtype="float32")
+                end_cm = np.array([[[FIELD_WIDTH_CM, y_cm]]], dtype="float32")
+                start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
+                end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
+                cv2.line(overlay, tuple(start_px), tuple(end_px), grid_color, 1)
+            
+            # Convert path to grid for display
+            grid_path, ball_cells = self.convert_path_to_grid(path)
+            
+            # Draw thick path lines between consecutive points
             for i in range(len(path) - 1):
-                # Convert cm to pixels for both points
                 start_cm = np.array([[[path[i]['pos'][0], path[i]['pos'][1]]]], dtype="float32")
                 end_cm = np.array([[[path[i+1]['pos'][0], path[i+1]['pos'][1]]]], dtype="float32")
                 
                 start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
                 end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
                 
-                # Draw line
+                # Draw thick path line
+                cv2.line(overlay, tuple(start_px), tuple(end_px), (255, 255, 255), 4)
                 cv2.line(overlay, tuple(start_px), tuple(end_px), (150, 150, 150), 2)
             
-            # Draw points
-            for point in path:
+            # Draw waypoints with numbers
+            for i, point in enumerate(path):
                 pt_cm = np.array([[[point['pos'][0], point['pos'][1]]]], dtype="float32")
                 pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
                 
-                # Draw point
+                # Draw point with larger circle
                 color = colors[point['type']]
-                cv2.circle(overlay, tuple(pt_px), 5, color, -1)
+                cv2.circle(overlay, tuple(pt_px), 8, color, -1)
+                cv2.circle(overlay, tuple(pt_px), 10, (255, 255, 255), 2)
                 
-                # Draw direction for approach points
+                # Add waypoint number
+                cv2.putText(overlay, str(i+1), 
+                          (pt_px[0] - 5, pt_px[1] + 5),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Draw direction arrows for approach points
                 if point['type'] in ['approach', 'goal']:
                     angle_rad = math.radians(point['angle'])
-                    end_x = pt_px[0] + int(20 * math.cos(angle_rad))
-                    end_y = pt_px[1] + int(20 * math.sin(angle_rad))
-                    cv2.arrowedLine(overlay, tuple(pt_px), (end_x, end_y), color, 2)
+                    end_x = pt_px[0] + int(25 * math.cos(angle_rad))
+                    end_y = pt_px[1] + int(25 * math.sin(angle_rad))
+                    cv2.arrowedLine(overlay, tuple(pt_px), (end_x, end_y), color, 3)
                 
-                # Add labels
-                if point['type'] == 'collect':
-                    cv2.putText(overlay, point['ball_type'], 
-                              (pt_px[0] + 10, pt_px[1] + 10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                # Add grid coordinates
+                if i < len(grid_path):
+                    gx, gy = grid_path[i]
+                    grid_text = f"({gx},{gy})"
+                    cv2.putText(overlay, grid_text, 
+                              (pt_px[0] + 15, pt_px[1] - 10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            
+            # Draw path statistics
+            total_distance = 0
+            for i in range(len(path) - 1):
+                dx = path[i+1]['pos'][0] - path[i]['pos'][0]
+                dy = path[i+1]['pos'][1] - path[i]['pos'][1]
+                total_distance += math.hypot(dx, dy)
+            
+            # Path info overlay
+            info_y = 30
+            cv2.putText(overlay, f"Path: {len(path)} waypoints", 
+                      (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(overlay, f"Distance: {total_distance:.1f}cm", 
+                      (10, info_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(overlay, f"Balls: {len(ball_cells)}", 
+                      (10, info_y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(overlay, f"Grid points: {len(grid_path)}", 
+                      (10, info_y + 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             # Blend overlay with original frame
-            alpha = 0.7
+            alpha = 0.8
             frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
             
             # Draw robot position and heading
@@ -640,13 +775,14 @@ class BallCollector:
             robot_px = cv2.perspectiveTransform(robot_cm, self.homography_matrix)[0][0].astype(int)
             
             # Robot circle
-            cv2.circle(frame, tuple(robot_px), 8, (255, 0, 0), -1)
+            cv2.circle(frame, tuple(robot_px), 10, (255, 0, 0), -1)
+            cv2.circle(frame, tuple(robot_px), 12, (255, 255, 255), 2)
             
             # Robot heading
             angle_rad = math.radians(self.robot_heading)
-            end_x = robot_px[0] + int(25 * math.cos(angle_rad))
-            end_y = robot_px[1] + int(25 * math.sin(angle_rad))
-            cv2.arrowedLine(frame, tuple(robot_px), (end_x, end_y), (255, 0, 0), 2)
+            end_x = robot_px[0] + int(30 * math.cos(angle_rad))
+            end_y = robot_px[1] + int(30 * math.sin(angle_rad))
+            cv2.arrowedLine(frame, tuple(robot_px), (end_x, end_y), (255, 0, 0), 3)
         
         return frame
 
@@ -710,328 +846,241 @@ class BallCollector:
             logger.error("Failed to deliver balls: {}".format(e))
             return False
 
-    def calculate_goal_approach_path(self, current_pos, current_heading):
-        """Calculate a smooth path to the selected goal using the new goal system"""
-        # Get goal candidates for selected goal
-        goal_candidates = self.goal_ranges.get(self.selected_goal, [])
-        if not goal_candidates:
-            logger.warning("No goal candidates for %s", self.selected_goal)
-            return []
+    def convert_path_to_grid(self, path):
+        """Convert continuous path to grid coordinates for client_automated.py"""
+        if not path:
+            return [], []
         
-        # Calculate target point with offset from goal edge
-        y_vals = [y for (x, y) in goal_candidates]
-        goal_y = sum(y_vals) / len(y_vals)  # Middle Y of goal
+        grid_path = []
+        ball_cells = []
         
-        # Determine goal side and calculate X with offset
-        goal_x_edge = goal_candidates[0][0]  # X coordinate of goal (0 or FIELD_WIDTH_CM)
+        # Convert each waypoint to grid coordinates
+        for point in path:
+            x_cm, y_cm = point['pos']
+            # Convert cm to grid coordinates (2cm spacing)
+            gx = int(round(x_cm / 2))
+            gy = int(round(y_cm / 2))
+            
+            grid_path.append([gx, gy])
+            
+            # Mark ball collection points
+            if point['type'] == 'collect':
+                ball_cells.append([gx, gy])
         
-        if goal_x_edge == 0:  # Left side goal
-            goal_x = GOAL_OFFSET_CM  # Stop before left edge
-        else:  # Right side goal
-            goal_x = FIELD_WIDTH_CM - GOAL_OFFSET_CM  # Stop before right edge
-        
-        # Calculate direct distance and angle to goal
-        dx = goal_x - current_pos[0]
-        dy = goal_y - current_pos[1]
-        direct_distance = math.hypot(dx, dy)
-        angle_to_goal = math.degrees(math.atan2(dy, dx))
-        
-        # If we're already well-aligned with the goal (within 15 degrees), just go straight
-        angle_diff = (angle_to_goal - current_heading + 180) % 360 - 180
-        if abs(angle_diff) < 15 and not check_wall_collision(current_pos, (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
-            return [{
-                'type': 'goal',
-                'pos': (goal_x, goal_y),
-                'angle': 0  # Face straight ahead at goal
-            }]
-        
-        # Otherwise, calculate a curved approach path
-        # First point: swing out to create better approach angle
-        swing_distance = min(50, direct_distance * 0.4)  # Don't swing out too far
-        
-        # If we're to the left of the goal, swing right, and vice versa
-        swing_direction = 1 if current_pos[1] < goal_y else -1
-        swing_angle = current_heading + (45 * swing_direction)  # 45-degree swing
-        
-        # Calculate swing point
-        swing_x = current_pos[0] + swing_distance * math.cos(math.radians(swing_angle))
-        swing_y = current_pos[1] + swing_distance * math.sin(math.radians(swing_angle))
-        
-        # Second point: intermediate approach point
-        if goal_x_edge == 0:  # Left side goal
-            approach_x = goal_x + (GOAL_OFFSET_CM * 1.5)  # Further from left edge
-        else:  # Right side goal  
-            approach_x = goal_x - (GOAL_OFFSET_CM * 1.5)  # Further from right edge
-        approach_y = goal_y  # Aligned with goal
-        
-        # Check if points are reachable
-        path = []
-        if not check_wall_collision(current_pos, (swing_x, swing_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'approach',
-                'pos': (swing_x, swing_y),
-                'angle': swing_angle
-            })
-        
-        if not check_wall_collision((swing_x, swing_y), (approach_x, approach_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'approach',
-                'pos': (approach_x, approach_y),
-                'angle': angle_to_goal  # Face toward goal
-            })
-        
-        if not check_wall_collision((approach_x, approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'goal',
-                'pos': (goal_x, goal_y),
-                'angle': 0
-            })
-        
-        return path
+        return grid_path, ball_cells
 
-    def collect_balls(self):
-        """Main ball collection loop"""
-        cv2.namedWindow("Path Planning")
-        last_plan_time = 0
-        last_plan_positions = []
+    def execute_autonomous_collection(self, initial_path=None):
+        """Execute true live-tracking autonomous ball collection - continuously replans based on current conditions"""
+        logger.info("🤖 Starting TRUE live-tracking autonomous collection...")
         
-        while True:
-            try:
-                # Capture frame for visualization
+        collected_balls = 0
+        max_balls_per_session = 10  # Prevent infinite loops
+        
+        try:
+            while collected_balls < max_balls_per_session:
+                # Get fresh frame and update robot position
                 ret, frame = self.cap.read()
                 if not ret:
+                    logger.warning("Failed to get camera frame")
+                    time.sleep(0.1)
                     continue
-
+                
                 # Update robot position from visual markers
-                if not self.update_robot_position(frame):
-                    logger.warning("Could not detect robot markers")
-                    cv2.putText(frame, "Robot markers not detected!", 
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (0, 0, 255), 2)
-
-                # Draw walls and safety margins
-                frame = self.draw_walls(frame)
-
-                # Draw robot markers
-                frame = self.draw_robot_markers(frame)
-
-                # Add status overlay
-                frame = self.draw_status(frame)
-
-                # Detect balls
+                max_retries = 5
+                retry_count = 0
+                
+                while retry_count < max_retries:
+                    if self.update_robot_position(frame):
+                        break
+                    logger.warning(f"Lost robot tracking, retry {retry_count+1}/{max_retries}")
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        break
+                    retry_count += 1
+                    time.sleep(0.2)
+                
+                if retry_count >= max_retries:
+                    logger.error("❌ Lost robot tracking - aborting autonomous collection")
+                    return False
+                
+                # Detect balls in real-time
                 balls = self.detect_balls(frame)
-                current_time = time.time()
                 
-                # Draw detected balls on frame
+                if not balls:
+                    logger.info("✅ No more balls detected - autonomous collection complete!")
+                    
+                    # Show completion status
+                    frame = self.draw_walls(frame)
+                    frame = self.draw_robot_markers(frame)
+                    frame = self.draw_status(frame)
+                    cv2.putText(frame, f"🎉 Collection Complete! Collected {collected_balls} balls", 
+                              (10, frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 
+                              0.7, (0, 255, 0), 2)
+                    cv2.putText(frame, "No more balls detected", 
+                              (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                              0.7, (255, 255, 255), 2)
+                    cv2.imshow("Live Autonomous Collection", frame)
+                    cv2.waitKey(3000)  # Show completion for 3 seconds
+                    return True
+                
+                # Find closest reachable ball
+                closest_ball = None
+                min_distance = float('inf')
+                
+                for ball in balls:
+                    ball_pos = (ball[0], ball[1])
+                    distance = math.hypot(ball_pos[0] - self.robot_pos[0], ball_pos[1] - self.robot_pos[1])
+                    
+                    # Check if ball is reachable (not blocked by walls)
+                    if not check_wall_collision(self.robot_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
+                        if distance < min_distance:
+                            min_distance = distance
+                            closest_ball = ball
+                
+                if not closest_ball:
+                    logger.warning("All remaining balls are blocked by walls - ending collection")
+                    return True
+                
+                ball_pos = (closest_ball[0], closest_ball[1])
+                logger.info(f"🎯 Target: {closest_ball[2]} ball at ({ball_pos[0]:.1f}, {ball_pos[1]:.1f}), distance: {min_distance:.1f}cm")
+                
+                # Calculate approach vector
+                approach_pos, target_angle = self.get_approach_vector(ball_pos)
+                
+                # Check if approach position is reachable
+                if check_wall_collision(self.robot_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
+                    logger.warning("Approach to ball blocked by wall, skipping...")
+                    continue
+                
+                # Create immediate path to this ball
+                immediate_path = [
+                    {
+                        'type': 'approach',
+                        'pos': approach_pos,
+                        'angle': target_angle
+                    },
+                    {
+                        'type': 'collect',
+                        'pos': ball_pos,
+                        'ball_type': closest_ball[2]
+                    }
+                ]
+                
+                # Add goal delivery path
+                goal_path = self.calculate_goal_approach_path(ball_pos, target_angle)
+                immediate_path.extend(goal_path)
+                
+                # Show current plan with live visualization
+                frame = self.draw_walls(frame)
+                frame = self.draw_robot_markers(frame)
                 frame = self.draw_detected_balls(frame, balls)
+                frame = self.draw_path(frame, immediate_path)
+                frame = self.draw_status(frame)
                 
-                # Only replan if:
-                # 1. We have balls AND robot markers are detected AND
-                # 2. Either:
-                #    a) It's been at least 3 seconds since last plan OR
-                #    b) Ball positions have changed significantly OR
-                #    c) Robot has moved significantly
-                should_replan = False
-                if balls and self.robot_pos:
-                    if current_time - last_plan_time >= 3:  # Minimum 3 seconds between plans
-                        should_replan = True
-                    elif last_plan_positions:
-                        # Check if any ball has moved more than 10cm
-                        for ball in balls:
-                            if not any(math.hypot(ball[0] - old[0], ball[1] - old[1]) < 10 
-                                     for old in last_plan_positions):
-                                should_replan = True
-                                break
-                    else:
-                        should_replan = True
-
-                if should_replan:
-                    last_plan_time = current_time
-                    last_plan_positions = [(b[0], b[1]) for b in balls]
-                    logger.info(f"Planning to collect {len(balls)} balls from position {self.robot_pos}")
-
-                    # Sort balls by distance from current robot position
-                    balls.sort(key=lambda b: math.hypot(
-                        b[0] - self.robot_pos[0],
-                        b[1] - self.robot_pos[1]
-                    ))
-
-                    # Take up to MAX_BALLS_PER_TRIP closest balls
-                    current_batch = balls[:MAX_BALLS_PER_TRIP]
-
-                    # Plan path through all balls in the batch
-                    path = []
+                cv2.putText(frame, f"🔄 LIVE AUTONOMOUS - Ball {collected_balls+1}", 
+                          (10, frame.shape[0] - 90), cv2.FONT_HERSHEY_SIMPLEX, 
+                          0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Target: {closest_ball[2]} ball at ({ball_pos[0]:.1f}, {ball_pos[1]:.1f})", 
+                          (10, frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 
+                          0.7, (0, 255, 0), 2)
+                cv2.putText(frame, "Executing live-planned path...", 
+                          (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                          0.7, (255, 255, 255), 2)
+                
+                cv2.imshow("Live Autonomous Collection", frame)
+                cv2.waitKey(1000)  # Show plan for 1 second
+                
+                # Execute each step with live position updates
+                for i, target_point in enumerate(immediate_path):
+                    logger.info(f"Executing step {i+1}/{len(immediate_path)}: {target_point['type']}")
+                    
+                    # Update robot position before each movement
+                    for retry in range(3):
+                        ret, frame = self.cap.read()
+                        if ret and self.update_robot_position(frame):
+                            break
+                        time.sleep(0.1)
+                    
+                    # Calculate movement needed from current live position
+                    target_pos = target_point['pos']
                     current_pos = self.robot_pos
-                    current_heading = self.robot_heading
-                    remaining_balls = current_batch.copy()
-
-                    # Add balls to path in nearest-neighbor order
-                    while remaining_balls:
-                        closest_ball = min(remaining_balls, 
-                                         key=lambda b: math.hypot(
-                                             b[0] - current_pos[0],
-                                             b[1] - current_pos[1]
-                                         ))
-                        
-                        ball_pos = (closest_ball[0], closest_ball[1])
-                        approach_pos, target_angle = self.get_approach_vector(ball_pos)
-                        
-                        # Check for wall collisions
-                        if check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
-                            logger.warning(f"Path to ball at {ball_pos} blocked by wall, skipping")
-                            remaining_balls.remove(closest_ball)
-                            continue
-                        
-                        if check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
-                            logger.warning(f"Approach to ball at {ball_pos} blocked by wall, skipping")
-                            remaining_balls.remove(closest_ball)
-                            continue
-                        
-                        path.append({
-                            'type': 'approach',
-                            'pos': approach_pos,
-                            'angle': target_angle
-                        })
-                        path.append({
-                            'type': 'collect',
-                            'pos': ball_pos,
-                            'ball_type': closest_ball[2]
-                        })
-                        
-                        current_pos = ball_pos
-                        current_heading = target_angle
-                        remaining_balls.remove(closest_ball)
-
-                    # Add goal approach path if we have collected any balls
-                    if path:
-                        goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
-                        path.extend(goal_path)
-
-                    # Draw path on frame
-                    frame_with_path = self.draw_path(frame, path)
                     
-                    # Add key command help
-                    help_text = [
-                        "Commands:",
-                        "SPACE - Show preview",
-                        "ENTER - Execute path", 
-                        "1 - Select Goal A (small)",
-                        "2 - Select Goal B (large)",
-                        "3 - Toggle goal sides",
-                        "Q - Quit"
-                    ]
-                    y = 150
-                    for text in help_text:
-                        cv2.putText(frame_with_path, text,
-                                  (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                                  0.5, (255, 255, 255), 1)
-                        y += 20
+                    dx = target_pos[0] - current_pos[0]
+                    dy = target_pos[1] - current_pos[1]
+                    distance = math.hypot(dx, dy)
                     
-                    # Store path for later execution
-                    self.current_path = path
-                    cv2.imshow("Path Planning", frame_with_path)
+                    # Skip if we're already very close
+                    if distance < 2:
+                        logger.info(f"Already at target position (distance: {distance:.1f}cm)")
+                        continue
+                    
+                    # Calculate turn needed
+                    target_angle = math.degrees(math.atan2(dy, dx))
+                    angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                    
+                    # Turn to face target if significant difference
+                    if abs(angle_diff) > 5:
+                        logger.info(f"Turning {angle_diff:.1f} degrees to face target")
+                        if not self.turn(angle_diff):
+                            logger.error("❌ Turn command failed")
+                            return False
+                        
+                        # Update heading after turn
+                        self.robot_heading = target_angle
+                    
+                    # Execute movement based on waypoint type
+                    if target_point['type'] == 'collect':
+                        logger.info(f"🏐 Collecting {target_point['ball_type']} ball")
+                        if not self.collect(COLLECTION_DISTANCE_CM):
+                            logger.error("❌ Ball collection failed")
+                            return False
+                        collected_balls += 1
+                        logger.info(f"✅ Ball collected! Total: {collected_balls}")
+                        
+                    elif target_point['type'] == 'goal':
+                        logger.info(f"🎯 Moving {distance:.1f}cm to goal")
+                        if not self.move(distance):
+                            logger.error("❌ Goal movement failed")
+                            return False
+                        
+                        # Deliver balls at goal
+                        logger.info("🎁 Delivering balls...")
+                        if not self.deliver_balls():
+                            logger.error("❌ Ball delivery failed")
+                            return False
+                        logger.info(f"✅ Delivered {collected_balls} balls to goal!")
+                        
+                    else:  # 'approach' waypoint
+                        logger.info(f"➡️ Moving {distance:.1f}cm to approach position")
+                        if not self.move(distance):
+                            logger.error("❌ Approach movement failed")
+                            return False
+                    
+                    # Update visualization after each step
+                    ret, frame = self.cap.read()
+                    if ret:
+                        self.update_robot_position(frame)
+                        frame = self.draw_status(frame)
+                        frame = self.draw_robot_markers(frame)
+                        frame = self.draw_walls(frame)
+                        
+                        cv2.putText(frame, f"Step {i+1}/{len(immediate_path)} completed - Ball {collected_balls}", 
+                                  (10, frame.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, 
+                                  0.7, (0, 255, 0), 2)
+                        cv2.imshow("Live Autonomous Collection", frame)
+                        cv2.waitKey(500)  # Brief pause to show progress
                 
-                # Show frame even when not replanning
-                cv2.imshow("Path Planning", frame)
-                
-                # Handle key commands
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('1'):
-                    # Select Goal A (small goal)
-                    self.selected_goal = 'A'
-                    logger.info("✅ Selected Goal A (small goal)")
-                elif key == ord('2'):
-                    # Select Goal B (large goal)
-                    self.selected_goal = 'B'
-                    logger.info("✅ Selected Goal B (large goal)")
-                elif key == ord('3'):
-                    # Toggle small goal side between left and right
-                    self.small_goal_side = "right" if self.small_goal_side == "left" else "left"
-                    self.goal_ranges = self._build_goal_ranges()
-                    self.setup_walls()  # Rebuild walls to exclude new goal positions
-                    logger.info(f"🔄 Toggled small goal side to {self.small_goal_side}")
-                elif key == ord(' ') and hasattr(self, 'current_path'):
-                    # Show preview
-                    preview_frame = frame.copy()
-                    preview_frame = self.draw_path(preview_frame, self.current_path)
-                    cv2.putText(preview_frame, "PREVIEW MODE - Press ENTER to execute", 
-                              (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    cv2.imshow("Path Planning", preview_frame)
-                    cv2.waitKey(1000)  # Show preview for 1 second
-                elif key == 13 and hasattr(self, 'current_path'):  # Enter key
-                    # Execute the planned path
-                    path = self.current_path
-                    logger.info("Executing path with {} points".format(len(path)))
-                    
-                    try:
-                        for point in path:
-                            # Wait for visual marker detection
-                            retries = 0
-                            while not self.update_robot_position(frame) and retries < 10:
-                                ret, frame = self.cap.read()
-                                retries += 1
-                                time.sleep(0.1)
-                            
-                            if retries >= 10:
-                                raise Exception("Lost robot marker tracking")
-
-                            # Calculate turn angle from current heading
-                            target_pos = point['pos']
-                            dx = target_pos[0] - self.robot_pos[0]
-                            dy = target_pos[1] - self.robot_pos[1]
-                            target_angle = math.degrees(math.atan2(dy, dx))
-                            
-                            # Turn to face target
-                            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                            if abs(angle_diff) > 5:
-                                logger.info(f"Turning {angle_diff:.1f} degrees")
-                                if not self.turn(angle_diff):
-                                    raise Exception("Turn command failed")
-                            
-                            # Move to target position
-                            distance = math.hypot(dx, dy)
-                            
-                            if point['type'] == 'collect':
-                                logger.info(f"Collecting {point['ball_type']} ball")
-                                if not self.collect(COLLECTION_DISTANCE_CM):
-                                    raise Exception("Collect command failed")
-                            elif point['type'] == 'goal':
-                                logger.info(f"Moving {distance:.1f} cm to goal")
-                                if not self.move(distance):
-                                    raise Exception("Move command failed")
-                                # After reaching goal position, deliver balls
-                                if not self.deliver_balls():
-                                    raise Exception("Ball delivery failed")
-                            else:  # approach point
-                                logger.info(f"Moving {distance:.1f} cm")
-                                if not self.move(distance):
-                                    raise Exception("Move command failed")
-                            
-                            # Update visualization
-                            ret, frame = self.cap.read()
-                            if ret:
-                                self.update_robot_position(frame)
-                                frame = self.draw_status(frame)
-                                frame = self.draw_robot_markers(frame)
-                                frame_with_path = self.draw_path(frame, path)
-                                cv2.imshow("Path Planning", frame_with_path)
-                                cv2.waitKey(1)
-                        
-                        # Pause briefly after completing the path
-                        cv2.waitKey(1000)
-                        
-                    except Exception as e:
-                        logger.error("Path execution failed: {}".format(e))
-                        self.stop()
-                        cv2.waitKey(2000)
-                    
-            except Exception as e:
-                logger.error(f"Main loop error: {e}")
-                cv2.waitKey(1000)
-
-        cv2.destroyWindow("Path Planning")
+                # After completing this ball's collection, immediately scan for next ball
+                logger.info(f"🔄 Ball {collected_balls} complete! Scanning for next target...")
+                time.sleep(0.5)  # Brief pause before next scan
+            
+            logger.info(f"✅ Autonomous collection session complete! Collected {collected_balls} balls")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Live autonomous collection failed: {e}")
+            self.stop()  # Emergency stop
+            return False
 
     def run(self):
         """Main run loop"""
@@ -1046,7 +1095,7 @@ class BallCollector:
             
             # Start continuous collection
             logger.info("Starting ball collection...")
-            self.collect_balls()
+            self.execute_autonomous_collection()
             
         except KeyboardInterrupt:
             logger.info("Stopping...")
