@@ -33,10 +33,10 @@ display = Display()                 # EV3 display
 power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
-NORMAL_SPEED_RPM = -40
-SLOW_SPEED_RPM = -25
-TURN_SPEED_RPM = -50  # Even slower turns for more precision
-COLLECTOR_SPEED = 50  # Percentage
+NORMAL_SPEED_RPM = -40  # Negative for forward movement
+SLOW_SPEED_RPM = -25   # Negative for forward movement
+TURN_SPEED_RPM = -50   # Even slower turns for more precision
+COLLECTOR_SPEED = 50   # Percentage
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
@@ -77,7 +77,10 @@ def safe_motor_control(func):
 @safe_motor_control
 def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
-    mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
+    # For forward (positive distance), use negative speed
+    # For backward (negative distance), use positive speed
+    speed = NORMAL_SPEED_RPM if distance_cm > 0 else abs(NORMAL_SPEED_RPM)
+    mdiff.on_for_distance(SpeedRPM(speed), abs(distance_cm) * 11.1)  # adjusted cm to mm conversion
     return True
 
 @safe_motor_control
@@ -130,8 +133,8 @@ def execute_collect(distance_cm):
             collector.on(speed)
             time.sleep(0.05)
         
-        # Move forward slowly
-        mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
+        # Move forward slowly (always forward for collection)
+        mdiff.on_for_distance(SpeedRPM(-SLOW_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
         
         # Gradually stop collector
         for speed in range(COLLECTOR_SPEED, -1, -5):
