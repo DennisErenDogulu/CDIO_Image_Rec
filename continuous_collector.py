@@ -874,6 +874,8 @@ class BallCollector:
 
     def calibrate_colors(self):
         """Interactive HSV color calibration for green and pink markers"""
+        global GREEN_LOWER, GREEN_UPPER, PINK_LOWER, PINK_UPPER
+        
         cv2.namedWindow("Color Calibration")
         cv2.namedWindow("Trackbars")
 
@@ -973,7 +975,6 @@ class BallCollector:
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 # Save the calibrated values
-                global GREEN_LOWER, GREEN_UPPER, PINK_LOWER, PINK_UPPER
                 GREEN_LOWER = green_lower
                 GREEN_UPPER = green_upper
                 PINK_LOWER = pink_lower
