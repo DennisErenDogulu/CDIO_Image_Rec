@@ -18,6 +18,9 @@ import numpy as np
 from typing import List, Tuple, Optional
 from roboflow import Roboflow
 import time
+import threading
+from queue import Queue, Empty
+from dataclasses import dataclass
 
 # Configuration
 EV3_IP = "172.20.10.6"
@@ -70,98 +73,149 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def point_to_line_distance(point, line_start, line_end):
-    """Calculate the shortest distance from a point to a line segment"""
-    x, y = point
-    x1, y1 = line_start
-    x2, y2 = line_end
-    
-    # Vector from line start to end
-    line_vec = (x2 - x1, y2 - y1)
-    # Vector from line start to point
-    point_vec = (x - x1, y - y1)
-    # Length of line
-    line_len = math.hypot(line_vec[0], line_vec[1])
-    
-    if line_len == 0:
-        return math.hypot(point_vec[0], point_vec[1])
-    
-    # Project point vector onto line vector to get distance along line
-    t = max(0, min(1, (point_vec[0] * line_vec[0] + point_vec[1] * line_vec[1]) / (line_len * line_len)))
-    
-    # Calculate projection point
-    proj_x = x1 + t * line_vec[0]
-    proj_y = y1 + t * line_vec[1]
-    
-    return math.hypot(x - proj_x, y - proj_y)
+@dataclass
+class FrameData:
+    frame: np.ndarray
+    timestamp: float
+    robot_pos: Optional[Tuple[float, float]] = None
+    robot_heading: Optional[float] = None
 
-def check_wall_collision(start_pos, end_pos, walls, safety_margin):
-    """Check if a path between two points collides with any walls"""
-    for wall_start_x, wall_start_y, wall_end_x, wall_end_y in walls:
-        # Check if either endpoint is too close to the wall
-        if (point_to_line_distance(start_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin or
-            point_to_line_distance(end_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin):
-            return True
-            
-        # Check if path intersects with wall
-        # Using line segment intersection formula
-        x1, y1 = start_pos
-        x2, y2 = end_pos
-        x3, y3 = wall_start_x, wall_start_y
-        x4, y4 = wall_end_x, wall_end_y
+class CameraThread(threading.Thread):
+    def __init__(self, camera_index=1):
+        super().__init__()
+        self.daemon = True
+        self.frame_queue = Queue(maxsize=1)  # Only keep latest frame
+        self.stop_flag = threading.Event()
+        self.camera_index = camera_index
+
+    def run(self):
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            raise RuntimeError("Could not open camera")
         
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if denom == 0:  # Lines are parallel
-            continue
-            
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-        
-        if 0 <= t <= 1 and 0 <= u <= 1:
-            return True
-            
-    return False
+        # Set camera properties for better performance
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        try:
+            while not self.stop_flag.is_set():
+                ret, frame = cap.read()
+                if ret:
+                    # Clear queue and put new frame
+                    while self.frame_queue.qsize() > 0:
+                        try:
+                            self.frame_queue.get_nowait()
+                        except Empty:
+                            break
+                    
+                    frame_data = FrameData(
+                        frame=frame,
+                        timestamp=time.time()
+                    )
+                    self.frame_queue.put(frame_data)
+                time.sleep(0.01)  # Small sleep to prevent busy waiting
+        finally:
+            cap.release()
+
+    def get_frame(self) -> Optional[FrameData]:
+        try:
+            return self.frame_queue.get_nowait()
+        except Empty:
+            return None
+
+    def stop(self):
+        self.stop_flag.set()
+
+class ProcessingThread(threading.Thread):
+    def __init__(self, ball_collector):
+        super().__init__()
+        self.daemon = True
+        self.ball_collector = ball_collector
+        self.processed_frame_queue = Queue(maxsize=1)
+        self.stop_flag = threading.Event()
+
+    def run(self):
+        while not self.stop_flag.is_set():
+            frame_data = self.ball_collector.camera_thread.get_frame()
+            if frame_data is not None:
+                # Update robot position
+                if self.ball_collector.homography_matrix is not None:
+                    green_center, _, pink_endpoints = self.ball_collector.detect_markers(frame_data.frame)
+                    if green_center and pink_endpoints:
+                        # Convert green center to cm coordinates
+                        green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
+                        green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.ball_collector.homography_matrix))[0][0]
+                        
+                        # Find front point
+                        front_point = max(pink_endpoints, 
+                                        key=lambda p: math.hypot(p[0] - green_center[0],
+                                                               p[1] - green_center[1]))
+                        
+                        # Convert front point to cm coordinates
+                        front_px = np.array([[[float(front_point[0]), float(front_point[1])]]], dtype="float32")
+                        front_cm = cv2.perspectiveTransform(front_px, np.linalg.inv(self.ball_collector.homography_matrix))[0][0]
+                        
+                        # Calculate heading
+                        dx = front_cm[0] - green_cm[0]
+                        dy = front_cm[1] - green_cm[1]
+                        heading = math.degrees(math.atan2(dy, dx))
+                        
+                        # Update frame data with position info
+                        frame_data.robot_pos = (float(green_cm[0]), float(green_cm[1]))
+                        frame_data.robot_heading = heading
+                
+                # Put processed frame in queue
+                while self.processed_frame_queue.qsize() > 0:
+                    try:
+                        self.processed_frame_queue.get_nowait()
+                    except Empty:
+                        break
+                self.processed_frame_queue.put(frame_data)
+            time.sleep(0.01)
+
+    def get_processed_frame(self) -> Optional[FrameData]:
+        try:
+            return self.processed_frame_queue.get_nowait()
+        except Empty:
+            return None
+
+    def stop(self):
+        self.stop_flag.set()
 
 class BallCollector:
     def __init__(self):
+        # Initialize camera thread
+        self.camera_thread = CameraThread()
+        self.camera_thread.start()
+        
+        # Initialize processing thread
+        self.processing_thread = ProcessingThread(self)
+        self.processing_thread.start()
+        
         # Initialize Roboflow
         self.rf = Roboflow(api_key=ROBOFLOW_API_KEY)
         self.project = self.rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
         self.model = self.project.version(RF_VERSION).model
         
-        # Initialize camera with more efficient settings
-        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            raise RuntimeError("Could not open camera")
-        
-        # Set camera properties for better performance
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Reduced from 1280
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480) # Reduced from 720
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce latency
-        
-        # Add frame timing tracking
-        self.last_frame_time = time.time()
-        self.frame_count = 0
-        self.fps = 0
-        
         # Robot state
-        self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)  # Starting position
-        self.robot_heading = ROBOT_START_HEADING  # Starting heading
+        self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)
+        self.robot_heading = ROBOT_START_HEADING
         
         # Calibration points for homography
         self.calibration_points = []
         self.homography_matrix = None
         
         # Wall configuration
-        self.walls = []  # Will be set after calibration
+        self.walls = []
         
         # Goal dimensions and positions
-        self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal
-        self.goal_approach_distance = 20  # Distance to stop in front of goal
-        self.delivery_time = 10.0  # Seconds to run collector in reverse
-        self.current_goal_width = GOAL_WIDTH_SMALL  # Start with small goal
-        self.is_small_goal = True  # Track which goal is selected
+        self.goal_y_center = FIELD_HEIGHT_CM / 2
+        self.goal_approach_distance = 20
+        self.delivery_time = 10.0
+        self.current_goal_width = GOAL_WIDTH_SMALL
+        self.is_small_goal = True
 
         # Color ranges for marker detection
         self.green_lower = GREEN_LOWER
@@ -226,86 +280,59 @@ class BallCollector:
         
         return green_center, green_rect, pink_endpoints
 
-    def update_robot_position(self, frame):
-        """Update robot position and heading based on visual markers"""
-        current_time = time.time()
-        
-        # Track FPS
-        self.frame_count += 1
-        if current_time - self.last_frame_time >= 1.0:
-            self.fps = self.frame_count
-            self.frame_count = 0
-            self.last_frame_time = current_time
-        
-        # Skip processing if we're running behind (more than 100ms old frame)
-        frame_delay = current_time - self.last_frame_time
-        if frame_delay > 0.1:
-            logger.warning(f"Frame processing falling behind: {frame_delay*1000:.1f}ms delay")
-            return False
-            
-        green_center, green_rect, pink_endpoints = self.detect_markers(frame)
-        
-        if green_center and pink_endpoints and self.homography_matrix is not None:
-            # Convert green center (robot center) to cm coordinates
-            green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
-            green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
-            
-            # Find which pink endpoint is furthest from the center (front point)
-            dist1 = math.hypot(pink_endpoints[0][0] - green_center[0],
-                             pink_endpoints[0][1] - green_center[1])
-            dist2 = math.hypot(pink_endpoints[1][0] - green_center[0],
-                             pink_endpoints[1][1] - green_center[1])
-            
-            front_point = pink_endpoints[0] if dist1 > dist2 else pink_endpoints[1]
-            
-            # Convert front point to cm coordinates
-            front_px = np.array([[[float(front_point[0]), float(front_point[1])]]], dtype="float32")
-            front_cm = cv2.perspectiveTransform(front_px, np.linalg.inv(self.homography_matrix))[0][0]
-            
-            # Update robot position (green marker center)
-            self.robot_pos = (green_cm[0], green_cm[1])
-            
-            # Calculate heading from center to front point
-            dx = front_cm[0] - green_cm[0]
-            dy = front_cm[1] - green_cm[1]
-            self.robot_heading = math.degrees(math.atan2(dy, dx))
-            
-            return True
-        
+    def update_robot_position(self):
+        """Update robot position from latest processed frame"""
+        frame_data = self.processing_thread.get_processed_frame()
+        if frame_data is not None:
+            if frame_data.robot_pos is not None and frame_data.robot_heading is not None:
+                self.robot_pos = frame_data.robot_pos
+                self.robot_heading = frame_data.robot_heading
+                return True
         return False
 
-    def draw_robot_markers(self, frame):
-        """Draw detected robot markers on frame"""
-        green_center, green_rect, pink_endpoints = self.detect_markers(frame)
+    def calibrate(self):
+        """Perform camera calibration by clicking 4 corners"""
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if len(self.calibration_points) < 4:
+                    self.calibration_points.append((x, y))
+                    logger.info(f"Corner {len(self.calibration_points)} set: ({x}, {y})")
+
+                if len(self.calibration_points) == 4:
+                    # Build homography matrix
+                    dst_pts = np.array([
+                        [0, 0],
+                        [FIELD_WIDTH_CM, 0],
+                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM],
+                        [0, FIELD_HEIGHT_CM]
+                    ], dtype="float32")
+                    src_pts = np.array(self.calibration_points, dtype="float32")
+                    self.homography_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
+                    
+                    # Set up walls
+                    self.setup_walls()
+                    logger.info("✅ Calibration and wall setup complete")
+
+        cv2.namedWindow("Calibration")
+        cv2.setMouseCallback("Calibration", mouse_callback)
         
-        if green_center and green_rect:
-            # Draw green base marker center and rectangle
-            cv2.circle(frame, green_center, 5, (0, 255, 0), -1)
-            box = np.int32(cv2.boxPoints(green_rect))  # Changed from int0 to int32
-            cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
+        while len(self.calibration_points) < 4:
+            frame_data = self.camera_thread.get_frame()
+            if frame_data is None:
+                continue
+                
+            frame = frame_data.frame
+            # Draw existing points
+            for i, pt in enumerate(self.calibration_points):
+                cv2.circle(frame, pt, 5, (0, 255, 0), -1)
+                cv2.putText(frame, str(i+1), (pt[0]+10, pt[1]+10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            cv2.imshow("Calibration", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
         
-        if pink_endpoints:
-            # Draw pink direction marker
-            cv2.line(frame, pink_endpoints[0], pink_endpoints[1], (255, 192, 203), 3)
-            # Draw arrow at the front endpoint
-            if green_center:  # Only if we have a green center to reference
-                front_point = max(pink_endpoints, 
-                                key=lambda p: math.hypot(p[0] - green_center[0],
-                                                       p[1] - green_center[1]))
-                cv2.circle(frame, front_point, 5, (255, 192, 203), -1)
-        
-        if green_center and pink_endpoints:
-            # Add robot position and heading text
-            pos_text = f"Pos: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f})"
-            heading_text = f"Heading: {self.robot_heading:.1f}°"
-            cv2.putText(frame, pos_text, 
-                       (green_center[0] - 60, green_center[1] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            cv2.putText(frame, heading_text,
-                       (green_center[0] - 60, green_center[1] - 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        
-        return frame
+        cv2.destroyWindow("Calibration")
 
     def setup_walls(self):
         """Set up wall segments based on calibration points, excluding goal areas"""
@@ -418,55 +445,13 @@ class BallCollector:
         """Stop all motors"""
         return self.send_command("STOP")
 
-    def calibrate(self):
-        """Perform camera calibration by clicking 4 corners"""
-        def mouse_callback(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN:
-                if len(self.calibration_points) < 4:
-                    self.calibration_points.append((x, y))
-                    logger.info(f"Corner {len(self.calibration_points)} set: ({x}, {y})")
-
-                if len(self.calibration_points) == 4:
-                    # Build homography matrix (cm) → (px)
-                    dst_pts = np.array([
-                        [0, 0],
-                        [FIELD_WIDTH_CM, 0],
-                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM],
-                        [0, FIELD_HEIGHT_CM]
-                    ], dtype="float32")
-                    src_pts = np.array(self.calibration_points, dtype="float32")
-                    self.homography_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
-                    
-                    # Set up walls after calibration
-                    self.setup_walls()
-                    logger.info("✅ Calibration and wall setup complete")
-
-        cv2.namedWindow("Calibration")
-        cv2.setMouseCallback("Calibration", mouse_callback)
-        
-        while len(self.calibration_points) < 4:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-                
-            # Draw existing points
-            for i, pt in enumerate(self.calibration_points):
-                cv2.circle(frame, pt, 5, (0, 255, 0), -1)
-                cv2.putText(frame, str(i+1), (pt[0]+10, pt[1]+10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            cv2.imshow("Calibration", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        cv2.destroyWindow("Calibration")
-
     def detect_balls(self) -> List[Tuple[float, float, str]]:
         """Detect balls in current camera view, return list of (x_cm, y_cm, label)"""
-        ret, frame = self.cap.read()
-        if not ret:
+        frame_data = self.processing_thread.get_processed_frame()
+        if frame_data is None:
             return []
 
+        frame = frame_data.frame
         # Resize for Roboflow model
         small = cv2.resize(frame, (416, 416))
         
@@ -690,7 +675,7 @@ class BallCollector:
         
         # If we're already well-aligned with the goal (within 15 degrees), just go straight
         angle_diff = (angle_to_goal - current_heading + 180) % 360 - 180
-        if abs(angle_diff) < 15 and not check_wall_collision(current_pos, (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
+        if abs(angle_diff) < 15 and not self.check_wall_collision(current_pos, (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
             return [{
                 'type': 'goal',
                 'pos': (goal_x, goal_y),
@@ -715,21 +700,21 @@ class BallCollector:
         
         # Check if points are reachable
         path = []
-        if not check_wall_collision(current_pos, (swing_x, swing_y), self.walls, WALL_SAFETY_MARGIN):
+        if not self.check_wall_collision(current_pos, (swing_x, swing_y), self.walls, WALL_SAFETY_MARGIN):
             path.append({
                 'type': 'approach',
                 'pos': (swing_x, swing_y),
                 'angle': swing_angle
             })
         
-        if not check_wall_collision((swing_x, swing_y), (approach_x, approach_y), self.walls, WALL_SAFETY_MARGIN):
+        if not self.check_wall_collision((swing_x, swing_y), (approach_x, approach_y), self.walls, WALL_SAFETY_MARGIN):
             path.append({
                 'type': 'approach',
                 'pos': (approach_x, approach_y),
                 'angle': 0  # Align with goal
             })
         
-        if not check_wall_collision((approach_x, approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
+        if not self.check_wall_collision((approach_x, approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
             path.append({
                 'type': 'goal',
                 'pos': (goal_x, goal_y),
@@ -748,12 +733,13 @@ class BallCollector:
         while True:
             try:
                 # Capture frame for visualization
-                ret, frame = self.cap.read()
-                if not ret:
+                frame_data = self.processing_thread.get_processed_frame()
+                if frame_data is None:
                     continue
 
+                frame = frame_data.frame
                 # Update robot position from visual markers
-                if not self.update_robot_position(frame):
+                if not self.update_robot_position():
                     logger.warning("Could not detect robot markers")
                     cv2.putText(frame, "Robot markers not detected!", 
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
@@ -849,12 +835,12 @@ class BallCollector:
                         approach_pos, target_angle, is_reverse = self.get_approach_vector(ball_pos)
                         
                         # Check for wall collisions
-                        if check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
+                        if self.check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
                             logger.warning(f"Path to ball at {ball_pos} blocked by wall, skipping")
                             remaining_balls.remove(closest_ball)
                             continue
                         
-                        if check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
+                        if self.check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
                             logger.warning(f"Approach to ball at {ball_pos} blocked by wall, skipping")
                             remaining_balls.remove(closest_ball)
                             continue
@@ -1046,9 +1032,10 @@ class BallCollector:
                     time.sleep(0.1)
             
             # Update visualization more frequently
-            ret, frame = self.cap.read()
-            if ret:
-                self.update_robot_position(frame)
+            frame_data = self.processing_thread.get_processed_frame()
+            if frame_data is not None:
+                self.robot_pos = frame_data.robot_pos
+                self.robot_heading = frame_data.robot_heading
                 frame = self.draw_status(frame)
                 frame = self.draw_robot_markers(frame)
                 frame_with_path = self.draw_path(frame, path)
@@ -1058,9 +1045,10 @@ class BallCollector:
     def _update_position_with_retry(self, frame, max_retries=5):
         """Update robot position with multiple retries"""
         for _ in range(max_retries):
-            ret, frame = self.cap.read()
-            if ret and self.update_robot_position(frame):
-                return True
+            frame_data = self.processing_thread.get_processed_frame()
+            if frame_data is not None:
+                if self.update_robot_position():
+                    return True
             time.sleep(0.1)
         return False
 
@@ -1082,8 +1070,10 @@ class BallCollector:
         except KeyboardInterrupt:
             logger.info("Stopping...")
         finally:
-            self.stop()
-            self.cap.release()
+            self.camera_thread.stop()
+            self.processing_thread.stop()
+            self.camera_thread.join()
+            self.processing_thread.join()
             cv2.destroyAllWindows()
 
 if __name__ == "__main__":
