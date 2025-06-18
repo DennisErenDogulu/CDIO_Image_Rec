@@ -27,7 +27,7 @@ EV3_PORT = 12345
 ROBOFLOW_API_KEY = "qJTLU5ku2vpBGQUwjBx2"
 RF_WORKSPACE = "cdio-nczdp"
 RF_PROJECT = "cdio-golfbot2025" 
-RF_VERSION = 13
+RF_VERSION = 12
 
 # Wall configuration
 WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
