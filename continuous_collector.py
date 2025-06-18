@@ -25,7 +25,7 @@ EV3_PORT = 12345
 ROBOFLOW_API_KEY = "qJTLU5ku2vpBGQUwjBx2"
 RF_WORKSPACE = "cdio-nczdp"
 RF_PROJECT = "cdio-golfbot2025" 
-RF_VERSION = 13
+RF_VERSION = 12
 
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
@@ -158,57 +158,64 @@ class BallCollector:
         Detect green base and pink direction markers.
         The green paper is centered on the robot with the pink marker
         extending from center to front.
+        Returns:
+            tuple: (green_center, green_rect, pink_endpoints) or (None, None, None) if detection fails
         """
-        # Convert to HSV color space
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # Detect green base marker
-        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
-        # Clean up the mask
-        kernel = np.ones((5,5), np.uint8)
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
-        
-        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Detect pink direction marker
-        pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
-        # Clean up the mask
-        pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
-        pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
-        
-        pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Find green marker center and orientation
-        green_center = None
-        green_rect = None
-        if green_contours:
-            largest_green = max(green_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_green) > 100:  # Minimum area threshold
-                green_rect = cv2.minAreaRect(largest_green)
-                green_center = (int(green_rect[0][0]), int(green_rect[0][1]))
-        
-        # Find pink marker endpoints
-        pink_endpoints = None
-        if pink_contours:
-            largest_pink = max(pink_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_pink) > 50:  # Minimum area threshold
-                # Get the endpoints of the pink marker
-                pink_points = largest_pink.squeeze()
-                if len(pink_points.shape) >= 2:  # Check if we have valid points
-                    # Find the two points furthest apart to get the direction
-                    max_dist = 0
-                    for i in range(len(pink_points)):
-                        for j in range(i + 1, len(pink_points)):
-                            dist = np.linalg.norm(pink_points[i] - pink_points[j])
-                            if dist > max_dist:
-                                max_dist = dist
-                                pink_endpoints = (
-                                    tuple(pink_points[i]),
-                                    tuple(pink_points[j])
-                                )
-        
-        return green_center, green_rect, pink_endpoints
+        try:
+            # Convert to HSV color space
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            
+            # Detect green base marker
+            green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+            # Clean up the mask
+            kernel = np.ones((5,5), np.uint8)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+            
+            green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Detect pink direction marker
+            pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
+            # Clean up the mask
+            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
+            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
+            
+            pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Find green marker center and orientation
+            green_center = None
+            green_rect = None
+            if len(green_contours) > 0:
+                largest_green = max(green_contours, key=cv2.contourArea)
+                if cv2.contourArea(largest_green) > 100:  # Minimum area threshold
+                    green_rect = cv2.minAreaRect(largest_green)
+                    green_center = (int(green_rect[0][0]), int(green_rect[0][1]))
+            
+            # Find pink marker endpoints
+            pink_endpoints = None
+            if len(pink_contours) > 0:
+                largest_pink = max(pink_contours, key=cv2.contourArea)
+                if cv2.contourArea(largest_pink) > 50:  # Minimum area threshold
+                    # Get the endpoints of the pink marker
+                    pink_points = largest_pink.squeeze()
+                    if len(pink_points.shape) >= 2 and len(pink_points) >= 2:  # Check if we have enough valid points
+                        # Find the two points furthest apart to get the direction
+                        max_dist = 0
+                        for i in range(len(pink_points)):
+                            for j in range(i + 1, len(pink_points)):
+                                dist = np.linalg.norm(pink_points[i] - pink_points[j])
+                                if dist > max_dist:
+                                    max_dist = dist
+                                    pink_endpoints = (
+                                        tuple(map(int, pink_points[i])),
+                                        tuple(map(int, pink_points[j]))
+                                    )
+            
+            return green_center, green_rect, pink_endpoints
+            
+        except Exception as e:
+            logger.error(f"Error in detect_markers: {e}")
+            return None, None, None
 
     def update_robot_position(self, frame):
         """Update robot position and heading based on visual markers"""
@@ -247,14 +254,14 @@ class BallCollector:
         """Draw detected robot markers on frame"""
         green_center, green_rect, pink_endpoints = self.detect_markers(frame)
         
-        if green_center and green_rect:
+        if green_center is not None and green_rect is not None:
             # Draw green base marker center and rectangle
             cv2.circle(frame, green_center, 5, (0, 255, 0), -1)
             box = cv2.boxPoints(green_rect)
-            box = np.int0(box)
+            box = np.int32(box)
             cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
         
-        if pink_endpoints:
+        if pink_endpoints is not None and green_center is not None:
             # Draw pink direction marker
             cv2.line(frame, pink_endpoints[0], pink_endpoints[1], (255, 192, 203), 3)
             # Draw arrow at the front endpoint
@@ -263,8 +270,7 @@ class BallCollector:
                                                    p[1] - green_center[1]))
             cv2.circle(frame, front_point, 5, (255, 192, 203), -1)
         
-        if green_center and pink_endpoints:
-            # Add robot position and heading text
+            # Only add position and heading text if we have both markers
             pos_text = f"Pos: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f})"
             heading_text = f"Heading: {self.robot_heading:.1f}°"
             cv2.putText(frame, pos_text, 
@@ -872,144 +878,10 @@ class BallCollector:
 
         cv2.destroyWindow("Path Planning")
 
-    def calibrate_colors(self):
-        """Interactive HSV color calibration for green and pink markers"""
-        cv2.namedWindow("Color Calibration")
-        cv2.namedWindow("Trackbars")
-
-        # Create trackbars for both colors
-        def nothing(x):
-            pass
-
-        # Green trackbars
-        cv2.createTrackbar("Green H Min", "Trackbars", int(GREEN_LOWER[0]), 179, nothing)
-        cv2.createTrackbar("Green H Max", "Trackbars", int(GREEN_UPPER[0]), 179, nothing)
-        cv2.createTrackbar("Green S Min", "Trackbars", int(GREEN_LOWER[1]), 255, nothing)
-        cv2.createTrackbar("Green S Max", "Trackbars", int(GREEN_UPPER[1]), 255, nothing)
-        cv2.createTrackbar("Green V Min", "Trackbars", int(GREEN_LOWER[2]), 255, nothing)
-        cv2.createTrackbar("Green V Max", "Trackbars", int(GREEN_UPPER[2]), 255, nothing)
-
-        # Pink trackbars
-        cv2.createTrackbar("Pink H Min", "Trackbars", int(PINK_LOWER[0]), 179, nothing)
-        cv2.createTrackbar("Pink H Max", "Trackbars", int(PINK_UPPER[0]), 179, nothing)
-        cv2.createTrackbar("Pink S Min", "Trackbars", int(PINK_LOWER[1]), 255, nothing)
-        cv2.createTrackbar("Pink S Max", "Trackbars", int(PINK_UPPER[1]), 255, nothing)
-        cv2.createTrackbar("Pink V Min", "Trackbars", int(PINK_LOWER[2]), 255, nothing)
-        cv2.createTrackbar("Pink V Max", "Trackbars", int(PINK_UPPER[2]), 255, nothing)
-
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-
-            # Convert to HSV
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-            # Get current trackbar positions for green
-            green_h_min = cv2.getTrackbarPos("Green H Min", "Trackbars")
-            green_h_max = cv2.getTrackbarPos("Green H Max", "Trackbars")
-            green_s_min = cv2.getTrackbarPos("Green S Min", "Trackbars")
-            green_s_max = cv2.getTrackbarPos("Green S Max", "Trackbars")
-            green_v_min = cv2.getTrackbarPos("Green V Min", "Trackbars")
-            green_v_max = cv2.getTrackbarPos("Green V Max", "Trackbars")
-
-            # Get current trackbar positions for pink
-            pink_h_min = cv2.getTrackbarPos("Pink H Min", "Trackbars")
-            pink_h_max = cv2.getTrackbarPos("Pink H Max", "Trackbars")
-            pink_s_min = cv2.getTrackbarPos("Pink S Min", "Trackbars")
-            pink_s_max = cv2.getTrackbarPos("Pink S Max", "Trackbars")
-            pink_v_min = cv2.getTrackbarPos("Pink V Min", "Trackbars")
-            pink_v_max = cv2.getTrackbarPos("Pink V Max", "Trackbars")
-
-            # Create masks
-            green_lower = np.array([green_h_min, green_s_min, green_v_min])
-            green_upper = np.array([green_h_max, green_s_max, green_v_max])
-            pink_lower = np.array([pink_h_min, pink_s_min, pink_v_min])
-            pink_upper = np.array([pink_h_max, pink_s_max, pink_v_max])
-
-            green_mask = cv2.inRange(hsv, green_lower, green_upper)
-            pink_mask = cv2.inRange(hsv, pink_lower, pink_upper)
-
-            # Clean up masks
-            kernel = np.ones((5,5), np.uint8)
-            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
-            green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
-            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
-            pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
-
-            # Create result images
-            green_result = cv2.bitwise_and(frame, frame, mask=green_mask)
-            pink_result = cv2.bitwise_and(frame, frame, mask=pink_mask)
-            combined_result = cv2.addWeighted(green_result, 1, pink_result, 1, 0)
-
-            # Stack images for display
-            display_frame = np.hstack([frame, combined_result])
-
-            # Add instructions
-            instructions = [
-                "Adjust trackbars until markers are clearly visible",
-                "Green marker should be fully detected",
-                "Pink marker should show clear direction",
-                "Press 'q' to save and exit",
-                "Press 'r' to reset to defaults"
-            ]
-
-            y = 30
-            for text in instructions:
-                cv2.putText(display_frame, text, (10, y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                y += 25
-
-            # Show current values
-            cv2.putText(display_frame, 
-                       f"Green HSV: [{green_h_min},{green_s_min},{green_v_min}] - [{green_h_max},{green_s_max},{green_v_max}]",
-                       (10, y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(display_frame,
-                       f"Pink HSV: [{pink_h_min},{pink_s_min},{pink_v_min}] - [{pink_h_max},{pink_s_max},{pink_v_max}]",
-                       (10, y+50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 192, 203), 2)
-
-            cv2.imshow("Color Calibration", display_frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                # Save the calibrated values
-                global GREEN_LOWER, GREEN_UPPER, PINK_LOWER, PINK_UPPER
-                GREEN_LOWER = green_lower
-                GREEN_UPPER = green_upper
-                PINK_LOWER = pink_lower
-                PINK_UPPER = pink_upper
-                logger.info("Color calibration saved:")
-                logger.info(f"GREEN_LOWER = np.array([{green_h_min}, {green_s_min}, {green_v_min}])")
-                logger.info(f"GREEN_UPPER = np.array([{green_h_max}, {green_s_max}, {green_v_max}])")
-                logger.info(f"PINK_LOWER = np.array([{pink_h_min}, {pink_s_min}, {pink_v_min}])")
-                logger.info(f"PINK_UPPER = np.array([{pink_h_max}, {pink_s_max}, {pink_v_max}])")
-                break
-            elif key == ord('r'):
-                # Reset to defaults
-                cv2.setTrackbarPos("Green H Min", "Trackbars", int(GREEN_LOWER[0]))
-                cv2.setTrackbarPos("Green H Max", "Trackbars", int(GREEN_UPPER[0]))
-                cv2.setTrackbarPos("Green S Min", "Trackbars", int(GREEN_LOWER[1]))
-                cv2.setTrackbarPos("Green S Max", "Trackbars", int(GREEN_UPPER[1]))
-                cv2.setTrackbarPos("Green V Min", "Trackbars", int(GREEN_LOWER[2]))
-                cv2.setTrackbarPos("Green V Max", "Trackbars", int(GREEN_UPPER[2]))
-                cv2.setTrackbarPos("Pink H Min", "Trackbars", int(PINK_LOWER[0]))
-                cv2.setTrackbarPos("Pink H Max", "Trackbars", int(PINK_UPPER[0]))
-                cv2.setTrackbarPos("Pink S Min", "Trackbars", int(PINK_LOWER[1]))
-                cv2.setTrackbarPos("Pink S Max", "Trackbars", int(PINK_UPPER[1]))
-                cv2.setTrackbarPos("Pink V Min", "Trackbars", int(PINK_LOWER[2]))
-                cv2.setTrackbarPos("Pink V Max", "Trackbars", int(PINK_UPPER[2]))
-
-        cv2.destroyWindow("Color Calibration")
-        cv2.destroyWindow("Trackbars")
-
     def run(self):
         """Main run loop"""
         try:
-            # First calibrate colors
-            logger.info("Starting color calibration...")
-            self.calibrate_colors()
-            
-            # Then calibrate camera perspective
+            # Calibrate camera perspective
             logger.info("Starting camera calibration...")
             self.calibrate()
             
