@@ -129,15 +129,21 @@ class BallCollector:
         self.project = self.rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
         self.model = self.project.version(RF_VERSION).model
         
-        # Initialize camera
-        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
+        # Initialize camera with more efficient settings
+        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
         
-        # Set camera properties
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # Set camera properties for better performance
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Reduced from 1280
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480) # Reduced from 720
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce latency
+        
+        # Add frame timing tracking
+        self.last_frame_time = time.time()
+        self.frame_count = 0
+        self.fps = 0
         
         # Robot state
         self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)  # Starting position
@@ -222,6 +228,21 @@ class BallCollector:
 
     def update_robot_position(self, frame):
         """Update robot position and heading based on visual markers"""
+        current_time = time.time()
+        
+        # Track FPS
+        self.frame_count += 1
+        if current_time - self.last_frame_time >= 1.0:
+            self.fps = self.frame_count
+            self.frame_count = 0
+            self.last_frame_time = current_time
+        
+        # Skip processing if we're running behind (more than 100ms old frame)
+        frame_delay = current_time - self.last_frame_time
+        if frame_delay > 0.1:
+            logger.warning(f"Frame processing falling behind: {frame_delay*1000:.1f}ms delay")
+            return False
+            
         green_center, green_rect, pink_endpoints = self.detect_markers(frame)
         
         if green_center and pink_endpoints and self.homography_matrix is not None:
@@ -616,14 +637,18 @@ class BallCollector:
             line_height = 20
             
             # Background rectangle
-            cv2.rectangle(frame, (5, 5), (200, 110), (0, 0, 0), -1)
-            cv2.rectangle(frame, (5, 5), (200, 110), (255, 255, 255), 1)
+            cv2.rectangle(frame, (5, 5), (200, 130), (0, 0, 0), -1)
+            cv2.rectangle(frame, (5, 5), (200, 130), (255, 255, 255), 1)
+            
+            # Add FPS counter
+            cv2.putText(frame, f"FPS: {self.fps}",
+                       (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # Battery status
             battery_pct = status.get("battery_percentage", 0)
             battery_color = (0, 255, 0) if battery_pct > 20 else (0, 0, 255)
             cv2.putText(frame, f"Battery: {battery_pct:.1f}%",
-                       (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, battery_color, 1)
+                       (x, y + line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, battery_color, 1)
             
             # Motor speeds
             left_speed = status.get("left_motor", {}).get("speed", 0)
@@ -631,11 +656,16 @@ class BallCollector:
             collector_speed = status.get("collector_motor", {}).get("speed", 0)
             
             cv2.putText(frame, f"Left Motor: {left_speed}",
-                       (x, y + line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, f"Right Motor: {right_speed}",
                        (x, y + 2*line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, f"Collector: {collector_speed}",
+            cv2.putText(frame, f"Right Motor: {right_speed}",
                        (x, y + 3*line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, f"Collector: {collector_speed}",
+                       (x, y + 4*line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Add frame processing time
+            frame_time = time.time() - self.last_frame_time
+            cv2.putText(frame, f"Frame time: {frame_time*1000:.1f}ms",
+                       (x, y + 5*line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return frame
 
