@@ -154,57 +154,89 @@ class BallCollector:
         self.delivery_time = 2.0  # Seconds to run collector in reverse
 
     def detect_markers(self, frame):
-        """Detect green base and pink direction markers"""
+        """
+        Detect green base and pink direction markers.
+        The green paper is centered on the robot with the pink marker
+        extending from center to front.
+        """
         # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         # Detect green base marker
         green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+        # Clean up the mask
+        kernel = np.ones((5,5), np.uint8)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+        
         green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Detect pink direction marker
         pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
+        # Clean up the mask
+        pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
+        pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
+        
         pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Find largest green contour (base marker)
+        # Find green marker center and orientation
         green_center = None
+        green_rect = None
         if green_contours:
             largest_green = max(green_contours, key=cv2.contourArea)
             if cv2.contourArea(largest_green) > 100:  # Minimum area threshold
-                M = cv2.moments(largest_green)
-                if M["m00"] != 0:
-                    green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                green_rect = cv2.minAreaRect(largest_green)
+                green_center = (int(green_rect[0][0]), int(green_rect[0][1]))
         
-        # Find largest pink contour (direction marker)
-        pink_center = None
+        # Find pink marker endpoints
+        pink_endpoints = None
         if pink_contours:
             largest_pink = max(pink_contours, key=cv2.contourArea)
             if cv2.contourArea(largest_pink) > 50:  # Minimum area threshold
-                M = cv2.moments(largest_pink)
-                if M["m00"] != 0:
-                    pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                # Get the endpoints of the pink marker
+                pink_points = largest_pink.squeeze()
+                if len(pink_points.shape) >= 2:  # Check if we have valid points
+                    # Find the two points furthest apart to get the direction
+                    max_dist = 0
+                    for i in range(len(pink_points)):
+                        for j in range(i + 1, len(pink_points)):
+                            dist = np.linalg.norm(pink_points[i] - pink_points[j])
+                            if dist > max_dist:
+                                max_dist = dist
+                                pink_endpoints = (
+                                    tuple(pink_points[i]),
+                                    tuple(pink_points[j])
+                                )
         
-        return green_center, pink_center
+        return green_center, green_rect, pink_endpoints
 
     def update_robot_position(self, frame):
         """Update robot position and heading based on visual markers"""
-        green_center, pink_center = self.detect_markers(frame)
+        green_center, green_rect, pink_endpoints = self.detect_markers(frame)
         
-        if green_center and pink_center and self.homography_matrix is not None:
-            # Convert green center (robot base) to cm coordinates
+        if green_center and pink_endpoints and self.homography_matrix is not None:
+            # Convert green center (robot center) to cm coordinates
             green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
             green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
             
-            # Convert pink center (direction marker) to cm coordinates
-            pink_px = np.array([[[float(pink_center[0]), float(pink_center[1])]]], dtype="float32")
-            pink_cm = cv2.perspectiveTransform(pink_px, np.linalg.inv(self.homography_matrix))[0][0]
+            # Find which pink endpoint is furthest from the center (front point)
+            dist1 = math.hypot(pink_endpoints[0][0] - green_center[0],
+                             pink_endpoints[0][1] - green_center[1])
+            dist2 = math.hypot(pink_endpoints[1][0] - green_center[0],
+                             pink_endpoints[1][1] - green_center[1])
+            
+            front_point = pink_endpoints[0] if dist1 > dist2 else pink_endpoints[1]
+            
+            # Convert front point to cm coordinates
+            front_px = np.array([[[float(front_point[0]), float(front_point[1])]]], dtype="float32")
+            front_cm = cv2.perspectiveTransform(front_px, np.linalg.inv(self.homography_matrix))[0][0]
             
             # Update robot position (green marker center)
             self.robot_pos = (green_cm[0], green_cm[1])
             
-            # Calculate heading from green to pink marker
-            dx = pink_cm[0] - green_cm[0]
-            dy = pink_cm[1] - green_cm[1]
+            # Calculate heading from center to front point
+            dx = front_cm[0] - green_cm[0]
+            dy = front_cm[1] - green_cm[1]
             self.robot_heading = math.degrees(math.atan2(dy, dx))
             
             return True
@@ -213,21 +245,34 @@ class BallCollector:
 
     def draw_robot_markers(self, frame):
         """Draw detected robot markers on frame"""
-        green_center, pink_center = self.detect_markers(frame)
+        green_center, green_rect, pink_endpoints = self.detect_markers(frame)
         
-        if green_center:
-            # Draw green base marker
-            cv2.circle(frame, green_center, 10, (0, 255, 0), -1)
-            cv2.circle(frame, green_center, 12, (255, 255, 255), 2)
+        if green_center and green_rect:
+            # Draw green base marker center and rectangle
+            cv2.circle(frame, green_center, 5, (0, 255, 0), -1)
+            box = cv2.boxPoints(green_rect)
+            box = np.int0(box)
+            cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
         
-        if pink_center:
+        if pink_endpoints:
             # Draw pink direction marker
-            cv2.circle(frame, pink_center, 8, (255, 192, 203), -1)
-            cv2.circle(frame, pink_center, 10, (255, 255, 255), 2)
+            cv2.line(frame, pink_endpoints[0], pink_endpoints[1], (255, 192, 203), 3)
+            # Draw arrow at the front endpoint
+            front_point = max(pink_endpoints, 
+                            key=lambda p: math.hypot(p[0] - green_center[0],
+                                                   p[1] - green_center[1]))
+            cv2.circle(frame, front_point, 5, (255, 192, 203), -1)
         
-        if green_center and pink_center:
-            # Draw line from base to direction marker
-            cv2.line(frame, green_center, pink_center, (255, 255, 255), 2)
+        if green_center and pink_endpoints:
+            # Add robot position and heading text
+            pos_text = f"Pos: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f})"
+            heading_text = f"Heading: {self.robot_heading:.1f}°"
+            cv2.putText(frame, pos_text, 
+                       (green_center[0] - 60, green_center[1] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(frame, heading_text,
+                       (green_center[0] - 60, green_center[1] - 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         
         return frame
 
