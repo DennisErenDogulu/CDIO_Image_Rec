@@ -898,7 +898,7 @@ class BallCollector:
         cv2.destroyWindow("Path Planning")
 
     def _execute_path(self, path, frame):
-        """Execute a planned path"""
+        """Execute a planned path with continuous position updates"""
         for point in path:
             # Initial position update
             if not self._update_position_with_retry(frame):
@@ -915,33 +915,68 @@ class BallCollector:
             if point.get('is_reverse', False):
                 target_angle = (target_angle + 180) % 360
             
-            # Turn to face target with position correction
+            # Turn to face target with continuous position updates
             angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
             if abs(angle_diff) > 5:
                 logger.info(f"Turning {angle_diff:.1f} degrees")
                 if not self.turn(angle_diff):
                     raise Exception("Turn command failed")
                 
-                # Update position after turn
-                if not self._update_position_with_retry(frame):
-                    raise Exception("Lost robot marker tracking during turn")
+                # Multiple position updates after turn
+                for _ in range(3):
+                    if not self._update_position_with_retry(frame):
+                        raise Exception("Lost robot marker tracking during turn")
+                    # Recalculate angle difference after position update
+                    new_angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                    if abs(new_angle_diff) > 5:  # If still off by more than 5 degrees
+                        logger.info(f"Correcting turn by {new_angle_diff:.1f} degrees")
+                        if not self.turn(new_angle_diff):
+                            raise Exception("Turn correction failed")
+                    time.sleep(0.1)  # Small delay between updates
             
-            # Handle different point types
+            # Handle different point types with continuous position monitoring
             if point['type'] == 'collect':
-                # For collection points, move forward and collect
                 logger.info(f"Collecting {point['ball_type']} ball")
+                # Start collection movement
                 if not self.collect(COLLECTION_DISTANCE_CM):
                     raise Exception("Collect command failed")
+                
+                # Monitor position during collection
+                collection_start_time = time.time()
+                while time.time() - collection_start_time < 5:  # Max 5 seconds for collection
+                    if not self._update_position_with_retry(frame):
+                        logger.warning("Position tracking lost during collection")
+                    time.sleep(0.1)
             
             elif point['type'] == 'goal':
-                # For goal points, move to position then deliver
                 logger.info(f"Moving {distance:.1f} cm to goal")
+                # Start movement
                 if not self.move(distance):
                     raise Exception("Move command failed")
                 
-                # Update position after movement
-                if not self._update_position_with_retry(frame):
-                    raise Exception("Lost robot marker tracking after movement")
+                # Monitor position during movement to goal
+                movement_start_time = time.time()
+                last_correction_time = movement_start_time
+                while time.time() - movement_start_time < 10:  # Max 10 seconds for movement
+                    if not self._update_position_with_retry(frame):
+                        logger.warning("Position tracking lost during movement")
+                        continue
+                    
+                    # Check if we need course correction (every 0.5 seconds)
+                    current_time = time.time()
+                    if current_time - last_correction_time >= 0.5:
+                        # Recalculate distance and angle to goal
+                        dx = target_pos[0] - self.robot_pos[0]
+                        dy = target_pos[1] - self.robot_pos[1]
+                        current_distance = math.hypot(dx, dy)
+                        
+                        # If we're close enough to goal, break
+                        if current_distance < 5:  # Within 5cm of goal
+                            break
+                        
+                        last_correction_time = current_time
+                    
+                    time.sleep(0.1)
                 
                 # Deliver balls at goal
                 logger.info("Delivering balls")
@@ -949,17 +984,38 @@ class BallCollector:
                     raise Exception("Ball delivery failed")
             
             else:  # approach points
-                # For approach points, move the specified distance
                 logger.info(f"Moving {distance:.1f} cm {'backwards' if point.get('is_reverse', False) else 'forwards'}")
                 move_distance = -distance if point.get('is_reverse', False) else distance
+                
+                # Start movement
                 if not self.move(move_distance):
                     raise Exception("Move command failed")
                 
-                # Update position after movement
-                if not self._update_position_with_retry(frame):
-                    raise Exception("Lost robot marker tracking after movement")
+                # Monitor position during approach movement
+                movement_start_time = time.time()
+                last_correction_time = movement_start_time
+                while time.time() - movement_start_time < 10:  # Max 10 seconds for movement
+                    if not self._update_position_with_retry(frame):
+                        logger.warning("Position tracking lost during movement")
+                        continue
+                    
+                    # Check if we need course correction (every 0.5 seconds)
+                    current_time = time.time()
+                    if current_time - last_correction_time >= 0.5:
+                        # Recalculate distance to target
+                        dx = target_pos[0] - self.robot_pos[0]
+                        dy = target_pos[1] - self.robot_pos[1]
+                        current_distance = math.hypot(dx, dy)
+                        
+                        # If we're close enough to target, break
+                        if current_distance < 5:  # Within 5cm of target
+                            break
+                        
+                        last_correction_time = current_time
+                    
+                    time.sleep(0.1)
             
-            # Update visualization
+            # Update visualization more frequently
             ret, frame = self.cap.read()
             if ret:
                 self.update_robot_position(frame)
