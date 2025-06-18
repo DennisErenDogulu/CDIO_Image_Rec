@@ -153,6 +153,12 @@ class BallCollector:
         self.goal_approach_distance = 20  # Distance to stop in front of goal
         self.delivery_time = 2.0  # Seconds to run collector in reverse
 
+        # Color ranges for marker detection
+        self.green_lower = GREEN_LOWER
+        self.green_upper = GREEN_UPPER
+        self.pink_lower = PINK_LOWER
+        self.pink_upper = PINK_UPPER
+
     def detect_markers(self, frame):
         """
         Detect green base and pink direction markers.
@@ -163,7 +169,7 @@ class BallCollector:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         # Detect green base marker
-        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+        green_mask = cv2.inRange(hsv, self.green_lower, self.green_upper)
         # Clean up the mask
         kernel = np.ones((5,5), np.uint8)
         green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
@@ -172,7 +178,7 @@ class BallCollector:
         green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Detect pink direction marker
-        pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
+        pink_mask = cv2.inRange(hsv, self.pink_lower, self.pink_upper)
         # Clean up the mask
         pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel)
         pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
@@ -250,18 +256,18 @@ class BallCollector:
         if green_center and green_rect:
             # Draw green base marker center and rectangle
             cv2.circle(frame, green_center, 5, (0, 255, 0), -1)
-            box = cv2.boxPoints(green_rect)
-            box = np.int0(box)
+            box = np.int32(cv2.boxPoints(green_rect))  # Changed from int0 to int32
             cv2.drawContours(frame, [box], 0, (0, 255, 0), 2)
         
         if pink_endpoints:
             # Draw pink direction marker
             cv2.line(frame, pink_endpoints[0], pink_endpoints[1], (255, 192, 203), 3)
             # Draw arrow at the front endpoint
-            front_point = max(pink_endpoints, 
-                            key=lambda p: math.hypot(p[0] - green_center[0],
-                                                   p[1] - green_center[1]))
-            cv2.circle(frame, front_point, 5, (255, 192, 203), -1)
+            if green_center:  # Only if we have a green center to reference
+                front_point = max(pink_endpoints, 
+                                key=lambda p: math.hypot(p[0] - green_center[0],
+                                                       p[1] - green_center[1]))
+                cv2.circle(frame, front_point, 5, (255, 192, 203), -1)
         
         if green_center and pink_endpoints:
             # Add robot position and heading text
