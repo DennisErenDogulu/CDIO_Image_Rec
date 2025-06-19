@@ -1712,8 +1712,8 @@ class BallCollector:
         return grid_path, ball_cells
 
     def execute_autonomous_collection(self, initial_path=None):
-        """Execute true live-tracking autonomous ball collection - continuously replans based on current conditions"""
-        logger.info("🤖 Starting TRUE live-tracking autonomous collection...")
+        """Execute autonomous ball collection with continuous position monitoring"""
+        logger.info("🤖 Starting autonomous collection with continuous monitoring...")
         
         collected_balls = 0
         max_balls_per_session = 10  # Prevent infinite loops
@@ -1728,197 +1728,70 @@ class BallCollector:
                     continue
                 
                 # Update robot position from visual markers
-                max_retries = 5
-                retry_count = 0
-                
-                while retry_count < max_retries:
-                    if self.update_robot_position(frame):
-                        break
-                    logger.warning(f"Lost robot tracking, retry {retry_count+1}/{max_retries}")
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        break
-                    retry_count += 1
-                    time.sleep(0.2)
-                
-                if retry_count >= max_retries:
-                    logger.error("❌ Lost robot tracking - aborting autonomous collection")
-                    return False
-                
-                # Detect balls in real-time
-                balls = self.detect_balls(frame)
-                
-                if not balls:
-                    logger.info("✅ No more balls detected - autonomous collection complete!")
-                    
-                    # Show completion status
-                    frame = self.draw_walls(frame)
-                    frame = self.draw_robot_markers(frame)
-                    frame = self.draw_status(frame)
-                    cv2.putText(frame, f"🎉 Collection Complete! Collected {collected_balls} balls", 
-                              (10, frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (0, 255, 0), 2)
-                    cv2.putText(frame, "No more balls detected", 
-                              (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (255, 255, 255), 2)
-                    cv2.imshow("Live Autonomous Collection", frame)
-                    cv2.waitKey(3000)  # Show completion for 3 seconds
-                    return True
-                
-                # Find closest reachable ball
-                closest_ball = None
-                min_distance = float('inf')
-                
-                for ball in balls:
-                    ball_pos = (ball[0], ball[1])
-                    distance = math.hypot(ball_pos[0] - self.robot_pos[0], ball_pos[1] - self.robot_pos[1])
-                    
-                    # Check if ball is reachable (not blocked by walls)
-                    if not check_wall_collision(self.robot_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
-                        if distance < min_distance:
-                            min_distance = distance
-                            closest_ball = ball
-                
-                if not closest_ball:
-                    logger.warning("All remaining balls are blocked by walls - ending collection")
-                    return True
-                
-                ball_pos = (closest_ball[0], closest_ball[1])
-                logger.info(f"🎯 Target: {closest_ball[2]} ball at ({ball_pos[0]:.1f}, {ball_pos[1]:.1f}), distance: {min_distance:.1f}cm")
-                
-                # Calculate approach vector
-                approach_pos, target_angle = self.get_approach_vector(ball_pos)
-                
-                # Check if approach position is reachable
-                if check_wall_collision(self.robot_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
-                    logger.warning("Approach to ball blocked by wall, skipping...")
+                if not self.update_robot_position(frame):
+                    logger.warning("Cannot determine robot position")
+                    time.sleep(0.1)
                     continue
                 
-                # Create immediate path to this ball
-                immediate_path = [
-                    {
-                        'type': 'approach',
-                        'pos': approach_pos,
-                        'angle': target_angle
-                    },
-                    {
-                        'type': 'collect',
-                        'pos': ball_pos,
-                        'ball_type': closest_ball[2]
-                    }
-                ]
+                # Detect balls
+                balls = self.detect_balls(frame)
+                if not balls:
+                    logger.info("No balls detected")
+                    break
                 
-                # Add goal delivery path
-                goal_path = self.calculate_goal_approach_path(ball_pos, target_angle)
-                immediate_path.extend(goal_path)
+                # Sort balls by distance from robot
+                balls.sort(key=lambda b: math.hypot(b[0] - self.robot_pos[0], b[1] - self.robot_pos[1]))
                 
-                # Show current plan with live visualization
-                frame = self.draw_walls(frame)
-                frame = self.draw_robot_markers(frame)
-                frame = self.draw_detected_balls(frame, balls)
-                frame = self.draw_path(frame, immediate_path)
-                frame = self.draw_status(frame)
-                
-                cv2.putText(frame, f"🔄 LIVE AUTONOMOUS - Ball {collected_balls+1}", 
-                          (10, frame.shape[0] - 90), cv2.FONT_HERSHEY_SIMPLEX, 
-                          0.7, (0, 255, 255), 2)
-                cv2.putText(frame, f"Target: {closest_ball[2]} ball at ({ball_pos[0]:.1f}, {ball_pos[1]:.1f})", 
-                          (10, frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                          0.7, (0, 255, 0), 2)
-                cv2.putText(frame, "Executing live-planned path...", 
-                          (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                          0.7, (255, 255, 255), 2)
-                
-                cv2.imshow("Live Autonomous Collection", frame)
-                cv2.waitKey(1000)  # Show plan for 1 second
-                
-                # Execute each step with live position updates
-                for i, target_point in enumerate(immediate_path):
-                    logger.info(f"Executing step {i+1}/{len(immediate_path)}: {target_point['type']}")
+                # Try to collect each ball
+                for ball_x, ball_y, _ in balls:
+                    logger.info(f"🎯 Targeting ball at ({ball_x:.1f}, {ball_y:.1f})")
                     
-                    # Update robot position before each movement
-                    for retry in range(3):
-                        ret, frame = self.cap.read()
-                        if ret and self.update_robot_position(frame):
-                            break
-                        time.sleep(0.1)
+                    # Calculate approach position (slightly before the ball)
+                    approach_pos, collection_angle = self.get_approach_vector((ball_x, ball_y))
                     
-                    # Calculate movement needed from current live position
-                    target_pos = target_point['pos']
-                    current_pos = self.robot_pos
-                    
-                    dx = target_pos[0] - current_pos[0]
-                    dy = target_pos[1] - current_pos[1]
-                    distance = math.hypot(dx, dy)
-                    
-                    # Skip if we're already very close
-                    if distance < 2:
-                        logger.info(f"Already at target position (distance: {distance:.1f}cm)")
+                    # Move to approach position with continuous monitoring
+                    if not self.move_to_position(approach_pos):
+                        logger.warning("Failed to reach approach position")
                         continue
                     
-                    # Execute movement based on waypoint type
-                    if target_point['type'] == 'collect':
-                        # For collection, use standard movement (need to face the ball)
-                        target_angle = math.degrees(math.atan2(dy, dx))
-                        angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                        
-                        if abs(angle_diff) > 5:
-                            logger.info(f"Turning {angle_diff:.1f} degrees to face ball")
-                            if not self.turn(angle_diff):
-                                logger.error("❌ Turn command failed")
-                                return False
-                            self.robot_heading = target_angle
-                        
-                        logger.info(f"🏐 Collecting {target_point['ball_type']} ball")
-                        if not self.collect(COLLECTION_DISTANCE_CM):
-                            logger.error("❌ Ball collection failed")
-                            return False
-                        collected_balls += 1
-                        logger.info(f"✅ Ball collected! Total: {collected_balls}")
-                        
-                    elif target_point['type'] == 'goal':
-                        # Use smart movement for goal approach
-                        if not self.execute_smart_movement(target_pos, "goal"):
-                            logger.error("❌ Smart goal movement failed")
-                            return False
-                        
-                        # Deliver balls at goal
-                        logger.info("🎁 Delivering balls...")
-                        if not self.deliver_balls():
-                            logger.error("❌ Ball delivery failed")
-                            return False
-                        logger.info(f"✅ Delivered {collected_balls} balls to goal!")
-                        
-                    else:  # 'approach' waypoint
-                        # Use smart movement for approach
-                        if not self.execute_smart_movement(target_pos, "approach"):
-                            logger.error("❌ Smart approach movement failed")
-                            return False
+                    # Turn to face the ball
+                    turn_angle = collection_angle - self.robot_heading
+                    turn_angle = (turn_angle + 180) % 360 - 180
+                    if abs(turn_angle) > 5:
+                        if not self.turn(turn_angle):
+                            logger.warning("Failed to turn towards ball")
+                            continue
                     
-                    # Update visualization after each step
-                    ret, frame = self.cap.read()
-                    if ret:
-                        self.update_robot_position(frame)
-                        frame = self.draw_status(frame)
-                        frame = self.draw_robot_markers(frame)
-                        frame = self.draw_walls(frame)
+                    # Calculate collection distance
+                    collection_distance = math.hypot(ball_x - approach_pos[0], ball_y - approach_pos[1])
+                    collection_distance += 5  # Add margin to ensure we go past the ball
+                    
+                    # Collect the ball
+                    if not self.collect(collection_distance):
+                        logger.warning("Collection movement failed")
+                        continue
+                    
+                    collected_balls += 1
+                    logger.info(f"✅ Successfully collected ball ({collected_balls}/{max_balls_per_session})")
+                    
+                    # Verify we're not too close to any walls
+                    if not self.update_robot_position():
+                        logger.warning("Lost robot position after collection")
+                        continue
                         
-                        cv2.putText(frame, f"Step {i+1}/{len(immediate_path)} completed - Ball {collected_balls}", 
-                                  (10, frame.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, 
-                                  0.7, (0, 255, 0), 2)
-                        cv2.imshow("Live Autonomous Collection", frame)
-                        cv2.waitKey(500)  # Brief pause to show progress
-                
-                # After completing this ball's collection, immediately scan for next ball
-                logger.info(f"🔄 Ball {collected_balls} complete! Scanning for next target...")
-                time.sleep(0.5)  # Brief pause before next scan
+                    # If we're close to capacity or near a wall, deliver balls
+                    if collected_balls >= 3 or self.should_deliver_balls():
+                        if self.deliver_balls():
+                            collected_balls = 0
+                        else:
+                            logger.error("Failed to deliver balls")
+                            return False
             
-            logger.info(f"✅ Autonomous collection session complete! Collected {collected_balls} balls")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Live autonomous collection failed: {e}")
-            self.stop()  # Emergency stop
+            logger.error(f"Autonomous collection error: {e}")
+            self.stop()
             return False
 
     def _execute_immediate_path(self, path):
@@ -2529,6 +2402,110 @@ class BallCollector:
             self.stop()
             self.cap.release()
             cv2.destroyAllWindows()
+
+    def _verify_position(self, target_pos, max_retries=3, tolerance_cm=2.0):
+        """Verify current position matches expected position within tolerance"""
+        for retry in range(max_retries):
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+                
+            if self.update_robot_position(frame):
+                current_x, current_y = self.robot_pos
+                target_x, target_y = target_pos
+                
+                # Calculate distance to target
+                distance = math.hypot(current_x - target_x, current_y - target_y)
+                
+                if distance <= tolerance_cm:
+                    return True
+                    
+                logger.info(f"Position error: {distance:.1f}cm off target")
+                
+        return False
+        
+    def _execute_movement_with_verification(self, target_pos, movement_func, *args):
+        """Execute a movement with position verification and correction"""
+        max_attempts = 3
+        min_correction_distance = 2.0  # cm
+        
+        for attempt in range(max_attempts):
+            # Execute the movement
+            if not movement_func(*args):
+                logger.error("Movement command failed")
+                return False
+                
+            # Verify position
+            if self._verify_position(target_pos):
+                return True
+                
+            # If not at target, calculate correction
+            ret, frame = self.cap.read()
+            if not ret or not self.update_robot_position(frame):
+                continue
+                
+            current_x, current_y = self.robot_pos
+            target_x, target_y = target_pos
+            
+            # Calculate correction vector
+            dx = target_x - current_x
+            dy = target_y - current_y
+            correction_distance = math.hypot(dx, dy)
+            
+            if correction_distance < min_correction_distance:
+                logger.info("Close enough to target")
+                return True
+                
+            # Calculate correction angle
+            correction_angle = math.degrees(math.atan2(dy, dx)) - self.robot_heading
+            correction_angle = (correction_angle + 180) % 360 - 180  # Normalize to [-180, 180]
+            
+            logger.info(f"Attempting correction: distance={correction_distance:.1f}cm, angle={correction_angle:.1f}°")
+            
+            # Execute correction
+            if abs(correction_angle) > 10:
+                self.turn(correction_angle)
+            self.move(correction_distance)
+            
+        return False
+
+    def move_to_position(self, target_pos, backward_allowed=True):
+        """Move to a target position with continuous monitoring"""
+        if not self.update_robot_position():
+            logger.error("Cannot determine current position")
+            return False
+            
+        current_x, current_y = self.robot_pos
+        target_x, target_y = target_pos
+        
+        # Calculate initial movement
+        dx = target_x - current_x
+        dy = target_y - current_y
+        distance = math.hypot(dx, dy)
+        angle = math.degrees(math.atan2(dy, dx))
+        
+        # Calculate turn angle
+        turn_angle = angle - self.robot_heading
+        turn_angle = (turn_angle + 180) % 360 - 180  # Normalize to [-180, 180]
+        
+        # Check if backward movement would be better
+        use_backward = False
+        if backward_allowed:
+            backward_turn = (angle + 180) - self.robot_heading
+            backward_turn = (backward_turn + 180) % 360 - 180
+            if abs(backward_turn) < abs(turn_angle):
+                turn_angle = backward_turn
+                use_backward = True
+        
+        # Execute the movement sequence
+        if abs(turn_angle) > 5:
+            if not self._execute_movement_with_verification(target_pos, self.turn, turn_angle):
+                return False
+        
+        if use_backward:
+            return self._execute_movement_with_verification(target_pos, self.move, -distance)
+        else:
+            return self._execute_movement_with_verification(target_pos, self.move, distance)
 
 if __name__ == "__main__":
     collector = BallCollector()
