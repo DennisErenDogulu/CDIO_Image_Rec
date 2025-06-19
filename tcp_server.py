@@ -4,7 +4,7 @@ import threading
 import json
 import math
 import time
-from ev3dev2.motor import OUTPUT_B, OUTPUT_C, OUTPUT_A, MediumMotor
+from ev3dev2.motor import OUTPUT_B, OUTPUT_C, OUTPUT_A, MediumMotor, LargeMotor
 from ev3dev2.motor import MoveDifferential, SpeedRPM
 from ev3dev2.wheel import Wheel
 from ev3dev2.display import Display
@@ -73,7 +73,17 @@ def safe_motor_control(func):
 @safe_motor_control
 def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
-    mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
+    # Add debugging for backward movement
+    if distance_cm < 0:
+        print("[Move] BACKWARD movement: {:.1f}cm ({:.1f}mm)".format(distance_cm, distance_cm * 11.1))
+    else:
+        print("[Move] FORWARD movement: {:.1f}cm ({:.1f}mm)".format(distance_cm, distance_cm * 11.1))
+    
+    # Convert cm to mm with adjusted conversion factor
+    distance_mm = distance_cm * 11.1
+    
+    # Execute movement
+    mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_mm)
     return True
 
 @safe_motor_control
@@ -157,6 +167,18 @@ def execute_collect_reverse(duration):
         collector.off(brake=True)
         return False
 
+@safe_motor_control
+def execute_move_backward(distance_cm):
+    """Move backward by distance_cm (always positive value, but moves backward)"""
+    print("[Move] EXPLICIT BACKWARD movement: {:.1f}cm".format(distance_cm))
+    
+    # Ensure we're moving backward (negative distance)
+    backward_distance_mm = -abs(distance_cm) * 11.1
+    
+    # Use slower speed for backward movement for safety
+    mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), backward_distance_mm)
+    return True
+
 def execute_stop():
     """Stop all motors"""
     mdiff.off(brake=True)
@@ -223,6 +245,9 @@ def handle_client(conn, addr):
         if command == "MOVE" and "distance" in request:
             result = execute_move(float(request["distance"]))
             
+        elif command == "MOVE_BACKWARD" and "distance" in request:
+            result = execute_move_backward(float(request["distance"]))
+            
         elif command == "TURN" and "angle" in request:
             result = execute_turn(float(request["angle"]))
             
@@ -262,11 +287,32 @@ def handle_client(conn, addr):
     finally:
         conn.close()
 
+def check_motor_connections():
+    """Check what motors are actually connected"""
+    print("[Hardware Check] Detecting connected motors...")
+    
+    ports = ['outA', 'outB', 'outC', 'outD']
+    for port in ports:
+        try:
+            # Try Large Motor
+            large_motor = LargeMotor(port)
+            print("[Hardware Check] Large Motor found on {}".format(port))
+        except:
+            try:
+                # Try Medium Motor
+                medium_motor = MediumMotor(port)
+                print("[Hardware Check] Medium Motor found on {}".format(port))
+            except:
+                print("[Hardware Check] No motor found on {}".format(port))
+
 def main():
     HOST = ""      # Listen on all interfaces
     PORT = 12345   # Must match PC client's port
 
     print("[TCP Server] Starting on port {} …".format(PORT))
+    
+    # Check motor connections before starting server
+    check_motor_connections()
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((HOST, PORT))

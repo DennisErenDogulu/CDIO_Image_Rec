@@ -5,8 +5,10 @@ Continuous Ball Collection Client
 This script implements a continuous ball collection strategy using visual markers:
 1. Track robot position using green base marker
 2. Track robot heading using pink direction marker
-3. Detect balls using HSV color detection
+3. Detect balls using enhanced multi-method detection optimized for 1.8m aerial view
 4. Navigate to and collect balls based on visual position tracking
+
+Note: All detection parameters are optimized for a camera positioned 1.8 meters above the field
 """
 
 import cv2
@@ -83,22 +85,22 @@ IGNORED_AREA = {
     "y_min": 50, "y_max": 100
 }
 
-# Detection parameters - Enhanced for robust white ball detection
-MIN_BALL_AREA = 40   # Minimum contour area for ball detection (lowered for better sensitivity)
-MIN_ROUNDNESS = 0.5  # Minimum roundness (circularity) for ball detection
+# Detection parameters - Optimized for 1.8m height aerial view
+MIN_BALL_AREA = 15   # Much smaller for aerial view (was 40)
+MIN_ROUNDNESS = 0.4  # More lenient for small distant objects
 MIN_WALL_AREA = 500  # Minimum contour area for wall detection
 MIN_GOAL_AREA = 1000  # Minimum contour area for goal detection
 
-# Advanced detection parameters
-BALL_SIZE_RANGE = (6, 60)      # Pixel size range for ball detection
+# Advanced detection parameters - Adjusted for 1.8m aerial perspective
+BALL_SIZE_RANGE = (3, 25)      # Much smaller pixel size from 1.8m height
 BRIGHTNESS_PERCENTILE = 85      # Percentile threshold for brightness detection
-HOUGH_CIRCLE_PARAMS = {         # Parameters for circular object detection
+HOUGH_CIRCLE_PARAMS = {         # Parameters optimized for aerial view
     'dp': 1,
-    'minDist': 30,
-    'param1': 50,
-    'param2': 30,
-    'minRadius': 5,
-    'maxRadius': 50
+    'minDist': 15,              # Smaller minimum distance between circles
+    'param1': 40,               # Lower edge threshold for aerial view
+    'param2': 18,               # Lower accumulator threshold for small objects
+    'minRadius': 2,             # Much smaller minimum radius from height
+    'maxRadius': 15             # Much smaller maximum radius from height
 }
 
 # Setup logging
@@ -188,6 +190,9 @@ class BallCollector:
         self.selected_goal = 'A'  # 'A' (small goal) or 'B' (large goal)
         self.goal_ranges = self._build_goal_ranges()
         self.delivery_time = 2.0  # Seconds to run collector in reverse
+        
+        # Smart movement settings
+        self.backward_driving_enabled = True  # Enable smart backward driving
 
     def is_point_in_field(self, x_cm: float, y_cm: float) -> bool:
         """Check if a point in cm coordinates is within the calibrated field bounds"""
@@ -524,7 +529,12 @@ class BallCollector:
 
     def move(self, distance_cm: float) -> bool:
         """Move forward/backward by distance_cm"""
-        return self.send_command("MOVE", distance=distance_cm)
+        if distance_cm < 0:
+            # Use explicit backward command for negative distances
+            logger.info(f"🔄 Using MOVE_BACKWARD command for {abs(distance_cm):.1f}cm")
+            return self.send_command("MOVE_BACKWARD", distance=abs(distance_cm))
+        else:
+            return self.send_command("MOVE", distance=distance_cm)
 
     def turn(self, angle_deg: float) -> bool:
         """Turn by angle_deg (positive = CCW)"""
@@ -626,12 +636,15 @@ class BallCollector:
             frame_enhanced = np.power(frame_enhanced / 255.0, gamma)
             frame_enhanced = (frame_enhanced * 255).astype(np.uint8)
         
-        # 4. Convert to multiple color spaces for comprehensive detection
+        # 4. Additional white balance correction for changing lighting
+        frame_enhanced = self._apply_white_balance_correction(frame_enhanced)
+        
+        # 5. Convert to multiple color spaces for comprehensive detection
         hsv = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2HSV)
         lab = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2LAB)
         gray = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2GRAY)
         
-        # === MULTI-METHOD DETECTION ===
+        # === MULTI-METHOD DETECTION WITH ADAPTIVE WEIGHTING ===
         
         # Method 1: Enhanced HSV color detection
         hsv_mask = self._detect_balls_hsv(hsv)
@@ -639,12 +652,34 @@ class BallCollector:
         # Method 2: Brightness-based detection
         brightness_mask = self._detect_balls_brightness(gray, lab)
         
-        # Method 3: Edge-based circular detection
+        # Method 3: Enhanced Hough circles detection (now primary method)
         edge_mask = self._detect_balls_edges(gray)
         
-        # Combine all detection methods
-        combined_mask = cv2.bitwise_or(hsv_mask, brightness_mask)
-        combined_mask = cv2.bitwise_or(combined_mask, edge_mask)
+        # === ADAPTIVE LIGHTING COMPENSATION ===
+        
+        # Analyze lighting conditions to adjust detection strategy
+        lighting_condition = self._analyze_lighting_conditions(gray)
+        
+        # Combine methods with adaptive weighting based on lighting
+        if lighting_condition == "low_light":
+            # In low light, prioritize edge detection and brightness methods
+            combined_mask = cv2.addWeighted(edge_mask, 0.6, brightness_mask, 0.3, 0)
+            combined_mask = cv2.addWeighted(combined_mask, 1.0, hsv_mask, 0.2, 0)
+        elif lighting_condition == "high_contrast":
+            # In high contrast, prioritize HSV and edge detection
+            combined_mask = cv2.addWeighted(edge_mask, 0.5, hsv_mask, 0.4, 0)
+            combined_mask = cv2.addWeighted(combined_mask, 1.0, brightness_mask, 0.2, 0)
+        elif lighting_condition == "changing_light":
+            # In changing light, give highest weight to enhanced Hough circles
+            combined_mask = cv2.addWeighted(edge_mask, 0.7, brightness_mask, 0.2, 0)
+            combined_mask = cv2.addWeighted(combined_mask, 1.0, hsv_mask, 0.2, 0)
+        else:  # normal lighting
+            # Balanced approach with slight preference for enhanced Hough circles
+            combined_mask = cv2.addWeighted(edge_mask, 0.5, hsv_mask, 0.3, 0)
+            combined_mask = cv2.addWeighted(combined_mask, 1.0, brightness_mask, 0.3, 0)
+        
+        # Ensure the result is binary
+        _, combined_mask = cv2.threshold(combined_mask, 127, 255, cv2.THRESH_BINARY)
         
         # === ADVANCED MORPHOLOGICAL PROCESSING ===
         
@@ -727,30 +762,394 @@ class BallCollector:
         
         return brightness_mask
     
+    def _analyze_lighting_conditions(self, gray):
+        """Analyze the lighting conditions of the image to adapt detection strategy"""
+        # Calculate basic statistics
+        mean_brightness = np.mean(gray)
+        std_brightness = np.std(gray)
+        
+        # Calculate histogram
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        hist_norm = hist.flatten() / hist.sum()
+        
+        # Check for low light conditions
+        if mean_brightness < 70:
+            return "low_light"
+        
+        # Check for high contrast (wide brightness distribution)
+        if std_brightness > 60:
+            # Additional check: bimodal distribution indicates high contrast
+            peaks = []
+            for i in range(1, 255):
+                if hist_norm[i] > hist_norm[i-1] and hist_norm[i] > hist_norm[i+1]:
+                    if hist_norm[i] > 0.01:  # Significant peak
+                        peaks.append(i)
+            
+            if len(peaks) >= 2 and abs(peaks[-1] - peaks[0]) > 100:
+                return "high_contrast"
+        
+        # Check for changing light conditions (uneven brightness distribution)
+        # Divide image into regions and check brightness variation
+        h, w = gray.shape
+        regions = []
+        for i in range(3):
+            for j in range(3):
+                y1, y2 = i * h // 3, (i + 1) * h // 3
+                x1, x2 = j * w // 3, (j + 1) * w // 3
+                region_mean = np.mean(gray[y1:y2, x1:x2])
+                regions.append(region_mean)
+        
+        region_std = np.std(regions)
+        if region_std > 30:  # High variation across regions
+            return "changing_light"
+        
+        # Default to normal lighting
+        return "normal"
+    
+    def _apply_white_balance_correction(self, frame):
+        """Apply automatic white balance correction to normalize for changing lighting conditions"""
+        # Convert to LAB color space for better white balance
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        
+        # Method 1: Gray World assumption
+        gray_world = frame.copy().astype(np.float32)
+        b_mean = np.mean(gray_world[:, :, 0])
+        g_mean = np.mean(gray_world[:, :, 1])
+        r_mean = np.mean(gray_world[:, :, 2])
+        
+        # Calculate scaling factors
+        gray_mean = (b_mean + g_mean + r_mean) / 3
+        
+        if b_mean > 0 and g_mean > 0 and r_mean > 0:
+            b_scale = gray_mean / b_mean
+            g_scale = gray_mean / g_mean
+            r_scale = gray_mean / r_mean
+            
+            # Apply gentle correction (not too aggressive)
+            b_scale = 0.7 + 0.3 * b_scale  # Limit correction strength
+            g_scale = 0.7 + 0.3 * g_scale
+            r_scale = 0.7 + 0.3 * r_scale
+            
+            gray_world[:, :, 0] *= b_scale
+            gray_world[:, :, 1] *= g_scale
+            gray_world[:, :, 2] *= r_scale
+            
+            gray_world = np.clip(gray_world, 0, 255).astype(np.uint8)
+        else:
+            gray_world = frame
+        
+        # Method 2: White patch correction
+        # Find brightest regions (likely to be white/light colored)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        bright_threshold = np.percentile(gray, 95)
+        bright_mask = gray > bright_threshold
+        
+        if np.sum(bright_mask) > 100:  # Enough bright pixels
+            white_patch = frame.copy().astype(np.float32)
+            
+            # Calculate average color of bright regions
+            bright_b = np.mean(frame[:, :, 0][bright_mask])
+            bright_g = np.mean(frame[:, :, 1][bright_mask])
+            bright_r = np.mean(frame[:, :, 2][bright_mask])
+            
+            # Target white point (slightly bluish to account for typical indoor lighting)
+            target_white = 240
+            
+            if bright_b > 0 and bright_g > 0 and bright_r > 0:
+                b_factor = target_white / bright_b
+                g_factor = target_white / bright_g
+                r_factor = target_white / bright_r
+                
+                # Limit correction factors to avoid over-correction
+                b_factor = np.clip(b_factor, 0.5, 2.0)
+                g_factor = np.clip(g_factor, 0.5, 2.0)
+                r_factor = np.clip(r_factor, 0.5, 2.0)
+                
+                white_patch[:, :, 0] *= b_factor
+                white_patch[:, :, 1] *= g_factor
+                white_patch[:, :, 2] *= r_factor
+                
+                white_patch = np.clip(white_patch, 0, 255).astype(np.uint8)
+            else:
+                white_patch = frame
+        else:
+            white_patch = frame
+        
+        # Combine both methods with adaptive weighting
+        alpha = 0.6  # Weight for gray world method
+        beta = 0.4   # Weight for white patch method
+        
+        combined = cv2.addWeighted(gray_world, alpha, white_patch, beta, 0)
+        
+        # Final gentle enhancement for white objects
+        lab_corrected = cv2.cvtColor(combined, cv2.COLOR_BGR2LAB)
+        l_channel = lab_corrected[:, :, 0]
+        
+        # Slightly boost brightness in the upper range (where white balls would be)
+        l_enhanced = l_channel.copy().astype(np.float32)
+        bright_regions = l_enhanced > 150
+        l_enhanced[bright_regions] = l_enhanced[bright_regions] * 1.1
+        l_enhanced = np.clip(l_enhanced, 0, 255).astype(np.uint8)
+        
+        lab_corrected[:, :, 0] = l_enhanced
+        final_corrected = cv2.cvtColor(lab_corrected, cv2.COLOR_LAB2BGR)
+        
+        return final_corrected
+    
     def _detect_balls_edges(self, gray):
-        """Edge-based circular object detection"""
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+        """Enhanced edge-based circular object detection with multiple Hough circle approaches"""
+        edge_masks = []
         
-        # Use HoughCircles to detect circular objects
-        circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=30,
-                                 param1=50, param2=30, minRadius=5, maxRadius=50)
+        # === PREPROCESSING IMPROVEMENTS ===
         
-        # Create mask from detected circles
+        # Method 1: Standard preprocessing with bilateral filtering
+        bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+        blurred1 = cv2.GaussianBlur(bilateral, (5, 5), 1)
+        
+        # Method 2: Histogram equalization for better contrast
+        equalized = cv2.equalizeHist(gray)
+        blurred2 = cv2.GaussianBlur(equalized, (7, 7), 2)
+        
+        # Method 3: CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_enhanced = clahe.apply(gray)
+        blurred3 = cv2.GaussianBlur(clahe_enhanced, (9, 9), 2)
+        
+        # Method 4: Edge enhancement using unsharp masking
+        gaussian = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        unsharp_mask = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+        blurred4 = cv2.GaussianBlur(unsharp_mask, (5, 5), 1)
+        
+        preprocessed_images = [
+            (blurred1, "bilateral"),
+            (blurred2, "equalized"), 
+            (blurred3, "clahe"),
+            (blurred4, "unsharp")
+        ]
+        
+        # === MULTIPLE HOUGH CIRCLE PARAMETER SETS ===
+        
+        # Parameter sets optimized for 1.8m aerial view and different lighting conditions
+        hough_params = [
+            # Standard detection - optimized for 1.8m height
+            {'dp': 1, 'minDist': 12, 'param1': 40, 'param2': 18, 'minRadius': 2, 'maxRadius': 15},
+            
+            # Sensitive detection - for low contrast from height
+            {'dp': 1, 'minDist': 8, 'param1': 25, 'param2': 12, 'minRadius': 2, 'maxRadius': 18},
+            
+            # Conservative detection - for noisy aerial conditions
+            {'dp': 1, 'minDist': 15, 'param1': 50, 'param2': 22, 'minRadius': 3, 'maxRadius': 12},
+            
+            # Ultra-sensitive - for very small/distant balls
+            {'dp': 1, 'minDist': 6, 'param1': 20, 'param2': 8, 'minRadius': 1, 'maxRadius': 10},
+            
+            # High precision - for clearly visible balls from height
+            {'dp': 1, 'minDist': 10, 'param1': 35, 'param2': 15, 'minRadius': 2, 'maxRadius': 20}
+        ]
+        
+        all_circles = []
+        
+        # Apply each preprocessing method with each parameter set
+        for img, img_type in preprocessed_images:
+            for i, params in enumerate(hough_params):
+                try:
+                    circles = cv2.HoughCircles(
+                        img, 
+                        cv2.HOUGH_GRADIENT,
+                        dp=params['dp'],
+                        minDist=params['minDist'],
+                        param1=params['param1'],
+                        param2=params['param2'],
+                        minRadius=params['minRadius'],
+                        maxRadius=params['maxRadius']
+                    )
+                    
+                    if circles is not None:
+                        circles = np.round(circles[0, :]).astype("int")
+                        for (x, y, r) in circles:
+                            # Store circle with confidence score based on method
+                            confidence = self._calculate_circle_confidence(gray, x, y, r, img_type, i)
+                            all_circles.append((x, y, r, confidence, img_type, i))
+                            
+                except Exception as e:
+                    # Continue if this parameter set fails
+                    continue
+        
+        # === CIRCLE VALIDATION AND FILTERING ===
+        
+        # Remove duplicate circles using non-maximum suppression
+        filtered_circles = self._non_maximum_suppression_circles(all_circles)
+        
+        # Additional validation for white ball characteristics
+        validated_circles = []
+        for (x, y, r, confidence, method, param_idx) in filtered_circles:
+            if self._validate_circle_as_ball(gray, x, y, r):
+                validated_circles.append((x, y, r, confidence))
+        
+        # === CREATE FINAL MASK ===
+        
         edge_mask = np.zeros(gray.shape, dtype=np.uint8)
-        if circles is not None:
-            circles = np.round(circles[0, :]).astype("int")
-            for (x, y, r) in circles:
-                # Draw filled circle on mask
-                cv2.circle(edge_mask, (x, y), r, 255, -1)
+        
+        # Sort circles by confidence and take the best ones
+        validated_circles.sort(key=lambda x: x[3], reverse=True)
+        max_circles = min(10, len(validated_circles))  # Limit to avoid false positives
+        
+        for i in range(max_circles):
+            x, y, r, confidence = validated_circles[i]
+            # Lower confidence threshold for small aerial objects
+            if confidence > 0.2:  # More lenient for 1.8m height detection
+                # Draw filled circle with radius slightly smaller than detected
+                adjusted_radius = max(2, int(r * 0.8))
+                cv2.circle(edge_mask, (x, y), adjusted_radius, 255, -1)
         
         return edge_mask
     
+    def _calculate_circle_confidence(self, gray, x, y, r, method_type, param_idx):
+        """Calculate confidence score for detected circle based on white ball characteristics"""
+        if x - r < 0 or y - r < 0 or x + r >= gray.shape[1] or y + r >= gray.shape[0]:
+            return 0.0
+        
+        # Extract circular region
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.circle(mask, (x, y), r, 255, -1)
+        
+        # Get pixels within the circle
+        circle_pixels = gray[mask > 0]
+        if len(circle_pixels) == 0:
+            return 0.0
+        
+        # Get surrounding pixels for comparison
+        outer_mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.circle(outer_mask, (x, y), int(r * 1.5), 255, -1)
+        cv2.circle(outer_mask, (x, y), r, 0, -1)  # Remove inner circle
+        surrounding_pixels = gray[outer_mask > 0]
+        
+        confidence = 0.0
+        
+        # Brightness score - white balls should be bright
+        avg_brightness = np.mean(circle_pixels)
+        max_brightness = np.max(circle_pixels)
+        brightness_score = min(1.0, avg_brightness / 200.0) * 0.3
+        brightness_score += min(1.0, max_brightness / 255.0) * 0.2
+        confidence += brightness_score
+        
+        # Contrast score - ball should be brighter than surroundings
+        if len(surrounding_pixels) > 0:
+            contrast = avg_brightness - np.mean(surrounding_pixels)
+            contrast_score = min(1.0, max(0.0, contrast / 50.0)) * 0.2
+            confidence += contrast_score
+        
+        # Uniformity score - ball should have relatively uniform brightness
+        brightness_std = np.std(circle_pixels)
+        max_allowed_std = 30 + (r * 2)  # Allow more variation for larger circles
+        uniformity_score = max(0.0, 1.0 - brightness_std / max_allowed_std) * 0.15
+        confidence += uniformity_score
+        
+        # Size score - adjusted for 1.8m aerial view
+        ideal_radius = 6  # Much smaller for aerial perspective (was 15)
+        size_diff = abs(r - ideal_radius)
+        size_score = max(0.0, 1.0 - size_diff / 8.0) * 0.1  # Tighter tolerance for small objects
+        confidence += size_score
+        
+        # Method bonus - some methods are more reliable
+        method_bonuses = {
+            "bilateral": 0.05,
+            "clahe": 0.03,
+            "equalized": 0.02,
+            "unsharp": 0.04
+        }
+        confidence += method_bonuses.get(method_type, 0.0)
+        
+        # Edge strength score
+        roi = gray[max(0, y-r):min(gray.shape[0], y+r+1), 
+                   max(0, x-r):min(gray.shape[1], x+r+1)]
+        if roi.size > 0:
+            edges = cv2.Canny(roi, 50, 150)
+            edge_pixels = np.sum(edges > 0)
+            expected_edge_pixels = 2 * np.pi * r * 0.7  # Approximate circle perimeter
+            edge_score = min(1.0, edge_pixels / max(1, expected_edge_pixels)) * 0.05
+            confidence += edge_score
+        
+        return min(1.0, confidence)
+    
+    def _non_maximum_suppression_circles(self, circles):
+        """Remove overlapping circles, keeping the ones with highest confidence"""
+        if len(circles) == 0:
+            return []
+        
+        # Sort by confidence
+        circles = sorted(circles, key=lambda x: x[3], reverse=True)
+        
+        kept_circles = []
+        for circle in circles:
+            x, y, r, conf, method, param_idx = circle
+            
+            # Check if this circle overlaps significantly with any kept circle
+            should_keep = True
+            for kept_x, kept_y, kept_r, kept_conf, kept_method, kept_param in kept_circles:
+                distance = np.sqrt((x - kept_x)**2 + (y - kept_y)**2)
+                overlap_threshold = min(r, kept_r) * 0.7
+                
+                if distance < overlap_threshold:
+                    should_keep = False
+                    break
+            
+            if should_keep:
+                kept_circles.append(circle)
+        
+        return kept_circles
+    
+    def _validate_circle_as_ball(self, gray, x, y, r):
+        """Additional validation to ensure detected circle represents a ball"""
+        # Check bounds
+        if x - r < 0 or y - r < 0 or x + r >= gray.shape[1] or y + r >= gray.shape[0]:
+            return False
+        
+        # Size constraints - adjusted for 1.8m height
+        if r < 1 or r > 20:  # Much smaller range for aerial view
+            return False
+        
+        # Extract circular region
+        roi = gray[y-r:y+r+1, x-r:x+r+1]
+        if roi.size == 0:
+            return False
+        
+        # Create circular mask for the ROI
+        mask = np.zeros(roi.shape, dtype=np.uint8)
+        cv2.circle(mask, (r, r), r, 255, -1)
+        
+        # Get pixels within the circle
+        circle_pixels = roi[mask > 0]
+        if len(circle_pixels) < 10:  # Too few pixels
+            return False
+        
+        # Brightness validation - adjusted for aerial perspective
+        avg_brightness = np.mean(circle_pixels)
+        if avg_brightness < 50:  # Lower threshold for distant white balls
+            return False
+        
+        # Check for reasonable brightness distribution
+        brightness_std = np.std(circle_pixels)
+        if brightness_std > 60:  # Too much variation
+            return False
+        
+        # Gradient check - balls should have smooth gradients
+        gradx = cv2.Sobel(roi, cv2.CV_64F, 1, 0, ksize=3)
+        grady = cv2.Sobel(roi, cv2.CV_64F, 0, 1, ksize=3)
+        magnitude = np.sqrt(gradx**2 + grady**2)
+        
+        # Check if gradients are reasonable (not too high)
+        avg_gradient = np.mean(magnitude[mask > 0])
+        if avg_gradient > 50:  # Too much texture/noise
+            return False
+        
+        return True
+    
     def _validate_ball_contour(self, contour, frame_enhanced, gray):
         """Comprehensive validation of ball contours"""
-        # Basic area check
+        # Basic area check - adjusted for 1.8m aerial perspective
         area = cv2.contourArea(contour)
-        if area < MIN_BALL_AREA or area > 2000:  # Increased upper limit
+        if area < MIN_BALL_AREA or area > 400:  # Much smaller upper limit for aerial view
             return None
         
         # Enhanced circularity check
@@ -768,9 +1167,9 @@ class BallCollector:
         if aspect_ratio < 0.7 or aspect_ratio > 1.4:  # More lenient aspect ratio
             return None
         
-        # Size consistency
+        # Size consistency - adjusted for aerial view
         avg_size = (w + h) / 2
-        if avg_size < 6 or avg_size > 60:  # Broader size range
+        if avg_size < 3 or avg_size > 25:  # Much smaller range for 1.8m height
             return None
         
         # Minimum enclosing circle analysis
@@ -806,9 +1205,9 @@ class BallCollector:
             max_brightness = np.max(masked_pixels)
             brightness_std = np.std(masked_pixels)
             
-            # Adaptive brightness thresholds
-            min_avg_brightness = 70 if np.mean(gray) < 120 else 90
-            min_max_brightness = 100 if np.mean(gray) < 120 else 130
+            # Adaptive brightness thresholds - adjusted for aerial perspective
+            min_avg_brightness = 60 if np.mean(gray) < 120 else 80  # Lower thresholds for distant objects
+            min_max_brightness = 90 if np.mean(gray) < 120 else 120
             
             if avg_brightness < min_avg_brightness or max_brightness < min_max_brightness:
                 return None
@@ -964,7 +1363,8 @@ class BallCollector:
             colors = {
                 'approach': (0, 255, 255),  # Yellow
                 'collect': (0, 255, 0),     # Green
-                'goal': (0, 0, 255)         # Red
+                'goal': (0, 0, 255),        # Red
+                'backward': (255, 0, 255)   # Magenta for backward movements
             }
             
             # Draw grid overlay (light grid lines every 10cm)
@@ -1125,6 +1525,168 @@ class BallCollector:
         except Exception as e:
             logger.error("Failed to deliver balls: {}".format(e))
             return False
+
+    def should_drive_backward(self, target_pos: Tuple[float, float], distance: float) -> Tuple[bool, float]:
+        """
+        Determine if it's more efficient to drive backward instead of turning around.
+        
+        Returns:
+            (should_reverse, backward_angle): Whether to reverse and the angle for backward driving
+        """
+        # Get current position and heading
+        current_pos = self.robot_pos
+        current_heading = self.robot_heading
+        
+        # Calculate angle to target (forward direction)
+        dx = target_pos[0] - current_pos[0]
+        dy = target_pos[1] - current_pos[1]
+        forward_angle = math.degrees(math.atan2(dy, dx))
+        forward_angle_diff = abs((forward_angle - current_heading + 180) % 360 - 180)
+        
+        # Calculate angle for backward driving (opposite direction)
+        backward_angle = (forward_angle + 180) % 360
+        backward_angle_diff = abs((backward_angle - current_heading + 180) % 360 - 180)
+        
+        # Scenarios where backward driving makes sense:
+        should_reverse = False
+        reason = ""
+        
+        # 1. Short distances (<20cm) and large turn angle (>90°)
+        if distance < 20 and forward_angle_diff > 90:
+            if backward_angle_diff < forward_angle_diff - 30:  # At least 30° advantage
+                should_reverse = True
+                reason = f"short distance ({distance:.1f}cm) with large turn angle"
+        
+        # 2. Backward angle is significantly smaller (>60° difference)
+        elif backward_angle_diff < forward_angle_diff - 60:
+            should_reverse = True
+            reason = f"much smaller turn angle ({backward_angle_diff:.1f}° vs {forward_angle_diff:.1f}°)"
+        
+        # 3. Very close to 180° turn (between 150° and 210°)
+        elif 150 <= forward_angle_diff <= 210:
+            should_reverse = True
+            reason = f"near-180° turn ({forward_angle_diff:.1f}°) - backing up instead"
+        
+        # 4. Robot is facing almost opposite direction and distance is reasonable
+        elif forward_angle_diff > 135 and distance < 50:
+            should_reverse = True
+            reason = f"facing opposite direction with reasonable distance"
+        
+        # Additional safety checks for backward driving
+        if should_reverse and self.backward_driving_enabled:
+            # Check if backward path is clear
+            # Calculate backward endpoint
+            backward_distance = min(distance, 30)  # Limit backward distance to 30cm max
+            back_dx = -backward_distance * math.cos(math.radians(current_heading))
+            back_dy = -backward_distance * math.sin(math.radians(current_heading))
+            back_end_pos = (current_pos[0] + back_dx, current_pos[1] + back_dy)
+            
+            # Check for wall collisions on backward path
+            if check_wall_collision(current_pos, back_end_pos, self.walls, WALL_SAFETY_MARGIN + 2):
+                should_reverse = False
+                reason = "backward path blocked by walls"
+            # Check if we'd go out of bounds
+            elif not self.is_point_in_field(back_end_pos[0], back_end_pos[1]):
+                should_reverse = False
+                reason = "backward path goes out of field"
+        elif should_reverse and not self.backward_driving_enabled:
+            should_reverse = False
+            reason = "backward driving disabled"
+        
+        if should_reverse:
+            logger.info(f"🔄 Backward driving recommended: {reason}")
+            return True, backward_angle
+        else:
+            return False, forward_angle
+    
+    def execute_smart_movement(self, target_pos: Tuple[float, float], movement_type: str = "approach") -> bool:
+        """
+        Execute movement to target with smart forward/backward decision making.
+        
+        Args:
+            target_pos: Target position (x, y) in cm
+            movement_type: Type of movement ("approach", "goal", "collect")
+        
+        Returns:
+            True if movement was successful
+        """
+        current_pos = self.robot_pos
+        dx = target_pos[0] - current_pos[0]
+        dy = target_pos[1] - current_pos[1]
+        distance = math.hypot(dx, dy)
+        
+        # Skip if we're already very close
+        if distance < 2:
+            logger.info(f"Already at target position (distance: {distance:.1f}cm)")
+            return True
+        
+        # Determine if we should drive backward
+        should_reverse, target_angle = self.should_drive_backward(target_pos, distance)
+        
+        if should_reverse:
+            # Backward driving strategy
+            
+            # First, align for backward driving (face away from target)
+            current_heading = self.robot_heading
+            backward_heading = (target_angle + 180) % 360  # Face opposite to target
+            turn_angle = (backward_heading - current_heading + 180) % 360 - 180
+            
+            if abs(turn_angle) > 5:
+                logger.info(f"🔄 Turning {turn_angle:.1f}° to align for backward driving")
+                if not self.turn(turn_angle):
+                    logger.error("❌ Turn for backward alignment failed")
+                    return False
+                self.robot_heading = backward_heading
+            
+            # Drive backward (negative distance)
+            max_backward_distance = min(distance, 25)  # Limit backward driving
+            logger.info(f"⬅️ Driving backward {max_backward_distance:.1f}cm")
+            if not self.move(-max_backward_distance):
+                logger.error("❌ Backward movement failed")
+                return False
+            
+            # If we didn't reach the target, turn and move forward for the rest
+            remaining_distance = distance - max_backward_distance
+            if remaining_distance > 2:
+                # Turn to face target
+                forward_angle = math.degrees(math.atan2(dy, dx))
+                final_turn = (forward_angle - self.robot_heading + 180) % 360 - 180
+                
+                if abs(final_turn) > 5:
+                    logger.info(f"🔄 Final turn {final_turn:.1f}° to face target")
+                    if not self.turn(final_turn):
+                        logger.error("❌ Final turn failed")
+                        return False
+                    self.robot_heading = forward_angle
+                
+                # Move remaining distance forward
+                logger.info(f"➡️ Moving remaining {remaining_distance:.1f}cm forward")
+                if not self.move(remaining_distance):
+                    logger.error("❌ Final forward movement failed")
+                    return False
+        
+        else:
+            # Standard forward driving strategy
+            
+            # Calculate angle to target
+            target_angle = math.degrees(math.atan2(dy, dx))
+            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+            
+            # Turn to face target if significant difference
+            if abs(angle_diff) > 5:
+                logger.info(f"🔄 Turning {angle_diff:.1f}° to face target")
+                if not self.turn(angle_diff):
+                    logger.error("❌ Turn command failed")
+                    return False
+                self.robot_heading = target_angle
+            
+            # Move forward to target
+            logger.info(f"➡️ Moving {distance:.1f}cm to {movement_type} position")
+            if not self.move(distance):
+                logger.error(f"❌ {movement_type} movement failed")
+                return False
+        
+        return True
 
     def convert_path_to_grid(self, path):
         """Convert continuous path to grid coordinates for client_automated.py"""
@@ -1294,22 +1856,19 @@ class BallCollector:
                         logger.info(f"Already at target position (distance: {distance:.1f}cm)")
                         continue
                     
-                    # Calculate turn needed
-                    target_angle = math.degrees(math.atan2(dy, dx))
-                    angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                    
-                    # Turn to face target if significant difference
-                    if abs(angle_diff) > 5:
-                        logger.info(f"Turning {angle_diff:.1f} degrees to face target")
-                        if not self.turn(angle_diff):
-                            logger.error("❌ Turn command failed")
-                            return False
-                        
-                        # Update heading after turn
-                        self.robot_heading = target_angle
-                    
                     # Execute movement based on waypoint type
                     if target_point['type'] == 'collect':
+                        # For collection, use standard movement (need to face the ball)
+                        target_angle = math.degrees(math.atan2(dy, dx))
+                        angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                        
+                        if abs(angle_diff) > 5:
+                            logger.info(f"Turning {angle_diff:.1f} degrees to face ball")
+                            if not self.turn(angle_diff):
+                                logger.error("❌ Turn command failed")
+                                return False
+                            self.robot_heading = target_angle
+                        
                         logger.info(f"🏐 Collecting {target_point['ball_type']} ball")
                         if not self.collect(COLLECTION_DISTANCE_CM):
                             logger.error("❌ Ball collection failed")
@@ -1318,9 +1877,9 @@ class BallCollector:
                         logger.info(f"✅ Ball collected! Total: {collected_balls}")
                         
                     elif target_point['type'] == 'goal':
-                        logger.info(f"🎯 Moving {distance:.1f}cm to goal")
-                        if not self.move(distance):
-                            logger.error("❌ Goal movement failed")
+                        # Use smart movement for goal approach
+                        if not self.execute_smart_movement(target_pos, "goal"):
+                            logger.error("❌ Smart goal movement failed")
                             return False
                         
                         # Deliver balls at goal
@@ -1331,9 +1890,9 @@ class BallCollector:
                         logger.info(f"✅ Delivered {collected_balls} balls to goal!")
                         
                     else:  # 'approach' waypoint
-                        logger.info(f"➡️ Moving {distance:.1f}cm to approach position")
-                        if not self.move(distance):
-                            logger.error("❌ Approach movement failed")
+                        # Use smart movement for approach
+                        if not self.execute_smart_movement(target_pos, "approach"):
+                            logger.error("❌ Smart approach movement failed")
                             return False
                     
                     # Update visualization after each step
@@ -1480,6 +2039,12 @@ class BallCollector:
                 cv2.putText(frame, f"Heading: {self.robot_heading:.1f}°", 
                           (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
+                # Show backward driving status
+                backward_status = "ON" if self.backward_driving_enabled else "OFF"
+                backward_color = (0, 255, 0) if self.backward_driving_enabled else (0, 0, 255)
+                cv2.putText(frame, f"Backward driving: {backward_status}", 
+                          (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, backward_color, 2)
+                
                 # Find balls
                 balls = self.detect_balls(frame)
                 frame = self.draw_detected_balls(frame, balls)
@@ -1571,18 +2136,17 @@ class BallCollector:
                                 self.deliver_balls()
                         
                     else:
-                        # Move toward ball
-                        if abs(angle_diff) > 8:  # Turn toward ball first (increased threshold)
-                            logger.info(f"Turning {angle_diff:.1f}° toward ball")
-                            if self.turn(angle_diff):
-                                # Update heading after successful turn
-                                self.robot_heading = angle_to_ball
-                        else:
-                            # Move forward toward ball
-                            move_distance = min(distance - 15, 20)  # Max 20cm, leave 15cm buffer
-                            if move_distance > 2:
-                                logger.info(f"Moving {move_distance:.1f}cm toward ball")
-                                self.move(move_distance)
+                        # Use smart movement toward ball
+                        ball_approach_pos = (ball_x - 15 * math.cos(math.radians(angle_to_ball)), 
+                                           ball_y - 15 * math.sin(math.radians(angle_to_ball)))
+                        
+                        # Check if we need to move at all
+                        approach_distance = math.hypot(ball_approach_pos[0] - self.robot_pos[0], 
+                                                     ball_approach_pos[1] - self.robot_pos[1])
+                        
+                        if approach_distance > 5:  # Only move if we're not close enough
+                            logger.info(f"Smart movement toward ball (distance: {approach_distance:.1f}cm)")
+                            self.execute_smart_movement(ball_approach_pos, "ball_approach")
                 
                 else:
                     cv2.putText(frame, "🔍 No balls detected", 
@@ -1818,6 +2382,8 @@ class BallCollector:
                         "1 - Select Goal A (small)",
                         "2 - Select Goal B (large)",
                         "3 - Toggle goal sides",
+                        "B - Toggle backward driving",
+                        "T - Test backward movement",
                         "Q - Quit"
                     ]
                     y = 150
@@ -1852,6 +2418,25 @@ class BallCollector:
                     self.goal_ranges = self._build_goal_ranges()
                     self.setup_walls()  # Rebuild walls to exclude new goal positions
                     logger.info(f"🔄 Toggled small goal side to {self.small_goal_side}")
+                elif key == ord('b') or key == ord('B'):
+                    # Toggle backward driving
+                    self.backward_driving_enabled = not self.backward_driving_enabled
+                    status = "enabled" if self.backward_driving_enabled else "disabled"
+                    logger.info(f"🔄 Backward driving {status}")
+                elif key == ord('t') or key == ord('T'):
+                    # Test backward movement
+                    logger.info("🧪 Testing backward movement...")
+                    logger.info("Moving backward 10cm...")
+                    if self.move(-10):
+                        logger.info("✅ Backward movement successful!")
+                        time.sleep(1)
+                        logger.info("Moving forward 10cm...")
+                        if self.move(10):
+                            logger.info("✅ Forward movement successful!")
+                        else:
+                            logger.error("❌ Forward movement failed!")
+                    else:
+                        logger.error("❌ Backward movement failed!")
                 elif key == ord('s') or key == ord('S'):
                     # Start LIVE autonomous collection
                     logger.info("🤖 Starting LIVE autonomous collection...")
