@@ -23,9 +23,9 @@ EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 
 # Color detection ranges (HSV)
-# Cyan/Teal paper detection (was green) - Expanded range for bright cyan
-CYAN_LOWER = np.array([80, 100, 100])   # Broader cyan hue range: 80-110, higher saturation
-CYAN_UPPER = np.array([110, 255, 255])
+# Green paper detection - Optimized for bright green paper
+GREEN_LOWER = np.array([40, 50, 50])    # Green hue range: 40-80, moderate saturation and value
+GREEN_UPPER = np.array([80, 255, 255])
 PINK_LOWER = np.array([145, 50, 50])
 PINK_UPPER = np.array([175, 255, 255])
 
@@ -34,23 +34,26 @@ PINK_UPPER = np.array([175, 255, 255])
 # ORANGE_BALL_LOWER = np.array([8, 80, 40])    
 # ORANGE_BALL_UPPER = np.array([22, 255, 255]) 
 
-# Fine-tuned white ball detection ranges
-WHITE_BALL_LOWER_1 = np.array([0, 0, 120])   # Main range - medium brightness, very low saturation
-WHITE_BALL_UPPER_1 = np.array([180, 25, 255])
-WHITE_BALL_LOWER_2 = np.array([0, 0, 90])    # Shadow range - lower brightness
-WHITE_BALL_UPPER_2 = np.array([180, 40, 180])
-WHITE_BALL_LOWER_3 = np.array([0, 0, 160])   # Bright range - high brightness, ultra low saturation
-WHITE_BALL_UPPER_3 = np.array([180, 15, 255])
+# Enhanced white ball detection ranges - multiple approaches
+WHITE_BALL_LOWER_1 = np.array([0, 0, 140])   # Main range - bright whites, very low saturation
+WHITE_BALL_UPPER_1 = np.array([180, 20, 255])
+WHITE_BALL_LOWER_2 = np.array([0, 0, 100])   # Shadow range - medium brightness
+WHITE_BALL_UPPER_2 = np.array([180, 35, 200])
+WHITE_BALL_LOWER_3 = np.array([0, 0, 170])   # Highlight range - very bright, ultra low saturation
+WHITE_BALL_UPPER_3 = np.array([180, 12, 255])
+WHITE_BALL_LOWER_4 = np.array([0, 0, 80])    # Dark shadow range
+WHITE_BALL_UPPER_4 = np.array([180, 50, 160])
 
-# Ball colors mapping - Only white balls for now
+# Ball colors mapping - Enhanced white ball detection
 BALL_COLORS = {
-    'white': (WHITE_BALL_LOWER_1, WHITE_BALL_UPPER_1),
+    'white_main': (WHITE_BALL_LOWER_1, WHITE_BALL_UPPER_1),
     'white_shadow': (WHITE_BALL_LOWER_2, WHITE_BALL_UPPER_2),
-    'white_bright': (WHITE_BALL_LOWER_3, WHITE_BALL_UPPER_3)
+    'white_bright': (WHITE_BALL_LOWER_3, WHITE_BALL_UPPER_3),
+    'white_dark': (WHITE_BALL_LOWER_4, WHITE_BALL_UPPER_4)
 }
 
 # Marker dimensions
-GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
+GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet (back to green!)
 PINK_MARKER_WIDTH_CM = 5    # Width of pink direction marker
 
 # Wall configuration
@@ -80,11 +83,23 @@ IGNORED_AREA = {
     "y_min": 50, "y_max": 100
 }
 
-# Detection parameters - Optimized for white ball detection
-MIN_BALL_AREA = 60   # Minimum contour area for ball detection (optimized for white balls)
+# Detection parameters - Enhanced for robust white ball detection
+MIN_BALL_AREA = 40   # Minimum contour area for ball detection (lowered for better sensitivity)
 MIN_ROUNDNESS = 0.5  # Minimum roundness (circularity) for ball detection
 MIN_WALL_AREA = 500  # Minimum contour area for wall detection
 MIN_GOAL_AREA = 1000  # Minimum contour area for goal detection
+
+# Advanced detection parameters
+BALL_SIZE_RANGE = (6, 60)      # Pixel size range for ball detection
+BRIGHTNESS_PERCENTILE = 85      # Percentile threshold for brightness detection
+HOUGH_CIRCLE_PARAMS = {         # Parameters for circular object detection
+    'dp': 1,
+    'minDist': 30,
+    'param1': 50,
+    'param2': 30,
+    'minRadius': 5,
+    'maxRadius': 50
+}
 
 # Setup logging
 logging.basicConfig(
@@ -208,18 +223,18 @@ class BallCollector:
         return ranges
 
     def detect_markers(self, frame):
-        """Detect cyan base paper and pink direction marker"""
+        """Detect green base paper and pink direction marker"""
         # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Detect cyan base marker (paper) - use morphological operations to clean up
-        cyan_mask = cv2.inRange(hsv, CYAN_LOWER, CYAN_UPPER)
+        # Detect green base marker (paper) - use morphological operations to clean up
+        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
         # Clean up the mask for better paper detection
         kernel = np.ones((5,5), np.uint8)
-        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_CLOSE, kernel)  # Fill holes
-        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_OPEN, kernel)   # Remove noise
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)  # Fill holes
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)   # Remove noise
         
-        cyan_contours, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Detect pink direction marker (clip)
         pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
@@ -230,16 +245,16 @@ class BallCollector:
         
         pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Find largest cyan contour (base paper) - lower threshold for larger areas
-        cyan_center = None
-        if cyan_contours:
-            largest_cyan = max(cyan_contours, key=cv2.contourArea)
-            cyan_area = cv2.contourArea(largest_cyan)
-            if cyan_area > 500:  # Increased threshold for paper (was 100)
+        # Find largest green contour (base paper) - lower threshold for larger areas
+        green_center = None
+        if green_contours:
+            largest_green = max(green_contours, key=cv2.contourArea)
+            green_area = cv2.contourArea(largest_green)
+            if green_area > 500:  # Increased threshold for paper (was 100)
                 # Use moments to find center of mass
-                M = cv2.moments(largest_cyan)
+                M = cv2.moments(largest_green)
                 if M["m00"] != 0:
-                    cyan_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                    green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
         # Find largest pink contour (direction clip) - keep smaller threshold
         pink_center = None
@@ -251,27 +266,27 @@ class BallCollector:
                 if M["m00"] != 0:
                     pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
-        return cyan_center, pink_center
+        return green_center, pink_center
 
     def update_robot_position(self, frame):
         """Update robot position and heading based on visual markers"""
-        cyan_center, pink_center = self.detect_markers(frame)
+        green_center, pink_center = self.detect_markers(frame)
         
-        if cyan_center and pink_center and self.homography_matrix is not None:
-            # Convert cyan center (robot base) to cm coordinates
-            cyan_px = np.array([[[float(cyan_center[0]), float(cyan_center[1])]]], dtype="float32")
-            cyan_cm = cv2.perspectiveTransform(cyan_px, np.linalg.inv(self.homography_matrix))[0][0]
+        if green_center and pink_center and self.homography_matrix is not None:
+            # Convert green center (robot base) to cm coordinates
+            green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
+            green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
             
             # Convert pink center (direction marker) to cm coordinates
             pink_px = np.array([[[float(pink_center[0]), float(pink_center[1])]]], dtype="float32")
             pink_cm = cv2.perspectiveTransform(pink_px, np.linalg.inv(self.homography_matrix))[0][0]
             
-            # Update robot position (cyan marker center)
-            self.robot_pos = (cyan_cm[0], cyan_cm[1])
+            # Update robot position (green marker center)
+            self.robot_pos = (green_cm[0], green_cm[1])
             
-            # Calculate heading from cyan to pink marker (front direction)
-            dx = pink_cm[0] - cyan_cm[0]
-            dy = pink_cm[1] - cyan_cm[1]
+            # Calculate heading from green to pink marker (front direction)
+            dx = pink_cm[0] - green_cm[0]
+            dy = pink_cm[1] - green_cm[1]
             # Convert to degrees and normalize to [-180, 180]
             heading_raw = math.degrees(math.atan2(dy, dx))
             self.robot_heading = (heading_raw + 180) % 360 - 180
@@ -285,11 +300,11 @@ class BallCollector:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         # Get the masks for debugging
-        cyan_mask = cv2.inRange(hsv, CYAN_LOWER, CYAN_UPPER)
+        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
         kernel = np.ones((5,5), np.uint8)
-        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_CLOSE, kernel)
-        cyan_mask = cv2.morphologyEx(cyan_mask, cv2.MORPH_OPEN, kernel)
-        cyan_contours, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
         kernel_small = np.ones((3,3), np.uint8)
@@ -297,27 +312,27 @@ class BallCollector:
         pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel_small)
         pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        cyan_center, pink_center = self.detect_markers(frame)
+        green_center, pink_center = self.detect_markers(frame)
         
-        # Draw all cyan contours for debugging
-        if cyan_contours:
-            largest_cyan = max(cyan_contours, key=cv2.contourArea)
-            cyan_area = cv2.contourArea(largest_cyan)
+        # Draw all green contours for debugging
+        if green_contours:
+            largest_green = max(green_contours, key=cv2.contourArea)
+            green_area = cv2.contourArea(largest_green)
             
-            # Draw the cyan paper contour
-            cv2.drawContours(frame, [largest_cyan], -1, (255, 255, 0), 2)  # Cyan color in BGR
+            # Draw the green paper contour
+            cv2.drawContours(frame, [largest_green], -1, (0, 255, 0), 2)  # Green color in BGR
             
             # Show area info
-            cv2.putText(frame, f"Cyan area: {cyan_area:.0f}", 
-                      (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(frame, f"Green area: {green_area:.0f}", 
+                      (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            if cyan_center:
+            if green_center:
                 # Draw center point
-                cv2.circle(frame, cyan_center, 8, (255, 255, 0), -1)
-                cv2.circle(frame, cyan_center, 12, (255, 255, 255), 2)
-                cv2.putText(frame, "CYAN CENTER", 
-                          (cyan_center[0] + 15, cyan_center[1] - 10), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                cv2.circle(frame, green_center, 8, (0, 255, 0), -1)
+                cv2.circle(frame, green_center, 12, (255, 255, 255), 2)
+                cv2.putText(frame, "GREEN CENTER", 
+                          (green_center[0] + 15, green_center[1] - 10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
         # Draw all pink contours for debugging
         if pink_contours:
@@ -340,12 +355,12 @@ class BallCollector:
                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 192, 203), 2)
         
         # Draw heading line if both markers detected
-        if cyan_center and pink_center:
+        if green_center and pink_center:
             # Draw thick heading line
-            cv2.arrowedLine(frame, cyan_center, pink_center, (0, 255, 255), 4)  # Yellow arrow
+            cv2.arrowedLine(frame, green_center, pink_center, (0, 255, 255), 4)  # Yellow arrow
             
             # Show distance between markers
-            distance = math.hypot(pink_center[0] - cyan_center[0], pink_center[1] - cyan_center[1])
+            distance = math.hypot(pink_center[0] - green_center[0], pink_center[1] - green_center[1])
             cv2.putText(frame, f"Marker distance: {distance:.1f}px", 
                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
@@ -568,7 +583,7 @@ class BallCollector:
         cv2.destroyWindow("Calibration")
 
     def detect_balls(self, frame=None) -> List[Tuple[float, float, str]]:
-        """Detect balls using HSV color detection, return list of (x_cm, y_cm, color)"""
+        """Enhanced ball detection using multiple methods for robust white ball detection"""
         if frame is None:
             ret, frame = self.cap.read()
             if not ret:
@@ -578,152 +593,350 @@ class BallCollector:
         if self.homography_matrix is None:
             return []
         
-        # Advanced image enhancement for white ball detection
+        # === ENHANCED PREPROCESSING PIPELINE ===
         
-        # 1. Histogram equalization to improve contrast
-        frame_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        frame_lab[:, :, 0] = cv2.equalizeHist(frame_lab[:, :, 0])  # Equalize L channel
-        frame_enhanced = cv2.cvtColor(frame_lab, cv2.COLOR_LAB2BGR)
+        # 1. Advanced denoising while preserving edges
+        frame_denoised = cv2.fastNlMeansDenoisingColored(frame, None, 6, 6, 7, 21)
         
-        # 2. Apply adaptive gamma correction based on average brightness
+        # 2. Adaptive brightness enhancement
+        lab = cv2.cvtColor(frame_denoised, cv2.COLOR_BGR2LAB)
+        l_channel = lab[:, :, 0]
+        
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to L channel
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l_channel = clahe.apply(l_channel)
+        lab[:, :, 0] = l_channel
+        frame_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        # 3. Adaptive gamma correction based on local statistics
         gray = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2GRAY)
-        avg_brightness = np.mean(gray)
-        gamma = 1.8 if avg_brightness < 100 else 1.3  # More aggressive for darker images
-        frame_enhanced = np.power(frame_enhanced / 255.0, 1.0 / gamma)
-        frame_enhanced = (frame_enhanced * 255).astype(np.uint8)
+        mean_brightness = np.mean(gray)
+        std_brightness = np.std(gray)
         
-        # 3. Convert to HSV color space
+        # Adjust gamma based on image statistics
+        if mean_brightness < 80:
+            gamma = 0.7  # Brighten dark images
+        elif mean_brightness > 180:
+            gamma = 1.4  # Darken bright images
+        else:
+            gamma = 1.0  # Normal images
+        
+        # Apply gamma correction if needed
+        if gamma != 1.0:
+            frame_enhanced = np.power(frame_enhanced / 255.0, gamma)
+            frame_enhanced = (frame_enhanced * 255).astype(np.uint8)
+        
+        # 4. Convert to multiple color spaces for comprehensive detection
         hsv = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2LAB)
+        gray = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2GRAY)
         
-        # 4. Apply bilateral filter to reduce noise while preserving edges
-        hsv = cv2.bilateralFilter(hsv, 9, 75, 75)
+        # === MULTI-METHOD DETECTION ===
         
-        balls = []
+        # Method 1: Enhanced HSV color detection
+        hsv_mask = self._detect_balls_hsv(hsv)
         
-        # Combine all white ball masks for comprehensive detection
-        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        # Method 2: Brightness-based detection
+        brightness_mask = self._detect_balls_brightness(gray, lab)
         
-        # Detect each white ball range and combine masks
-        for color_name, (lower, upper) in BALL_COLORS.items():
-            # Create mask for this color range
-            mask = cv2.inRange(hsv, lower, upper)
-            combined_mask = cv2.bitwise_or(combined_mask, mask)
+        # Method 3: Edge-based circular detection
+        edge_mask = self._detect_balls_edges(gray)
         
-        # Refined morphological operations for better ball isolation
-        kernel_small = np.ones((3,3), np.uint8)
-        kernel_medium = np.ones((5,5), np.uint8)
+        # Combine all detection methods
+        combined_mask = cv2.bitwise_or(hsv_mask, brightness_mask)
+        combined_mask = cv2.bitwise_or(combined_mask, edge_mask)
         
-        # Remove small noise more aggressively
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_small, iterations=2)
-        # Fill holes and connect nearby regions
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_medium, iterations=1)
-        # Final cleanup to ensure smooth circular shapes
+        # === ADVANCED MORPHOLOGICAL PROCESSING ===
+        
+        # Adaptive kernel size based on image resolution
+        base_kernel_size = max(3, min(7, int(frame.shape[0] / 200)))
+        kernel_small = np.ones((base_kernel_size, base_kernel_size), np.uint8)
+        kernel_medium = np.ones((base_kernel_size + 2, base_kernel_size + 2), np.uint8)
+        
+        # Progressive morphological operations
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_medium, iterations=2)
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
         
-        # Find contours
-        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Distance transform for better separation
+        dist_transform = cv2.distanceTransform(combined_mask, cv2.DIST_L2, 5)
+        _, sure_fg = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, 0)
+        combined_mask = np.uint8(sure_fg)
         
-        # Process each contour with refined validation for white balls
+        # === CONTOUR DETECTION AND VALIDATION ===
+        
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        balls = []
+        
         for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < MIN_BALL_AREA or area > 1500:  # Tighter upper limit
-                continue
-            
-            # Enhanced circularity check with tighter threshold
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
-                continue
-            circularity = 4 * math.pi * area / (perimeter * perimeter)
-            if circularity < 0.6:  # Stricter circularity for white balls
-                continue
-            
-            # Bounding box analysis
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = w / h if h > 0 else 0
-            if aspect_ratio < 0.8 or aspect_ratio > 1.2:  # Even stricter aspect ratio
-                continue
-            
-            # Size consistency check - width and height should be similar to expected ball size
-            avg_size = (w + h) / 2
-            if avg_size < 8 or avg_size > 40:  # Expected pixel size range for balls
-                continue
-            
-            # Minimum enclosing circle validation
-            (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
-            circle_area = math.pi * radius * radius
-            area_ratio = area / circle_area if circle_area > 0 else 0
-            if area_ratio < 0.65:  # Stricter - contour should fill most of the circle
-                continue
-            
-            # Brightness validation with adaptive threshold
-            roi = frame_enhanced[y:y+h, x:x+w]
-            if roi.size > 0:
-                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                avg_brightness = np.mean(roi_gray)
-                max_brightness = np.max(roi_gray)
-                # Ball should have good brightness and contrast
-                if avg_brightness < 80 or max_brightness < 120:
-                    continue
-            
-            # Get center of contour
-            M = cv2.moments(contour)
-            if M["m00"] == 0:
-                continue
-            
-            x_px = int(M["m10"] / M["m00"])
-            y_px = int(M["m01"] / M["m00"])
-            
-            # Convert to cm using homography
-            pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-            pt_cm = cv2.perspectiveTransform(pt_px, 
-                                           np.linalg.inv(self.homography_matrix))[0][0]
-            x_cm, y_cm = pt_cm
-            
-            # Check if ball is within the calibrated field bounds
-            if not self.is_point_in_field(x_cm, y_cm):
-                continue
-            
-            # Check if ball is in ignored area (center obstacle)
-            if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-               IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                continue
-            
-            # Avoid duplicate detections by checking if we already have a ball nearby
-            duplicate = False
-            for existing_x, existing_y, _ in balls:
-                if math.hypot(x_cm - existing_x, y_cm - existing_y) < 3:  # Within 3cm (tighter)
-                    duplicate = True
-                    break
-            
-            if not duplicate:
-                balls.append((x_cm, y_cm, 'white'))
+            ball_candidate = self._validate_ball_contour(contour, frame_enhanced, gray)
+            if ball_candidate:
+                x_px, y_px = ball_candidate
+                
+                # Convert to cm using homography
+                pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
+                x_cm, y_cm = pt_cm
+                
+                # Final validation
+                if self._final_ball_validation(x_cm, y_cm, balls):
+                    balls.append((x_cm, y_cm, 'white'))
         
         return balls
+    
+    def _detect_balls_hsv(self, hsv):
+        """HSV-based ball detection with weighted combination"""
+        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        # Weights for different color ranges (based on reliability)
+        weights = {'white_main': 1.0, 'white_bright': 0.8, 'white_shadow': 0.6, 'white_dark': 0.4}
+        
+        for color_name, (lower, upper) in BALL_COLORS.items():
+            mask = cv2.inRange(hsv, lower, upper)
+            
+            # Apply Gaussian blur to soften the mask
+            mask = cv2.GaussianBlur(mask, (5, 5), 0)
+            
+            # Weight the mask based on reliability
+            weight = weights.get(color_name, 0.5)
+            mask = (mask * weight).astype(np.uint8)
+            
+            combined_mask = cv2.add(combined_mask, mask)
+        
+        # Threshold the weighted combination
+        _, combined_mask = cv2.threshold(combined_mask, 128, 255, cv2.THRESH_BINARY)
+        
+        return combined_mask
+    
+    def _detect_balls_brightness(self, gray, lab):
+        """Brightness and luminance-based detection for white objects"""
+        # Method 1: High brightness detection in grayscale
+        _, bright_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Method 2: High luminance in LAB space
+        l_channel = lab[:, :, 0]
+        _, lab_mask = cv2.threshold(l_channel, np.percentile(l_channel, 85), 255, cv2.THRESH_BINARY)
+        
+        # Method 3: Adaptive threshold for local brightness peaks
+        adaptive_mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                            cv2.THRESH_BINARY, 15, -5)
+        
+        # Combine brightness-based masks
+        brightness_mask = cv2.bitwise_or(bright_mask, lab_mask)
+        brightness_mask = cv2.bitwise_and(brightness_mask, adaptive_mask)
+        
+        return brightness_mask
+    
+    def _detect_balls_edges(self, gray):
+        """Edge-based circular object detection"""
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+        
+        # Use HoughCircles to detect circular objects
+        circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=30,
+                                 param1=50, param2=30, minRadius=5, maxRadius=50)
+        
+        # Create mask from detected circles
+        edge_mask = np.zeros(gray.shape, dtype=np.uint8)
+        if circles is not None:
+            circles = np.round(circles[0, :]).astype("int")
+            for (x, y, r) in circles:
+                # Draw filled circle on mask
+                cv2.circle(edge_mask, (x, y), r, 255, -1)
+        
+        return edge_mask
+    
+    def _validate_ball_contour(self, contour, frame_enhanced, gray):
+        """Comprehensive validation of ball contours"""
+        # Basic area check
+        area = cv2.contourArea(contour)
+        if area < MIN_BALL_AREA or area > 2000:  # Increased upper limit
+            return None
+        
+        # Enhanced circularity check
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter == 0:
+            return None
+        
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        if circularity < 0.5:  # More lenient for better detection
+            return None
+        
+        # Bounding rectangle analysis
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = w / h if h > 0 else 0
+        if aspect_ratio < 0.7 or aspect_ratio > 1.4:  # More lenient aspect ratio
+            return None
+        
+        # Size consistency
+        avg_size = (w + h) / 2
+        if avg_size < 6 or avg_size > 60:  # Broader size range
+            return None
+        
+        # Minimum enclosing circle analysis
+        (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+        circle_area = math.pi * radius * radius
+        area_ratio = area / circle_area if circle_area > 0 else 0
+        if area_ratio < 0.5:  # More lenient area ratio
+            return None
+        
+        # Convexity check - balls should be mostly convex
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        convexity = area / hull_area if hull_area > 0 else 0
+        if convexity < 0.8:  # Should be quite convex
+            return None
+        
+        # Enhanced brightness validation
+        roi = frame_enhanced[y:y+h, x:x+w]
+        if roi.size > 0:
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            
+            # Create mask for the contour within ROI
+            contour_shifted = contour - [x, y]  # Shift contour to ROI coordinates
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [contour_shifted], 255)
+            
+            # Calculate statistics only within the contour
+            masked_pixels = roi_gray[mask > 0]
+            if len(masked_pixels) == 0:
+                return None
+            
+            avg_brightness = np.mean(masked_pixels)
+            max_brightness = np.max(masked_pixels)
+            brightness_std = np.std(masked_pixels)
+            
+            # Adaptive brightness thresholds
+            min_avg_brightness = 70 if np.mean(gray) < 120 else 90
+            min_max_brightness = 100 if np.mean(gray) < 120 else 130
+            
+            if avg_brightness < min_avg_brightness or max_brightness < min_max_brightness:
+                return None
+            
+            # Check for reasonable brightness variation (not too flat)
+            if brightness_std < 5:
+                return None
+        
+        # Get center of mass for more accurate center
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            return None
+        
+        center_x = M["m10"] / M["m00"]
+        center_y = M["m01"] / M["m00"]
+        
+        return (center_x, center_y)
+    
+    def _final_ball_validation(self, x_cm, y_cm, existing_balls):
+        """Final validation checks for ball position"""
+        # Check if ball is within the calibrated field bounds
+        if not self.is_point_in_field(x_cm, y_cm):
+            return False
+        
+        # Check if ball is in ignored area (center obstacle)
+        if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+           IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+            return False
+        
+        # Avoid duplicate detections with adaptive distance threshold
+        min_distance = 4  # Slightly increased for better duplicate removal
+        for existing_x, existing_y, _ in existing_balls:
+            if math.hypot(x_cm - existing_x, y_cm - existing_y) < min_distance:
+                return False
+        
+        return True
 
     def draw_detected_balls(self, frame, balls):
-        """Draw detected balls on the frame"""
+        """Draw detected balls on the frame with enhanced visualization"""
         ball_colors_bgr = {
             'orange': (0, 140, 255),  # Orange in BGR
             'white': (255, 255, 255)  # White in BGR
         }
         
-        for x_cm, y_cm, color_name in balls:
+        for i, (x_cm, y_cm, color_name) in enumerate(balls):
             if self.homography_matrix is not None:
                 # Convert cm position back to pixels for drawing
                 pt_cm = np.array([[[x_cm, y_cm]]], dtype="float32")
                 pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
                 
-                # Draw ball
+                # Draw ball with enhanced visualization
                 bgr_color = ball_colors_bgr.get(color_name, (255, 255, 255))
-                cv2.circle(frame, tuple(pt_px), 15, bgr_color, -1)
-                cv2.circle(frame, tuple(pt_px), 17, (255, 255, 255), 2)
                 
-                # Add label
-                cv2.putText(frame, color_name, 
-                          (pt_px[0] + 20, pt_px[1] + 5),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr_color, 2)
+                # Main ball circle
+                cv2.circle(frame, tuple(pt_px), 15, bgr_color, -1)
+                cv2.circle(frame, tuple(pt_px), 17, (0, 255, 0), 3)  # Green outline
+                
+                # Ball number
+                cv2.putText(frame, str(i+1), 
+                          (pt_px[0] - 5, pt_px[1] + 5),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                
+                # Position info
+                cv2.putText(frame, f"({x_cm:.1f},{y_cm:.1f})", 
+                          (pt_px[0] + 20, pt_px[1] - 10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Distance from robot
+                if hasattr(self, 'robot_pos') and self.robot_pos:
+                    distance = math.hypot(x_cm - self.robot_pos[0], y_cm - self.robot_pos[1])
+                    cv2.putText(frame, f"{distance:.1f}cm", 
+                              (pt_px[0] + 20, pt_px[1] + 10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
         
         return frame
+    
+    def show_detection_debug(self, frame):
+        """Show debug visualization of the detection process"""
+        if self.homography_matrix is None:
+            return frame
+        
+        # Get enhanced frame
+        frame_denoised = cv2.fastNlMeansDenoisingColored(frame, None, 6, 6, 7, 21)
+        lab = cv2.cvtColor(frame_denoised, cv2.COLOR_BGR2LAB)
+        l_channel = lab[:, :, 0]
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l_channel = clahe.apply(l_channel)
+        lab[:, :, 0] = l_channel
+        frame_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        # Convert to color spaces
+        hsv = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2GRAY)
+        
+        # Get detection masks
+        hsv_mask = self._detect_balls_hsv(hsv)
+        brightness_mask = self._detect_balls_brightness(gray, lab)
+        edge_mask = self._detect_balls_edges(gray)
+        
+        # Create debug visualization
+        debug_frame = np.zeros((frame.shape[0] * 2, frame.shape[1] * 2, 3), dtype=np.uint8)
+        
+        # Top-left: Original enhanced frame
+        debug_frame[0:frame.shape[0], 0:frame.shape[1]] = frame_enhanced
+        
+        # Top-right: HSV mask
+        hsv_colored = cv2.applyColorMap(hsv_mask, cv2.COLORMAP_JET)
+        debug_frame[0:frame.shape[0], frame.shape[1]:frame.shape[1]*2] = hsv_colored
+        
+        # Bottom-left: Brightness mask
+        brightness_colored = cv2.applyColorMap(brightness_mask, cv2.COLORMAP_HOT)
+        debug_frame[frame.shape[0]:frame.shape[0]*2, 0:frame.shape[1]] = brightness_colored
+        
+        # Bottom-right: Edge mask
+        edge_colored = cv2.applyColorMap(edge_mask, cv2.COLORMAP_COOL)
+        debug_frame[frame.shape[0]:frame.shape[0]*2, frame.shape[1]:frame.shape[1]*2] = edge_colored
+        
+        # Add labels
+        cv2.putText(debug_frame, "Enhanced Frame", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(debug_frame, "HSV Detection", (frame.shape[1] + 10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(debug_frame, "Brightness Detection", (10, frame.shape[0] + 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(debug_frame, "Edge Detection", (frame.shape[1] + 10, frame.shape[0] + 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        return debug_frame
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
         """Calculate approach position and angle for a target position"""
@@ -1601,6 +1814,7 @@ class BallCollector:
                         "ENTER - Execute LIVE autonomous",
                         "S - Start LIVE autonomous collection", 
                         "A - Adaptive real-time mode",
+                        "D - Debug detection view",
                         "1 - Select Goal A (small)",
                         "2 - Select Goal B (large)",
                         "3 - Toggle goal sides",
@@ -1654,6 +1868,35 @@ class BallCollector:
                     logger.info("🔄 Starting adaptive real-time autonomous mode...")
                     self.run_adaptive_autonomous()
                     break  # Exit main loop after adaptive mode
+                elif key == ord('d') or key == ord('D'):
+                    # Show debug detection view
+                    logger.info("🔍 Showing detection debug view...")
+                    while True:
+                        ret, debug_frame = self.cap.read()
+                        if not ret:
+                            continue
+                        
+                        # Update robot position
+                        self.update_robot_position(debug_frame)
+                        
+                        # Show debug visualization
+                        debug_view = self.show_detection_debug(debug_frame)
+                        
+                        # Detect and draw balls
+                        balls = self.detect_balls(debug_frame)
+                        debug_frame = self.draw_detected_balls(debug_frame, balls)
+                        
+                        # Show both normal and debug view
+                        combined_view = np.hstack([debug_frame, cv2.resize(debug_view, (debug_frame.shape[1], debug_frame.shape[0]))])
+                        
+                        cv2.putText(combined_view, f"Detected {len(balls)} balls - Press 'Q' to exit debug", 
+                                  (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        cv2.imshow("Detection Debug", combined_view)
+                        
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            cv2.destroyWindow("Detection Debug")
+                            break
                 elif key == ord(' ') and hasattr(self, 'current_path'):
                     # Show preview
                     preview_frame = frame.copy()
