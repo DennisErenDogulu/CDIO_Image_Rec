@@ -175,8 +175,6 @@ class BallCollector:
     def draw_walls(self, frame):
         """Draw walls, safety margins, and starting box on the frame"""
         if not self.homography_matrix is None and self.walls:
-            # First draw the starting box
-            frame = self.draw_starting_box(frame)
             
             # Create a semi-transparent overlay for walls
             overlay = frame.copy()
