@@ -1712,8 +1712,8 @@ class BallCollector:
         return grid_path, ball_cells
 
     def execute_autonomous_collection(self, initial_path=None):
-        """Execute autonomous ball collection with continuous position monitoring"""
-        logger.info("🤖 Starting autonomous collection with continuous monitoring...")
+        """Execute autonomous ball collection with position verification"""
+        logger.info("🤖 Starting autonomous collection...")
         
         collected_balls = 0
         max_balls_per_session = 10  # Prevent infinite loops
@@ -1749,7 +1749,7 @@ class BallCollector:
                     # Calculate approach position (slightly before the ball)
                     approach_pos, collection_angle = self.get_approach_vector((ball_x, ball_y))
                     
-                    # Move to approach position with continuous monitoring
+                    # Move to approach position
                     if not self.move_to_position(approach_pos):
                         logger.warning("Failed to reach approach position")
                         continue
@@ -1761,6 +1761,7 @@ class BallCollector:
                         if not self.turn(turn_angle):
                             logger.warning("Failed to turn towards ball")
                             continue
+                        self.robot_heading = collection_angle
                     
                     # Calculate collection distance
                     collection_distance = math.hypot(ball_x - approach_pos[0], ball_y - approach_pos[1])
@@ -1780,9 +1781,10 @@ class BallCollector:
                         continue
                         
                     # If we're close to capacity or near a wall, deliver balls
-                    if collected_balls >= 3 or self.should_deliver_balls():
+                    if collected_balls >= 3:
                         if self.deliver_balls():
                             collected_balls = 0
+                            logger.info("✅ Successfully delivered balls")
                         else:
                             logger.error("Failed to deliver balls")
                             return False
@@ -2403,7 +2405,7 @@ class BallCollector:
             self.cap.release()
             cv2.destroyAllWindows()
 
-    def _verify_position(self, target_pos, max_retries=3, tolerance_cm=2.0):
+    def _verify_position(self, target_pos, max_retries=3, tolerance_cm=3.0):
         """Verify current position matches expected position within tolerance"""
         for retry in range(max_retries):
             ret, frame = self.cap.read()
@@ -2424,88 +2426,76 @@ class BallCollector:
                 
         return False
         
-    def _execute_movement_with_verification(self, target_pos, movement_func, *args):
-        """Execute a movement with position verification and correction"""
-        max_attempts = 3
-        min_correction_distance = 2.0  # cm
-        
-        for attempt in range(max_attempts):
-            # Execute the movement
-            if not movement_func(*args):
-                logger.error("Movement command failed")
-                return False
-                
-            # Verify position
-            if self._verify_position(target_pos):
-                return True
-                
-            # If not at target, calculate correction
-            ret, frame = self.cap.read()
-            if not ret or not self.update_robot_position(frame):
-                continue
-                
-            current_x, current_y = self.robot_pos
-            target_x, target_y = target_pos
-            
-            # Calculate correction vector
-            dx = target_x - current_x
-            dy = target_y - current_y
-            correction_distance = math.hypot(dx, dy)
-            
-            if correction_distance < min_correction_distance:
-                logger.info("Close enough to target")
-                return True
-                
-            # Calculate correction angle
-            correction_angle = math.degrees(math.atan2(dy, dx)) - self.robot_heading
-            correction_angle = (correction_angle + 180) % 360 - 180  # Normalize to [-180, 180]
-            
-            logger.info(f"Attempting correction: distance={correction_distance:.1f}cm, angle={correction_angle:.1f}°")
-            
-            # Execute correction
-            if abs(correction_angle) > 10:
-                self.turn(correction_angle)
-            self.move(correction_distance)
-            
-        return False
-
-    def move_to_position(self, target_pos, backward_allowed=True):
-        """Move to a target position with continuous monitoring"""
+    def move_to_position(self, target_pos, max_attempts=2):
+        """Move to a target position with position verification"""
         if not self.update_robot_position():
             logger.error("Cannot determine current position")
             return False
             
-        current_x, current_y = self.robot_pos
-        target_x, target_y = target_pos
-        
-        # Calculate initial movement
-        dx = target_x - current_x
-        dy = target_y - current_y
-        distance = math.hypot(dx, dy)
-        angle = math.degrees(math.atan2(dy, dx))
-        
-        # Calculate turn angle
-        turn_angle = angle - self.robot_heading
-        turn_angle = (turn_angle + 180) % 360 - 180  # Normalize to [-180, 180]
-        
-        # Check if backward movement would be better
-        use_backward = False
-        if backward_allowed:
-            backward_turn = (angle + 180) - self.robot_heading
+        for attempt in range(max_attempts):
+            current_x, current_y = self.robot_pos
+            target_x, target_y = target_pos
+            
+            # Calculate movement needed
+            dx = target_x - current_x
+            dy = target_y - current_y
+            distance = math.hypot(dx, dy)
+            
+            # Skip if we're already very close
+            if distance < 2.0:
+                logger.info("Already at target position")
+                return True
+                
+            # Calculate turn angle needed
+            target_angle = math.degrees(math.atan2(dy, dx))
+            turn_angle = target_angle - self.robot_heading
+            turn_angle = (turn_angle + 180) % 360 - 180  # Normalize to [-180, 180]
+            
+            # Determine if backward movement would be better
+            backward_angle = (target_angle + 180) % 360
+            backward_turn = backward_angle - self.robot_heading
             backward_turn = (backward_turn + 180) % 360 - 180
-            if abs(backward_turn) < abs(turn_angle):
-                turn_angle = backward_turn
+            
+            use_backward = False
+            if abs(backward_turn) < abs(turn_angle) and distance < 30:
                 use_backward = True
+                turn_angle = backward_turn
+            
+            # Execute turn if needed
+            if abs(turn_angle) > 5:
+                logger.info(f"Turning {turn_angle:.1f}°")
+                if not self.turn(turn_angle):
+                    logger.error("Turn failed")
+                    continue
+                
+                # Update heading
+                self.robot_heading = (self.robot_heading + turn_angle) % 360
+                
+                # Verify position after turn
+                if not self.update_robot_position():
+                    logger.error("Lost position after turn")
+                    continue
+            
+            # Execute movement
+            if use_backward:
+                logger.info(f"Moving backward {distance:.1f}cm")
+                if not self.move(-distance):
+                    logger.error("Backward movement failed")
+                    continue
+            else:
+                logger.info(f"Moving forward {distance:.1f}cm")
+                if not self.move(distance):
+                    logger.error("Forward movement failed")
+                    continue
+            
+            # Verify final position
+            if self._verify_position(target_pos):
+                return True
+            
+            # If we're here, we didn't reach the target - try again if attempts remain
+            logger.info("Position verification failed, retrying..." if attempt < max_attempts - 1 else "Failed to reach target position")
         
-        # Execute the movement sequence
-        if abs(turn_angle) > 5:
-            if not self._execute_movement_with_verification(target_pos, self.turn, turn_angle):
-                return False
-        
-        if use_backward:
-            return self._execute_movement_with_verification(target_pos, self.move, -distance)
-        else:
-            return self._execute_movement_with_verification(target_pos, self.move, distance)
+        return False
 
 if __name__ == "__main__":
     collector = BallCollector()
