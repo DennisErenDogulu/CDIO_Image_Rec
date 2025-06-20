@@ -3,12 +3,10 @@
 Continuous Ball Collection Client
 
 This script implements a continuous ball collection strategy:
-1. Detect balls in the camera view
-2. For each group of up to 3 closest balls:
-   a. Calculate optimal approach angles
-   b. Move to each ball, collect it
-   c. Return to goal when 3 balls collected
-3. Repeat until no balls remain
+1. Detect balls using local YOLOv8 model
+2. Track robot position using colored markers
+3. Plan and execute paths to collect balls
+4. Return to goal area to deliver balls
 """
 
 import cv2
@@ -20,63 +18,44 @@ import numpy as np
 from typing import List, Tuple, Optional
 from ultralytics import YOLO
 import time
-from roboflow import Roboflow
 
 # Configuration
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 
 # Model configuration
-from roboflow import Roboflow
+MODEL_PATH = "weights(2).pt"  # Using local weights
+CONFIDENCE_THRESHOLD = 0.5
+MODEL_IMAGE_SIZE = 640  # YOLOv8 default size
 
-# Roboflow configuration
-ROBOFLOW_API_KEY = "LdvRakmEpZizttEFtQap"
-RF_WORKSPACE = "legoms3"
-RF_PROJECT = "golfbot-fyxfe-etdz0"
-RF_VERSION = 2
+# Color detection ranges (HSV)
+GREEN_LOWER = np.array([35, 50, 50])   # Robot base marker
+GREEN_UPPER = np.array([85, 255, 255])
+PINK_LOWER = np.array([145, 50, 50])   # Direction marker
+PINK_UPPER = np.array([175, 255, 255])
 
-CONFIDENCE_THRESHOLD = 0.50   # Match Roboflow visualization (50%)
-IOU_THRESHOLD = 0.50         # Match Roboflow visualization (50%)
-OPACITY_THRESHOLD = 0.75    # Opacity threshold (75%)
-TARGET_CLASS = ["white_ball", "orange_ball"]  # Classes to collect
-OBSTACLE_CLASS = ["cross"]   # Classes to avoid
-MODEL_IMAGE_SIZE = 640      # Model expects 640x640 input
-
-# Wall configuration
-WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
-GOAL_WIDTH = 30  # cm, width of the goal area to keep clear
+# Field dimensions (cm)
+FIELD_WIDTH_CM = 180
+FIELD_HEIGHT_CM = 120
 
 # Robot configuration
 ROBOT_WIDTH = 15   # cm
 ROBOT_LENGTH = 20  # cm
+ROBOT_START_X = 20  # cm from left edge
+ROBOT_START_Y = 20  # cm from bottom edge
+ROBOT_START_HEADING = 0  # degrees (0 = facing east)
 
-# Physical constraints
-FIELD_WIDTH_CM = 180
-FIELD_HEIGHT_CM = 120
+# Collection parameters
+MAX_BALLS_PER_TRIP = 3      # Maximum balls to collect before delivery
 COLLECTION_DISTANCE_CM = 20  # Distance to move forward when collecting
 APPROACH_DISTANCE_CM = 30    # Distance to keep from ball for approach
-MAX_BALLS_PER_TRIP = 3
-REASSESS_DISTANCE_CM = 15    # Distance to move before reassessing
-REASSESS_PAUSE_SEC = 1.5     # Time to pause for reassessment
-
-# Color detection ranges (HSV)
-GREEN_LOWER = np.array([40, 40, 40])
-GREEN_UPPER = np.array([80, 255, 255])
-PINK_LOWER = np.array([140, 40, 40])
-PINK_UPPER = np.array([170, 255, 255])
+WALL_SAFETY_MARGIN = 15     # cm to keep away from walls
 
 # Ignored area (center obstacle)
 IGNORED_AREA = {
     "x_min": 50, "x_max": 100,
     "y_min": 50, "y_max": 100
 }
-
-# Camera configuration
-CAMERA_WIDTH = 640   # Match model's input size
-CAMERA_HEIGHT = 640  # Match model's input size
-CAMERA_FPS = 30
-CAMERA_HEIGHT_CM = 180  # Camera is 180cm above field
-CAMERA_ANGLE = 90  # Assuming camera points straight down (90 degrees)
 
 # Setup logging
 logging.basicConfig(
@@ -85,272 +64,125 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def point_to_line_distance(point, line_start, line_end):
-    """Calculate the shortest distance from a point to a line segment"""
-    x, y = point
-    x1, y1 = line_start
-    x2, y2 = line_end
-    
-    # Vector from line start to end
-    line_vec = (x2 - x1, y2 - y1)
-    # Vector from line start to point
-    point_vec = (x - x1, y - y1)
-    # Length of line
-    line_len = math.hypot(line_vec[0], line_vec[1])
-    
-    if line_len == 0:
-        return math.hypot(point_vec[0], point_vec[1])
-    
-    # Project point vector onto line vector to get distance along line
-    t = max(0, min(1, (point_vec[0] * line_vec[0] + point_vec[1] * line_vec[1]) / (line_len * line_len)))
-    
-    # Calculate projection point
-    proj_x = x1 + t * line_vec[0]
-    proj_y = y1 + t * line_vec[1]
-    
-    return math.hypot(x - proj_x, y - proj_y)
-
-def check_wall_collision(start_pos, end_pos, walls, safety_margin):
-    """Check if a path between two points collides with any walls"""
-    for wall_start_x, wall_start_y, wall_end_x, wall_end_y in walls:
-        # Check if either endpoint is too close to the wall
-        if (point_to_line_distance(start_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin or
-            point_to_line_distance(end_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin):
-            return True
-            
-        # Check if path intersects with wall
-        # Using line segment intersection formula
-        x1, y1 = start_pos
-        x2, y2 = end_pos
-        x3, y3 = wall_start_x, wall_start_y
-        x4, y4 = wall_end_x, wall_end_y
-        
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if denom == 0:  # Lines are parallel
-            continue
-            
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-        
-        if 0 <= t <= 1 and 0 <= u <= 1:
-            return True
-            
-    return False
-
-def detect_colored_marker(frame, lower_color, upper_color):
-    """Detect colored marker in frame and return its center and orientation"""
-    # Convert to HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    # Create mask and find contours
-    mask = cv2.inRange(hsv, lower_color, upper_color)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return None, None
-    
-    # Find largest contour
-    largest_contour = max(contours, key=cv2.contourArea)
-    
-    # Get center
-    M = cv2.moments(largest_contour)
-    if M["m00"] == 0:
-        return None, None
-        
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-    
-    # Get orientation using PCA
-    data_pts = np.float32(largest_contour).reshape(-1, 2)
-    mean, eigenvectors = cv2.PCACompute(data_pts, mean=np.float32([]))
-    
-    # Calculate angle
-    angle = math.degrees(math.atan2(eigenvectors[0][1], eigenvectors[0][0]))
-    
-    return (cx, cy), angle
-
 class BallCollector:
     def __init__(self):
-        # Initialize Roboflow
+        # Initialize YOLO model
         try:
-            rf = Roboflow(api_key=ROBOFLOW_API_KEY)
-            self.project = rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
-            self.model = self.project.version(RF_VERSION).model
-            logger.info("Successfully connected to Roboflow API")
+            self.model = YOLO(MODEL_PATH)
+            logger.info("Successfully loaded YOLO model from %s", MODEL_PATH)
         except Exception as e:
-            logger.error("Failed to initialize Roboflow: %s", e)
+            logger.error("Failed to load YOLO model: %s", e)
             raise
 
         # Initialize camera
-        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
-        
-        # Set camera properties to match model's expected input
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-        
+
+        # Set camera properties
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+
         # Robot state
-        self.robot_pos = None
-        self.robot_heading = None
-        self.detected_obstacles = []
+        self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)
+        self.robot_heading = ROBOT_START_HEADING
         
-        # Camera calibration parameters
+        # Calibration
         self.calibration_points = []
         self.homography_matrix = None
-        self.camera_matrix = None
-        self.dist_coeffs = None
+
+    def detect_markers(self, frame):
+        """Detect green base and pink direction markers"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Wall configuration
-        self.walls = []  # Will be set after calibration
+        # Detect green base marker
+        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Goal dimensions and positions
-        self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal
-        self.goal_approach_distance = 20  # Distance to stop in front of goal
-        self.delivery_time = 2.0  # Seconds to run collector in reverse
+        # Detect pink direction marker
+        pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
+        pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Position tracking
-        self.last_pos_update = 0
-        self.pos_update_interval = 0.2  # Update position every 200ms
-
-    def setup_walls(self):
-        """Set up wall segments based on calibration points, excluding goal areas"""
-        if len(self.calibration_points) != 4:
-            return
-
-        # Calculate goal positions (in cm)
-        goal_y_min = (FIELD_HEIGHT_CM / 2) - (GOAL_WIDTH / 2)
-        goal_y_max = (FIELD_HEIGHT_CM / 2) + (GOAL_WIDTH / 2)
-
-        # Create wall segments with small safety margin
-        margin = WALL_SAFETY_MARGIN
-        self.walls = [
-            # Bottom wall (excluding goal)
-            (margin, margin, FIELD_WIDTH_CM - margin, margin),
-            
-            # Top wall (excluding goal)
-            (margin, FIELD_HEIGHT_CM - margin, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin),
-            
-            # Left wall (split into two parts to exclude goal)
-            (margin, margin, margin, goal_y_min),
-            (margin, goal_y_max, margin, FIELD_HEIGHT_CM - margin),
-            
-            # Right wall (split into two parts to exclude goal)
-            (FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_y_min),
-            (FIELD_WIDTH_CM - margin, goal_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin)
-        ]
-
-    def draw_walls(self, frame):
-        """Draw walls, safety margins, and starting box on the frame"""
-        if not self.homography_matrix is None and self.walls:
-            
-            # Create a semi-transparent overlay for walls
-            overlay = frame.copy()
-            
-            # Draw each wall segment
-            for wall in self.walls:
-                # Convert wall endpoints from cm to pixels
-                start_cm = np.array([[[wall[0], wall[1]]]], dtype="float32")
-                end_cm = np.array([[[wall[2], wall[3]]]], dtype="float32")
-                
-                start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
-                end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
-                
-                # Draw the wall line
-                cv2.line(overlay, tuple(start_px), tuple(end_px), (0, 0, 255), 2)
-                
-                # Draw safety margin area (semi-transparent)
-                margin_pts = []
-                angle = math.atan2(end_px[1] - start_px[1], end_px[0] - start_px[0])
-                margin_px = int(WALL_SAFETY_MARGIN * 10)  # Convert cm to approximate pixels
-                
-                # Calculate margin points
-                dx = int(margin_px * math.sin(angle))
-                dy = int(margin_px * math.cos(angle))
-                
-                margin_pts = np.array([
-                    [start_px[0] - dx, start_px[1] + dy],
-                    [end_px[0] - dx, end_px[1] + dy],
-                    [end_px[0] + dx, end_px[1] - dy],
-                    [start_px[0] + dx, start_px[1] - dy]
-                ], np.int32)
-                
-                # Draw safety margin area
-                cv2.fillPoly(overlay, [margin_pts], (0, 0, 255, 128))
-            
-            # Blend the overlay with the original frame
-            alpha = 0.3
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        # Find largest green contour
+        green_center = None
+        if green_contours:
+            largest_green = max(green_contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_green) > 100:
+                M = cv2.moments(largest_green)
+                if M["m00"] != 0:
+                    green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
-        return frame
-
-    def send_command(self, command: str, **params) -> bool:
-        """Send a command to the EV3 server"""
-        try:
-            with socket.create_connection((EV3_IP, EV3_PORT), timeout=15) as s:  # Increased timeout for longer movements
-                # Prepare command
-                message = {
-                    "command": command,
-                    **params
-                }
-                
-                # Send command
-                s.sendall((json.dumps(message) + "\n").encode("utf-8"))
-                
-                # Get response
-                response = s.recv(1024).decode("utf-8").strip()
-                return response == "OK"
-                
-        except socket.timeout:
-            logger.error("Command timed out - robot might still be moving")
-            return False
-        except Exception as e:
-            logger.error("Failed to send command: {}".format(e))
-            return False
-
-    def move(self, distance_cm: float) -> bool:
-        """Move forward/backward by distance_cm"""
-        return self.send_command("MOVE", distance=distance_cm)
-
-    def turn(self, angle_deg: float) -> bool:
-        """Turn by angle_deg (positive = CCW)"""
-        return self.send_command("TURN", angle=angle_deg)
-
-    def collect(self, distance_cm: float) -> bool:
-        """Move forward slowly while collecting"""
-        return self.send_command("COLLECT", distance=distance_cm)
-
-    def stop(self) -> bool:
-        """Stop all motors"""
-        return self.send_command("STOP")
-
-    def calculate_perspective_correction(self, x_cm: float, y_cm: float) -> Tuple[float, float]:
-        """
-        Correct for perspective distortion based on camera height and position
-        """
-        if self.homography_matrix is None:
-            return x_cm, y_cm
-
-        # Calculate distance from camera center in cm
-        center_x = FIELD_WIDTH_CM / 2
-        center_y = FIELD_HEIGHT_CM / 2
-        dx = x_cm - center_x
-        dy = y_cm - center_y
-        distance = math.sqrt(dx*dx + dy*dy)
-
-        # Calculate correction factor based on camera height and distance
-        # Using simple trigonometry for perspective correction
-        angle_rad = math.atan2(distance, CAMERA_HEIGHT_CM)
-        correction_factor = CAMERA_HEIGHT_CM / math.cos(angle_rad)
+        # Find largest pink contour
+        pink_center = None
+        if pink_contours:
+            largest_pink = max(pink_contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_pink) > 50:
+                M = cv2.moments(largest_pink)
+                if M["m00"] != 0:
+                    pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
-        # Apply correction to coordinates
-        if distance > 0:
-            correction_ratio = correction_factor / CAMERA_HEIGHT_CM
-            x_corrected = center_x + dx * correction_ratio
-            y_corrected = center_y + dy * correction_ratio
-            return x_corrected, y_corrected
-        return x_cm, y_cm
+        return green_center, pink_center
+
+    def update_robot_position(self, frame):
+        """Update robot position and heading based on visual markers"""
+        green_center, pink_center = self.detect_markers(frame)
+        
+        if green_center and pink_center and self.homography_matrix is not None:
+            # Convert green center (robot base) to cm coordinates
+            green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
+            green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
+            
+            # Convert pink center (direction marker) to cm coordinates
+            pink_px = np.array([[[float(pink_center[0]), float(pink_center[1])]]], dtype="float32")
+            pink_cm = cv2.perspectiveTransform(pink_px, np.linalg.inv(self.homography_matrix))[0][0]
+            
+            # Update robot position and heading
+            self.robot_pos = (green_cm[0], green_cm[1])
+            dx = pink_cm[0] - green_cm[0]
+            dy = pink_cm[1] - green_cm[1]
+            self.robot_heading = math.degrees(math.atan2(dy, dx))
+            
+            return True
+        return False
+
+    def detect_balls(self) -> List[Tuple[float, float, str]]:
+        """Detect balls in current camera view, return list of (x_cm, y_cm, label)"""
+        ret, frame = self.cap.read()
+        if not ret:
+            return []
+
+        # Run YOLOv8 inference
+        results = self.model(frame, conf=CONFIDENCE_THRESHOLD)[0]
+        balls = []
+
+        # Process detections
+        for det in results.boxes.data.tolist():
+            x, y, x2, y2, conf, cls = det
+            
+            # Calculate center point
+            center_x = (x + x2) / 2
+            center_y = (y + y2) / 2
+            
+            # Convert to cm using homography if available
+            if self.homography_matrix is not None:
+                pt_px = np.array([[[center_x, center_y]]], dtype="float32")
+                pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
+                x_cm, y_cm = pt_cm
+                
+                # Skip if in ignored area
+                if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                    class_name = results.names[int(cls)]
+                    balls.append((x_cm, y_cm, class_name))
+                    
+                    # Draw detection for debugging
+                    cv2.rectangle(frame, (int(x), int(y)), (int(x2), int(y2)), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{class_name} {conf:.2f}",
+                              (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX,
+                              0.5, (0, 255, 0), 2)
+
+        return balls
 
     def calibrate(self):
         """Perform camera calibration by clicking 4 corners"""
@@ -361,45 +193,16 @@ class BallCollector:
                     logger.info(f"Corner {len(self.calibration_points)} set: ({x}, {y})")
 
                 if len(self.calibration_points) == 4:
-                    # Calculate field corners in real-world coordinates (cm)
-                    # Assuming camera is centered above field
-                    field_corners_cm = np.array([
-                        [0, 0],  # Bottom-left
-                        [FIELD_WIDTH_CM, 0],  # Bottom-right
-                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM],  # Top-right
-                        [0, FIELD_HEIGHT_CM]  # Top-left
-                    ], dtype="float32")
-
-                    # Convert clicked points to numpy array
-                    image_points = np.array(self.calibration_points, dtype="float32")
-
                     # Calculate homography matrix
-                    self.homography_matrix = cv2.getPerspectiveTransform(field_corners_cm, image_points)
-
-                    # Estimate camera parameters
-                    # This helps with perspective correction
-                    object_points = np.array([
-                        [0, 0, 0],
-                        [FIELD_WIDTH_CM, 0, 0],
-                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM, 0],
-                        [0, FIELD_HEIGHT_CM, 0]
+                    dst_pts = np.array([
+                        [0, 0],
+                        [FIELD_WIDTH_CM, 0],
+                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM],
+                        [0, FIELD_HEIGHT_CM]
                     ], dtype="float32")
-                    
-                    image_points_3d = np.array(self.calibration_points, dtype="float32")
-                    image_points_3d = image_points_3d.reshape(-1, 1, 2)
-                    
-                    # Assuming no lens distortion for simplicity
-                    self.dist_coeffs = np.zeros((4,1))
-                    
-                    # Estimate camera matrix
-                    self.camera_matrix, _ = cv2.calibrateCamera(
-                        [object_points], [image_points_3d],
-                        (CAMERA_WIDTH, CAMERA_HEIGHT),
-                        None, None,
-                        flags=cv2.CALIB_USE_INTRINSIC_GUESS
-                    )
-
-                    logger.info("✅ Calibration complete with perspective correction")
+                    src_pts = np.array(self.calibration_points, dtype="float32")
+                    self.homography_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
+                    logger.info("✅ Calibration complete")
 
         cv2.namedWindow("Calibration")
         cv2.setMouseCallback("Calibration", mouse_callback)
@@ -421,86 +224,43 @@ class BallCollector:
         
         cv2.destroyWindow("Calibration")
 
-    def detect_balls(self) -> List[Tuple[float, float, str]]:
-        ret, frame = self.cap.read()
-        if not ret:
-            return []
-
+    def send_command(self, command: str, **params) -> bool:
+        """Send a command to the EV3 server"""
         try:
-            # Get predictions from Roboflow
-            predictions = self.model.predict(frame, confidence=CONFIDENCE_THRESHOLD, overlap=IOU_THRESHOLD).json()
-            
-            balls = []
-            obstacles = []
-
-            # Process predictions
-            for pred in predictions.get('predictions', []):
-                x = pred['x']
-                y = pred['y']
-                width = pred['width']
-                height = pred['height']
-                confidence = pred['confidence']
-                class_name = pred['class']
-
-                # Calculate opacity
-                opacity = (width * height) / (CAMERA_WIDTH * CAMERA_HEIGHT)
-
-                # Skip if too small
-                if opacity < OPACITY_THRESHOLD:
-                    continue
-
-                # Convert detection point to real-world cm using homography
-                if self.homography_matrix is not None:
-                    pt_px = np.array([[[x, y]]], dtype="float32")
-                    pt_cm = cv2.perspectiveTransform(
-                        pt_px, np.linalg.inv(self.homography_matrix)
-                    )[0][0]
-                    x_cm, y_cm = pt_cm
-
-                    # Apply perspective correction
-                    x_cm, y_cm = self.calculate_perspective_correction(x_cm, y_cm)
-
-                    # Ignore detections in the ignored area
-                    if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                        IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                        continue
-
-                    # Store balls and obstacles separately
-                    if class_name in TARGET_CLASS:
-                        balls.append((x_cm, y_cm, class_name))
-                        color = (0, 255, 0)  # Green for balls
-                    elif class_name in OBSTACLE_CLASS:
-                        obstacles.append((x_cm, y_cm, class_name))
-                        color = (0, 0, 255)  # Red for obstacles
-
-                    # Draw detection for debugging
-                    x1 = int(x - width/2)
-                    y1 = int(y - height/2)
-                    x2 = int(x + width/2)
-                    y2 = int(y + height/2)
-                    
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, f"{class_name} {confidence:.2f}",
-                               (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
-                               0.5, color, 2)
-
-                    # Draw corrected position for debugging
-                    cv2.circle(frame, (int(x), int(y)), 3, (255, 255, 0), -1)
-                    cv2.putText(frame, f"({x_cm:.1f}, {y_cm:.1f})",
-                               (int(x) + 10, int(y) + 20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-            # Store obstacles for path planning
-            self.detected_obstacles = obstacles
-            return balls
-
+            with socket.create_connection((EV3_IP, EV3_PORT), timeout=5) as s:
+                message = {
+                    "command": command,
+                    **params
+                }
+                s.sendall((json.dumps(message) + "\n").encode("utf-8"))
+                response = s.recv(1024).decode("utf-8").strip()
+                return response == "OK"
         except Exception as e:
-            logger.error(f"Error during detection: {e}")
-            return []
+            logger.error(f"Failed to send command: {e}")
+            return False
+
+    def move(self, distance_cm: float) -> bool:
+        """Move forward/backward by distance_cm"""
+        return self.send_command("MOVE", distance=distance_cm)
+
+    def turn(self, angle_deg: float) -> bool:
+        """Turn by angle_deg (positive = CCW)"""
+        return self.send_command("TURN", angle=angle_deg)
+
+    def collect(self, distance_cm: float) -> bool:
+        """Move forward while collecting"""
+        return self.send_command("COLLECT", distance=distance_cm)
+
+    def deliver_balls(self) -> bool:
+        """Run collector in reverse to deliver balls"""
+        return self.send_command("COLLECT_REVERSE", duration=2.0)
+
+    def stop(self) -> bool:
+        """Stop all motors"""
+        return self.send_command("STOP")
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
         """Calculate approach position and angle for a target position"""
-        # Get vector from robot to target
         dx = target_pos[0] - self.robot_pos[0]
         dy = target_pos[1] - self.robot_pos[1]
         distance = math.hypot(dx, dy)
@@ -515,340 +275,36 @@ class BallCollector:
         
         return (approach_x, approach_y), target_angle
 
-    def draw_path(self, frame, path):
-        """Draw the planned path on the frame"""
-        if not self.homography_matrix is None:
-            overlay = frame.copy()
-            
-            # Colors for different point types
-            colors = {
-                'approach': (0, 255, 255),  # Yellow
-                'collect': (0, 255, 0),     # Green
-                'goal': (0, 0, 255)         # Red
-            }
-            
-            # Draw lines between points
-            for i in range(len(path) - 1):
-                # Convert cm to pixels for both points
-                start_cm = np.array([[[path[i]['pos'][0], path[i]['pos'][1]]]], dtype="float32")
-                end_cm = np.array([[[path[i+1]['pos'][0], path[i+1]['pos'][1]]]], dtype="float32")
-                
-                start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
-                end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
-                
-                # Draw line
-                cv2.line(overlay, tuple(start_px), tuple(end_px), (150, 150, 150), 2)
-            
-            # Draw points
-            for point in path:
-                pt_cm = np.array([[[point['pos'][0], point['pos'][1]]]], dtype="float32")
-                pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
-                
-                # Draw point
-                color = colors[point['type']]
-                cv2.circle(overlay, tuple(pt_px), 5, color, -1)
-                
-                # Draw direction for approach points
-                if point['type'] in ['approach', 'goal']:
-                    angle_rad = math.radians(point['angle'])
-                    end_x = pt_px[0] + int(20 * math.cos(angle_rad))
-                    end_y = pt_px[1] + int(20 * math.sin(angle_rad))
-                    cv2.arrowedLine(overlay, tuple(pt_px), (end_x, end_y), color, 2)
-                
-                # Add labels
-                if point['type'] == 'collect':
-                    cv2.putText(overlay, point['ball_type'], 
-                              (pt_px[0] + 10, pt_px[1] + 10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Blend overlay with original frame
-            alpha = 0.7
-            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-            
-            # Draw robot position and heading
-            robot_cm = np.array([[[self.robot_pos[0], self.robot_pos[1]]]], dtype="float32")
-            robot_px = cv2.perspectiveTransform(robot_cm, self.homography_matrix)[0][0].astype(int)
-            
-            # Robot circle
-            cv2.circle(frame, tuple(robot_px), 8, (255, 0, 0), -1)
-            
-            # Robot heading
-            angle_rad = math.radians(self.robot_heading)
-            end_x = robot_px[0] + int(25 * math.cos(angle_rad))
-            end_y = robot_px[1] + int(25 * math.sin(angle_rad))
-            cv2.arrowedLine(frame, tuple(robot_px), (end_x, end_y), (255, 0, 0), 2)
-        
-        return frame
-
-    def get_robot_status(self) -> dict:
-        """Get current robot status"""
-        try:
-            with socket.create_connection((EV3_IP, EV3_PORT), timeout=5) as s:
-                message = json.dumps({"command": "STATUS"}) + "\n"
-                s.sendall(message.encode("utf-8"))
-                response = s.recv(1024).decode("utf-8").strip()
-                return json.loads(response)
-        except Exception as e:
-            logger.error(f"Failed to get robot status: {e}")
-            return {}
-
-    def draw_status(self, frame):
-        """Draw robot status information on frame"""
-        status = self.get_robot_status()
-        if status:
-            # Draw status box in top-left corner
-            x, y = 10, 30
-            line_height = 20
-            
-            # Background rectangle
-            cv2.rectangle(frame, (5, 5), (200, 110), (0, 0, 0), -1)
-            cv2.rectangle(frame, (5, 5), (200, 110), (255, 255, 255), 1)
-            
-            # Battery status
-            battery_pct = status.get("battery_percentage", 0)
-            battery_color = (0, 255, 0) if battery_pct > 20 else (0, 0, 255)
-            cv2.putText(frame, f"Battery: {battery_pct:.1f}%",
-                       (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, battery_color, 1)
-            
-            # Motor speeds
-            left_speed = status.get("left_motor", {}).get("speed", 0)
-            right_speed = status.get("right_motor", {}).get("speed", 0)
-            collector_speed = status.get("collector_motor", {}).get("speed", 0)
-            
-            cv2.putText(frame, f"Left Motor: {left_speed}",
-                       (x, y + line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, f"Right Motor: {right_speed}",
-                       (x, y + 2*line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, f"Collector: {collector_speed}",
-                       (x, y + 3*line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        return frame
-
-    def deliver_balls(self) -> bool:
-        """Run collector in reverse to deliver balls"""
-        try:
-            return self.send_command("COLLECT_REVERSE", duration=self.delivery_time)
-        except Exception as e:
-            logger.error("Failed to deliver balls: {}".format(e))
-            return False
-
-    def calculate_goal_approach_path(self, current_pos, current_heading):
-        """Calculate a smooth path to the goal using intermediate points"""
-        goal_x = FIELD_WIDTH_CM - self.goal_approach_distance
-        goal_y = self.goal_y_center
-        
-        # Calculate direct distance and angle to goal
-        dx = goal_x - current_pos[0]
-        dy = goal_y - current_pos[1]
-        direct_distance = math.hypot(dx, dy)
-        angle_to_goal = math.degrees(math.atan2(dy, dx))
-        
-        # If we're already well-aligned with the goal (within 15 degrees), just go straight
-        angle_diff = (angle_to_goal - current_heading + 180) % 360 - 180
-        if abs(angle_diff) < 15 and not check_wall_collision(current_pos, (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
-            return [{
-                'type': 'goal',
-                'pos': (goal_x, goal_y),
-                'angle': 0  # Face straight ahead at goal
-            }]
-        
-        # Otherwise, calculate a curved approach path
-        # First point: swing out to create better approach angle
-        swing_distance = min(50, direct_distance * 0.4)  # Don't swing out too far
-        
-        # If we're to the left of the goal, swing right, and vice versa
-        swing_direction = 1 if current_pos[1] < goal_y else -1
-        swing_angle = current_heading + (45 * swing_direction)  # 45-degree swing
-        
-        # Calculate swing point
-        swing_x = current_pos[0] + swing_distance * math.cos(math.radians(swing_angle))
-        swing_y = current_pos[1] + swing_distance * math.sin(math.radians(swing_angle))
-        
-        # Second point: intermediate approach point
-        approach_x = goal_x - (self.goal_approach_distance * 1.5)  # Further back from goal
-        approach_y = goal_y  # Aligned with goal
-        
-        # Check if points are reachable
-        path = []
-        if not check_wall_collision(current_pos, (swing_x, swing_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'approach',
-                'pos': (swing_x, swing_y),
-                'angle': swing_angle
-            })
-        
-        if not check_wall_collision((swing_x, swing_y), (approach_x, approach_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'approach',
-                'pos': (approach_x, approach_y),
-                'angle': 0  # Align with goal
-            })
-        
-        if not check_wall_collision((approach_x, approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'goal',
-                'pos': (goal_x, goal_y),
-                'angle': 0
-            })
-        
-        return path
-
-    def update_robot_position(self, frame):
-        """Update robot position and heading using colored markers"""
-        current_time = time.time()
-        
-        # Only update every pos_update_interval seconds
-        if current_time - self.last_pos_update < self.pos_update_interval:
-            return
-            
-        # Detect green marker (robot body)
-        robot_center, robot_angle = detect_colored_marker(frame, GREEN_LOWER, GREEN_UPPER)
-        
-        # Detect pink marker (heading/collection area)
-        heading_center, _ = detect_colored_marker(frame, PINK_LOWER, PINK_UPPER)
-        
-        if robot_center and heading_center and self.homography_matrix is not None:
-            # Convert pixel coordinates to cm
-            robot_px = np.array([[[robot_center[0], robot_center[1]]]], dtype="float32")
-            robot_cm = cv2.perspectiveTransform(robot_px, np.linalg.inv(self.homography_matrix))[0][0]
-            
-            heading_px = np.array([[[heading_center[0], heading_center[1]]]], dtype="float32")
-            heading_cm = cv2.perspectiveTransform(heading_px, np.linalg.inv(self.homography_matrix))[0][0]
-            
-            # Update robot position
-            self.robot_pos = (robot_cm[0], robot_cm[1])
-            
-            # Calculate heading from robot center to heading marker
-            dx = heading_cm[0] - robot_cm[0]
-            dy = heading_cm[1] - robot_cm[1]
-            self.robot_heading = math.degrees(math.atan2(dy, dx))
-            
-            self.last_pos_update = current_time
-            
-            # Draw debug visualization
-            cv2.circle(frame, robot_center, 5, (0, 255, 0), -1)
-            cv2.circle(frame, heading_center, 5, (255, 192, 203), -1)
-            cv2.line(frame, robot_center, heading_center, (255, 255, 0), 2)
-
-    def move_with_reassessment(self, target_pos, is_collecting=False):
-        """Move to target position with periodic reassessment"""
-        while True:
-            # Get current position
-            if self.robot_pos is None or self.robot_heading is None:
-                logger.error("Lost robot position during movement")
-                return False
-
-            # Calculate remaining distance and angle
-            dx = target_pos[0] - self.robot_pos[0]
-            dy = target_pos[1] - self.robot_pos[1]
-            distance = math.hypot(dx, dy)
-            target_angle = math.degrees(math.atan2(dy, dx))
-
-            # If we're close enough to target, we're done
-            if distance < 2:  # 2cm threshold
-                return True
-
-            # Calculate turn angle
-            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-            if abs(angle_diff) > 5:
-                logger.info(f"Turning {angle_diff:.1f} degrees")
-                if not self.turn(angle_diff):
-                    return False
-                self.robot_heading = target_angle
-
-            # Calculate movement distance for this segment
-            move_distance = min(REASSESS_DISTANCE_CM, distance)
-
-            # Execute movement
-            if is_collecting:
-                logger.info(f"Collecting for {move_distance:.1f} cm")
-                if not self.collect(move_distance):
-                    return False
-            else:
-                logger.info(f"Moving {move_distance:.1f} cm")
-                if not self.move(move_distance):
-                    return False
-
-            # Pause for reassessment
-            logger.info("Pausing for position reassessment...")
-            time.sleep(REASSESS_PAUSE_SEC)
-
-            # Update visualization during pause
-            ret, frame = self.cap.read()
-            if ret:
-                self.update_robot_position(frame)
-                frame = self.draw_status(frame)
-                frame = self.draw_walls(frame)
-                cv2.imshow("Path Planning", frame)
-                cv2.waitKey(1)
-
-            # Check if we need to adjust path due to significant position error
-            if self.robot_pos is not None:
-                actual_dx = self.robot_pos[0] - target_pos[0]
-                actual_dy = self.robot_pos[1] - target_pos[1]
-                position_error = math.hypot(actual_dx, actual_dy)
-                
-                if position_error > 5:  # More than 5cm error
-                    logger.info(f"Position error of {position_error:.1f}cm detected, adjusting path")
-                    continue  # This will recalculate the path from current position
-
     def collect_balls(self):
         """Main ball collection loop"""
-        cv2.namedWindow("Path Planning")
+        cv2.namedWindow("Collection")
         last_plan_time = 0
         last_plan_positions = []
-        current_path = []  # Store current path for continuous display
         
         while True:
             try:
-                # Capture frame for visualization
+                # Capture frame
                 ret, frame = self.cap.read()
                 if not ret:
                     continue
 
-                # Update robot position from vision
-                self.update_robot_position(frame)
-                
-                # Skip if we don't have valid robot position yet
-                if self.robot_pos is None or self.robot_heading is None:
-                    cv2.putText(frame, "Waiting for robot markers...",
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.imshow("Path Planning", frame)
+                # Update robot position
+                if not self.update_robot_position(frame):
+                    cv2.putText(frame, "Robot markers not detected!", 
+                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                              0.7, (0, 0, 255), 2)
+                    cv2.imshow("Collection", frame)
                     cv2.waitKey(1)
                     continue
-
-                # Draw walls and safety margins
-                frame = self.draw_walls(frame)
-
-                # Add status overlay
-                frame = self.draw_status(frame)
 
                 # Detect balls
                 balls = self.detect_balls()
                 current_time = time.time()
-                
-                # Only replan if:
-                # 1. We have balls AND
-                # 2. Either:
-                #    a) It's been at least 3 seconds since last plan OR
-                #    b) Ball positions have changed significantly
-                should_replan = False
-                if balls:
-                    if current_time - last_plan_time >= 3:
-                        should_replan = True
-                    elif last_plan_positions:
-                        for ball in balls:
-                            if not any(math.hypot(ball[0] - old[0], ball[1] - old[1]) < 10 
-                                     for old in last_plan_positions):
-                                should_replan = True
-                                break
-                    else:
-                        should_replan = True
 
-                if should_replan:
+                # Only replan if we have balls and enough time has passed
+                if balls and current_time - last_plan_time >= 3:
                     last_plan_time = current_time
                     last_plan_positions = [(b[0], b[1]) for b in balls]
-                    logger.info("Planning to collect {} balls".format(len(balls)))
 
                     # Sort balls by distance from robot
                     balls.sort(key=lambda b: math.hypot(
@@ -856,120 +312,84 @@ class BallCollector:
                         b[1] - self.robot_pos[1]
                     ))
 
-                    # Take up to MAX_BALLS_PER_TRIP closest balls
+                    # Take closest balls up to MAX_BALLS_PER_TRIP
                     current_batch = balls[:MAX_BALLS_PER_TRIP]
+                    logger.info(f"Planning to collect {len(current_batch)} balls")
 
-                    # Plan path through all balls in the batch
-                    current_path = []  # Reset current path
-                    current_pos = self.robot_pos
-                    current_heading = self.robot_heading
-                    remaining_balls = current_batch.copy()
-
-                    # Add balls to path in nearest-neighbor order
-                    while remaining_balls:
-                        closest_ball = min(remaining_balls, 
-                                         key=lambda b: math.hypot(
-                                             b[0] - current_pos[0],
-                                             b[1] - current_pos[1]
-                                         ))
+                    # Process each ball
+                    for ball in current_batch:
+                        ball_pos = (ball[0], ball[1])
                         
-                        ball_pos = (closest_ball[0], closest_ball[1])
+                        # Get approach position
                         approach_pos, target_angle = self.get_approach_vector(ball_pos)
                         
-                        # Check for wall collisions
-                        if check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
-                            logger.warning(f"Path to ball at {ball_pos} blocked by wall, skipping")
-                            remaining_balls.remove(closest_ball)
-                            continue
+                        # Turn to face target
+                        angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                        if abs(angle_diff) > 5:
+                            logger.info(f"Turning {angle_diff:.1f} degrees")
+                            if not self.turn(angle_diff):
+                                raise Exception("Turn failed")
+                            time.sleep(0.5)
                         
-                        if check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
-                            logger.warning(f"Approach to ball at {ball_pos} blocked by wall, skipping")
-                            remaining_balls.remove(closest_ball)
-                            continue
+                        # Move to approach position
+                        distance = math.hypot(
+                            approach_pos[0] - self.robot_pos[0],
+                            approach_pos[1] - self.robot_pos[1]
+                        )
+                        logger.info(f"Moving {distance:.1f} cm to approach")
+                        if not self.move(distance):
+                            raise Exception("Move failed")
+                        time.sleep(0.5)
                         
-                        current_path.append({
-                            'type': 'approach',
-                            'pos': approach_pos,
-                            'angle': target_angle
-                        })
-                        current_path.append({
-                            'type': 'collect',
-                            'pos': ball_pos,
-                            'ball_type': closest_ball[2]
-                        })
-                        
-                        current_pos = ball_pos
-                        current_heading = target_angle
-                        remaining_balls.remove(closest_ball)
+                        # Collect ball
+                        logger.info("Collecting ball")
+                        if not self.collect(COLLECTION_DISTANCE_CM):
+                            raise Exception("Collection failed")
+                        time.sleep(0.5)
 
-                    # Add goal approach path if we have collected any balls
-                    if current_path:
-                        goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
-                        current_path.extend(goal_path)
+                    # After collecting batch, return to goal
+                    if current_batch:
+                        # Calculate goal position (right side, center)
+                        goal_x = FIELD_WIDTH_CM - 30  # 30cm from right edge
+                        goal_y = FIELD_HEIGHT_CM / 2
+                        
+                        # Turn to face goal
+                        dx = goal_x - self.robot_pos[0]
+                        dy = goal_y - self.robot_pos[1]
+                        goal_angle = math.degrees(math.atan2(dy, dx))
+                        
+                        angle_diff = (goal_angle - self.robot_heading + 180) % 360 - 180
+                        if abs(angle_diff) > 5:
+                            logger.info(f"Turning {angle_diff:.1f} degrees to goal")
+                            if not self.turn(angle_diff):
+                                raise Exception("Turn to goal failed")
+                            time.sleep(0.5)
+                        
+                        # Move to goal
+                        distance = math.hypot(dx, dy)
+                        logger.info(f"Moving {distance:.1f} cm to goal")
+                        if not self.move(distance):
+                            raise Exception("Move to goal failed")
+                        time.sleep(0.5)
+                        
+                        # Deliver balls
+                        logger.info("Delivering balls")
+                        if not self.deliver_balls():
+                            raise Exception("Ball delivery failed")
+                        time.sleep(0.5)
 
-                # Always draw the current path if it exists
-                if current_path:
-                    frame = self.draw_path(frame, current_path)
-                
-                # Add key command help
-                help_text = [
-                    "Commands:",
-                    "SPACE - Execute path",
-                    "Q - Quit",
-                    "R - Reset robot position"
-                ]
-                y = 150
-                for text in help_text:
-                    cv2.putText(frame, text,
-                              (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                              0.5, (255, 255, 255), 1)
-                    y += 20
-                
-                # Always show the frame
-                cv2.imshow("Path Planning", frame)
-                
-                # Handle key commands
+                # Show frame
+                cv2.imshow("Collection", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
-                elif key == ord('r'):
-                    self.robot_pos = None
-                    self.robot_heading = None
-                    current_path = []  # Clear current path
-                    logger.info("Reset robot position to start")
-                elif key == ord(' ') and current_path:
-                    # Execute the planned path
-                    logger.info("Executing path with {} points".format(len(current_path)))
-                    
-                    try:
-                        for point in current_path:
-                            # Move to target position with reassessment
-                            if not self.move_with_reassessment(
-                                point['pos'],
-                                is_collecting=(point['type'] == 'collect')
-                            ):
-                                raise Exception("Movement failed")
-                            
-                            # If this was a goal point, deliver balls
-                            if point['type'] == 'goal':
-                                if not self.deliver_balls():
-                                    raise Exception("Ball delivery failed")
-                        
-                        # Clear the path after successful execution
-                        current_path = []
-                        # Pause briefly after completing the path
-                        cv2.waitKey(1000)
-                        
-                    except Exception as e:
-                        logger.error("Path execution failed: {}".format(e))
-                        self.stop()
-                        cv2.waitKey(2000)
-                
-            except Exception as e:
-                logger.error(f"Main loop error: {e}")
-                cv2.waitKey(1000)
 
-        cv2.destroyWindow("Path Planning")
+            except Exception as e:
+                logger.error(f"Error in collection loop: {e}")
+                self.stop()
+                time.sleep(1)
+
+        cv2.destroyWindow("Collection")
 
     def run(self):
         """Main run loop"""
