@@ -25,7 +25,7 @@ EV3_PORT = 12345
 ROBOFLOW_API_KEY = "LdvRakmEpZizttEFtQap"
 RF_WORKSPACE = "legoms3"
 RF_PROJECT = "golfbot-fyxfe-etdz0" 
-RF_VERSION = 3
+RF_VERSION = 2
 
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
@@ -402,7 +402,16 @@ class BallCollector:
         scale_x = frame.shape[1] / 416
         scale_y = frame.shape[0] / 416
         
+        # Target only white and orange balls
+        target_ball_types = ['white_ball', 'orange_ball']
+        
         for pred in predictions.get('predictions', []):
+            ball_class = pred['class']
+            
+            # Only process white_ball and orange_ball
+            if ball_class not in target_ball_types:
+                continue
+                
             x_px = int(pred['x'] * scale_x)
             y_px = int(pred['y'] * scale_y)
             
@@ -416,7 +425,7 @@ class BallCollector:
                 # Check if ball is in ignored area
                 if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
                        IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                    balls.append((x_cm, y_cm, pred['class']))
+                    balls.append((x_cm, y_cm, ball_class))
         
         return balls
 
@@ -620,6 +629,7 @@ class BallCollector:
         cv2.namedWindow("Path Planning")
         last_plan_time = 0
         last_plan_positions = []
+        path = []
         
         while True:
             try:
@@ -730,29 +740,46 @@ class BallCollector:
                         goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
                         path.extend(goal_path)
 
-                    # Draw path on frame
-                    frame_with_path = self.draw_path(frame, path)
-                    
-                    # Add key command help
-                    help_text = [
-                        "Commands:",
-                        "SPACE - Execute path",
-                        "Q - Quit"
-                    ]
-                    y = 150
-                    for text in help_text:
-                        cv2.putText(frame_with_path, text,
-                                  (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                                  0.5, (255, 255, 255), 1)
-                        y += 20
-                    
-                    cv2.imshow("Path Planning", frame_with_path)
-                    
-                    # Handle key commands
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord(' '):
+                # Prepare the display frame
+                display_frame = frame.copy()
+                
+                # Always show path preview when path exists
+                if path:
+                    display_frame = self.draw_path(display_frame, path)
+                    # Add path ready indicator
+                    cv2.putText(display_frame, "PATH READY - Press ENTER to execute", 
+                              (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                              0.7, (0, 255, 0), 2)
+                
+                # Get key input
+                key = cv2.waitKey(1) & 0xFF
+                
+                # Add key command help
+                help_text = [
+                    "Commands:",
+                    "ENTER - Execute planned path",
+                    "Q - Quit"
+                ]
+                y = 150
+                for text in help_text:
+                    cv2.putText(display_frame, text,
+                              (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                              0.5, (255, 255, 255), 1)
+                    y += 20
+                
+                # Show planned path count
+                if path:
+                    cv2.putText(display_frame, f"Path planned: {len([p for p in path if p['type'] == 'collect'])} balls",
+                              (10, y + 10), cv2.FONT_HERSHEY_SIMPLEX,
+                              0.5, (0, 255, 0), 1)
+                
+                cv2.imshow("Path Planning", display_frame)
+                
+                # Handle key commands
+                if key == ord('q'):
+                    break
+                elif key == 13:  # Enter key
+                    if path:
                         # Execute the planned path
                         logger.info("Executing path with {} points".format(len(path)))
                         
@@ -800,27 +827,30 @@ class BallCollector:
                                     if not self.move(distance):
                                         raise Exception("Move command failed")
                                 
-                                # Update visualization
+                                # Update visualization during execution
                                 ret, frame = self.cap.read()
                                 if ret:
                                     self.update_robot_position(frame)
                                     frame = self.draw_status(frame)
                                     frame = self.draw_robot_markers(frame)
                                     frame_with_path = self.draw_path(frame, path)
+                                    cv2.putText(frame_with_path, "EXECUTING PATH...", 
+                                              (10, frame_with_path.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                              0.7, (0, 255, 0), 2)
                                     cv2.imshow("Path Planning", frame_with_path)
                                     cv2.waitKey(1)
                             
-                            # Pause briefly after completing the path
+                            # Clear path after successful execution
+                            path = []
+                            logger.info("Path execution completed successfully")
                             cv2.waitKey(1000)
                             
                         except Exception as e:
                             logger.error("Path execution failed: {}".format(e))
                             self.stop()
                             cv2.waitKey(2000)
-                    
-                # Show frame even when not replanning
-                cv2.imshow("Path Planning", frame)
-                cv2.waitKey(1)
+                    else:
+                        logger.warning("No path planned to execute")
                     
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
