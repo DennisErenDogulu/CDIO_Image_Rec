@@ -75,6 +75,8 @@ IGNORED_AREA = {
 CAMERA_WIDTH = 640   # Match model's input size
 CAMERA_HEIGHT = 640  # Match model's input size
 CAMERA_FPS = 30
+CAMERA_HEIGHT_CM = 180  # Camera is 180cm above field
+CAMERA_ANGLE = 90  # Assuming camera points straight down (90 degrees)
 
 # Setup logging
 logging.basicConfig(
@@ -194,9 +196,11 @@ class BallCollector:
         self.robot_heading = None
         self.detected_obstacles = []
         
-        # Calibration points for homography
+        # Camera calibration parameters
         self.calibration_points = []
         self.homography_matrix = None
+        self.camera_matrix = None
+        self.dist_coeffs = None
         
         # Wall configuration
         self.walls = []  # Will be set after calibration
@@ -321,6 +325,33 @@ class BallCollector:
         """Stop all motors"""
         return self.send_command("STOP")
 
+    def calculate_perspective_correction(self, x_cm: float, y_cm: float) -> Tuple[float, float]:
+        """
+        Correct for perspective distortion based on camera height and position
+        """
+        if self.homography_matrix is None:
+            return x_cm, y_cm
+
+        # Calculate distance from camera center in cm
+        center_x = FIELD_WIDTH_CM / 2
+        center_y = FIELD_HEIGHT_CM / 2
+        dx = x_cm - center_x
+        dy = y_cm - center_y
+        distance = math.sqrt(dx*dx + dy*dy)
+
+        # Calculate correction factor based on camera height and distance
+        # Using simple trigonometry for perspective correction
+        angle_rad = math.atan2(distance, CAMERA_HEIGHT_CM)
+        correction_factor = CAMERA_HEIGHT_CM / math.cos(angle_rad)
+        
+        # Apply correction to coordinates
+        if distance > 0:
+            correction_ratio = correction_factor / CAMERA_HEIGHT_CM
+            x_corrected = center_x + dx * correction_ratio
+            y_corrected = center_y + dy * correction_ratio
+            return x_corrected, y_corrected
+        return x_cm, y_cm
+
     def calibrate(self):
         """Perform camera calibration by clicking 4 corners"""
         def mouse_callback(event, x, y, flags, param):
@@ -330,19 +361,45 @@ class BallCollector:
                     logger.info(f"Corner {len(self.calibration_points)} set: ({x}, {y})")
 
                 if len(self.calibration_points) == 4:
-                    # Build homography matrix (cm) → (px)
-                    dst_pts = np.array([
-                        [0, 0],
-                        [FIELD_WIDTH_CM, 0],
-                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM],
-                        [0, FIELD_HEIGHT_CM]
+                    # Calculate field corners in real-world coordinates (cm)
+                    # Assuming camera is centered above field
+                    field_corners_cm = np.array([
+                        [0, 0],  # Bottom-left
+                        [FIELD_WIDTH_CM, 0],  # Bottom-right
+                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM],  # Top-right
+                        [0, FIELD_HEIGHT_CM]  # Top-left
                     ], dtype="float32")
-                    src_pts = np.array(self.calibration_points, dtype="float32")
-                    self.homography_matrix = cv2.getPerspectiveTransform(dst_pts, src_pts)
+
+                    # Convert clicked points to numpy array
+                    image_points = np.array(self.calibration_points, dtype="float32")
+
+                    # Calculate homography matrix
+                    self.homography_matrix = cv2.getPerspectiveTransform(field_corners_cm, image_points)
+
+                    # Estimate camera parameters
+                    # This helps with perspective correction
+                    object_points = np.array([
+                        [0, 0, 0],
+                        [FIELD_WIDTH_CM, 0, 0],
+                        [FIELD_WIDTH_CM, FIELD_HEIGHT_CM, 0],
+                        [0, FIELD_HEIGHT_CM, 0]
+                    ], dtype="float32")
                     
-                    # Set up walls after calibration
-                    self.setup_walls()
-                    logger.info("✅ Calibration and wall setup complete")
+                    image_points_3d = np.array(self.calibration_points, dtype="float32")
+                    image_points_3d = image_points_3d.reshape(-1, 1, 2)
+                    
+                    # Assuming no lens distortion for simplicity
+                    self.dist_coeffs = np.zeros((4,1))
+                    
+                    # Estimate camera matrix
+                    self.camera_matrix, _ = cv2.calibrateCamera(
+                        [object_points], [image_points_3d],
+                        (CAMERA_WIDTH, CAMERA_HEIGHT),
+                        None, None,
+                        flags=cv2.CALIB_USE_INTRINSIC_GUESS
+                    )
+
+                    logger.info("✅ Calibration complete with perspective correction")
 
         cv2.namedWindow("Calibration")
         cv2.setMouseCallback("Calibration", mouse_callback)
@@ -369,7 +426,6 @@ class BallCollector:
         if not ret:
             return []
 
-        # Run inference through Roboflow API
         try:
             # Get predictions from Roboflow
             predictions = self.model.predict(frame, confidence=CONFIDENCE_THRESHOLD, overlap=IOU_THRESHOLD).json()
@@ -401,6 +457,9 @@ class BallCollector:
                     )[0][0]
                     x_cm, y_cm = pt_cm
 
+                    # Apply perspective correction
+                    x_cm, y_cm = self.calculate_perspective_correction(x_cm, y_cm)
+
                     # Ignore detections in the ignored area
                     if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
                         IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
@@ -425,12 +484,18 @@ class BallCollector:
                                (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
                                0.5, color, 2)
 
+                    # Draw corrected position for debugging
+                    cv2.circle(frame, (int(x), int(y)), 3, (255, 255, 0), -1)
+                    cv2.putText(frame, f"({x_cm:.1f}, {y_cm:.1f})",
+                               (int(x) + 10, int(y) + 20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
             # Store obstacles for path planning
             self.detected_obstacles = obstacles
             return balls
 
         except Exception as e:
-            logger.error(f"Error during Roboflow inference: {e}")
+            logger.error(f"Error during detection: {e}")
             return []
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
