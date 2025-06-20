@@ -16,18 +16,16 @@ import socket
 import logging
 import numpy as np
 from typing import List, Tuple, Optional
-from ultralytics import YOLO
+from roboflow import Roboflow
 import time
 
 # Configuration
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
-
-# Model configuration
-MODEL_PATH = "weights(3).pt"  # Using local weights
-CONFIDENCE_THRESHOLD = 0.5
-IOU_THRESHOLD = 0.45  # Non-maximum suppression threshold
-MODEL_IMAGE_SIZE = 640  # YOLOv8 default size
+ROBOFLOW_API_KEY = "LdvRakmEpZizttEFtQap"
+RF_WORKSPACE = "legoms3"
+RF_PROJECT = "golfbot-fyxfe-etdz0" 
+RF_VERSION = 3
 
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
@@ -124,8 +122,10 @@ def check_wall_collision(start_pos, end_pos, walls, safety_margin):
 
 class BallCollector:
     def __init__(self):
-        # Initialize YOLO model (local weights)
-        self.model = YOLO(MODEL_PATH)
+        # Initialize Roboflow
+        self.rf = Roboflow(api_key=ROBOFLOW_API_KEY)
+        self.project = self.rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
+        self.model = self.project.version(RF_VERSION).model
         
         # Initialize camera
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
@@ -335,7 +335,7 @@ class BallCollector:
             return False
 
     def move(self, distance_cm: float) -> bool:
-        """Move forward/backward by distance_cm"""
+        """Move forward/backward by distance_cm (negative for backward)"""
         return self.send_command("MOVE", distance=distance_cm)
 
     def turn(self, angle_deg: float) -> bool:
@@ -399,52 +399,150 @@ class BallCollector:
         if not ret:
             return []
 
-        # Run YOLOv8 inference
-        results = self.model(frame, conf=CONFIDENCE_THRESHOLD)[0]
+        # Resize for Roboflow model
+        small = cv2.resize(frame, (416, 416))
+        
+        # Get predictions
+        predictions = self.model.predict(small, confidence=30, overlap=20).json()
+        
         balls = []
-
+        scale_x = frame.shape[1] / 416
+        scale_y = frame.shape[0] / 416
+        
         # Target only white and orange balls
         target_ball_types = ['white_ball', 'orange_ball']
-
-        for det in results.boxes.data.tolist():
-            x1, y1, x2, y2, conf, cls = det
-            class_name = results.names[int(cls)]
-            if class_name not in target_ball_types:
+        
+        for pred in predictions.get('predictions', []):
+            ball_class = pred['class']
+            
+            # Only process white_ball and orange_ball
+            if ball_class not in target_ball_types:
                 continue
-
-            # Calculate center point
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-
-            # Convert to cm using homography if available
+                
+            x_px = int(pred['x'] * scale_x)
+            y_px = int(pred['y'] * scale_y)
+            
+            # Convert to cm using homography
             if self.homography_matrix is not None:
-                pt_px = np.array([[[center_x, center_y]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
+                pt_px = np.array([[[x_px, y_px]]], dtype="float32")
+                pt_cm = cv2.perspectiveTransform(pt_px, 
+                                               np.linalg.inv(self.homography_matrix))[0][0]
                 x_cm, y_cm = pt_cm
-
+                
                 # Check if ball is in ignored area
                 if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                        IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                    balls.append((x_cm, y_cm, class_name))
-
+                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                    balls.append((x_cm, y_cm, ball_class))
+        
         return balls
 
-    def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
-        """Calculate approach position and angle for a target position"""
-        # Get vector from robot to target
+    def calculate_movement_efficiency(self, target_pos: Tuple[float, float]) -> dict:
+        """Calculate efficiency scores for different movement approaches"""
+        dx = target_pos[0] - self.robot_pos[0]
+        dy = target_pos[1] - self.robot_pos[1]
+        distance = math.hypot(dx, dy)
+        target_angle = math.degrees(math.atan2(dy, dx))
+        angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+        
+        # Calculate efficiency for different approaches
+        approaches = {}
+        
+        # 1. Direct forward approach
+        turn_cost = abs(angle_diff) / 180.0  # Normalize to 0-1
+        approaches['forward'] = {
+            'total_cost': turn_cost + distance * 0.01,  # Small distance penalty
+            'method': 'forward',
+            'angle': target_angle,
+            'backing': False
+        }
+        
+        # 2. Backward movement (if target is behind us)
+        backward_angle = target_angle + 180
+        backward_angle_diff = (backward_angle - self.robot_heading + 180) % 360 - 180
+        if abs(backward_angle_diff) < abs(angle_diff):  # Backing requires less turning
+            approaches['backward'] = {
+                'total_cost': abs(backward_angle_diff) / 180.0 + distance * 0.015,  # Slightly higher distance penalty
+                'method': 'backward',
+                'angle': backward_angle,
+                'backing': True
+            }
+        
+        # 3. Back away first, then forward (for nearby targets with sharp turns)
+        if distance < 60 and abs(angle_diff) > 60:
+            back_distance = min(30, distance * 0.5)
+            back_angle = self.robot_heading + 180
+            back_x = self.robot_pos[0] + back_distance * math.cos(math.radians(back_angle))
+            back_y = self.robot_pos[1] + back_distance * math.sin(math.radians(back_angle))
+            
+            if not check_wall_collision(self.robot_pos, (back_x, back_y), self.walls, WALL_SAFETY_MARGIN):
+                # Calculate new angle from backed position to target
+                new_dx = target_pos[0] - back_x
+                new_dy = target_pos[1] - back_y
+                new_target_angle = math.degrees(math.atan2(new_dy, new_dx))
+                new_angle_diff = (new_target_angle - back_angle + 180) % 360 - 180
+                
+                total_cost = (180 / 180.0) + (abs(new_angle_diff) / 180.0) + (back_distance + math.hypot(new_dx, new_dy)) * 0.01
+                approaches['back_then_forward'] = {
+                    'total_cost': total_cost,
+                    'method': 'back_then_forward',
+                    'back_pos': (back_x, back_y),
+                    'angle': new_target_angle,
+                    'backing': True
+                }
+        
+        return approaches
+
+    def get_smooth_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float, str]:
+        """Calculate optimal approach using efficiency analysis"""
+        approaches = self.calculate_movement_efficiency(target_pos)
+        
+        # Choose the most efficient approach
+        best_approach = min(approaches.values(), key=lambda x: x['total_cost'])
+        method = best_approach['method']
+        
         dx = target_pos[0] - self.robot_pos[0]
         dy = target_pos[1] - self.robot_pos[1]
         distance = math.hypot(dx, dy)
         
-        # Calculate approach point APPROACH_DISTANCE_CM before target
-        ratio = (distance - APPROACH_DISTANCE_CM) / distance if distance > APPROACH_DISTANCE_CM else 0
-        approach_x = self.robot_pos[0] + dx * ratio
-        approach_y = self.robot_pos[1] + dy * ratio
+        if method == 'backward':
+            # Move backward toward target
+            if distance > APPROACH_DISTANCE_CM:
+                ratio = (distance - APPROACH_DISTANCE_CM) / distance
+                approach_x = self.robot_pos[0] + dx * ratio
+                approach_y = self.robot_pos[1] + dy * ratio
+            else:
+                approach_x, approach_y = self.robot_pos
+            return (approach_x, approach_y), best_approach['angle'], 'backward'
+            
+        elif method == 'back_then_forward':
+            # Return the backing position first
+            return best_approach['back_pos'], self.robot_heading + 180, 'back_reposition'
+            
+        elif abs((best_approach['angle'] - self.robot_heading + 180) % 360 - 180) > 90:
+            # Still a sharp turn - use curved approach
+            curve_distance = min(40, distance * 0.6)
+            angle_diff = (best_approach['angle'] - self.robot_heading + 180) % 360 - 180
+            
+            if angle_diff > 0:
+                curve_angle = self.robot_heading + 45
+            else:
+                curve_angle = self.robot_heading - 45
+            
+            curve_x = self.robot_pos[0] + curve_distance * math.cos(math.radians(curve_angle))
+            curve_y = self.robot_pos[1] + curve_distance * math.sin(math.radians(curve_angle))
+            
+            if not check_wall_collision(self.robot_pos, (curve_x, curve_y), self.walls, WALL_SAFETY_MARGIN):
+                return (curve_x, curve_y), curve_angle, 'curve'
         
-        # Calculate angle to target
-        target_angle = math.degrees(math.atan2(dy, dx))
+        # Standard forward approach
+        if distance > APPROACH_DISTANCE_CM:
+            ratio = (distance - APPROACH_DISTANCE_CM) / distance
+            approach_x = self.robot_pos[0] + dx * ratio
+            approach_y = self.robot_pos[1] + dy * ratio
+        else:
+            approach_x, approach_y = self.robot_pos
         
-        return (approach_x, approach_y), target_angle
+        return (approach_x, approach_y), best_approach['angle'], 'forward'
 
     def draw_path(self, frame, path):
         """Draw the planned path on the frame"""
@@ -453,9 +551,14 @@ class BallCollector:
             
             # Colors for different point types
             colors = {
-                'approach': (0, 255, 255),  # Yellow
-                'collect': (0, 255, 0),     # Green
-                'goal': (0, 0, 255)         # Red
+                'approach': (0, 255, 255),        # Yellow
+                'collect': (0, 255, 0),           # Green
+                'goal': (0, 0, 255),              # Red
+                'backup': (255, 0, 255),          # Magenta
+                'turn_to_ball': (128, 128, 255),  # Light purple
+                'backward_approach': (255, 128, 0),  # Orange
+                'backward_collect': (255, 165, 0),   # Orange red
+                'curve_approach': (128, 255, 128)    # Light green
             }
             
             # Draw lines between points
@@ -555,11 +658,19 @@ class BallCollector:
         
         return frame
 
-    def move_to_target_live(self, target_pos: Tuple[float, float], target_type: str = "approach") -> bool:
+    def move_to_target_live(self, target_pos: Tuple[float, float], target_type: str = "approach", is_backing: bool = False) -> bool:
         """Move to target using continuous position updates and small adjustments"""
-        max_distance_per_step = 10  # Maximum distance to move in one step (cm)
-        angle_tolerance = 15  # Degrees - tolerance for direction alignment
-        distance_tolerance = 5  # cm - how close we need to get to target
+        # Different parameters based on movement type
+        if target_type == "goal":
+            max_distance_per_step = 30  # Larger steps for goal approach
+            angle_tolerance = 25       # More lenient angle tolerance for long distance
+            distance_tolerance = 10    # Goal can be reached with less precision
+            heading_adjust_distance = 40  # Only adjust heading when within 40cm of goal
+        else:
+            max_distance_per_step = 10  # Smaller steps for precise ball collection
+            angle_tolerance = 15       # Stricter angle tolerance
+            distance_tolerance = 5     # Need to get closer for ball collection
+            heading_adjust_distance = float('inf')  # Always adjust heading for ball collection
         
         step_count = 0
         max_steps = 50  # Prevent infinite loops
@@ -584,27 +695,44 @@ class BallCollector:
             # Calculate angle difference
             angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
             
-            # If we need to turn significantly, make a small turn
-            if abs(angle_diff) > angle_tolerance:
+            # For backing moves, we want to face away from target
+            if is_backing:
+                target_angle = target_angle + 180  # Face opposite direction
+                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+            
+            # Only adjust heading if within heading_adjust_distance or if angle is very wrong
+            should_adjust_heading = (distance_to_target <= heading_adjust_distance or 
+                                   abs(angle_diff) > 45)
+            
+            # If we need to turn significantly and should adjust heading
+            if abs(angle_diff) > angle_tolerance and should_adjust_heading:
                 # Limit turn to max 30 degrees per adjustment
                 turn_amount = max(-30, min(30, angle_diff))
-                logger.info(f"Live adjustment: turning {turn_amount:.1f} degrees")
+                action = "backing turn" if is_backing else "live adjustment"
+                logger.info(f"{action}: turning {turn_amount:.1f} degrees (distance: {distance_to_target:.1f}cm)")
                 if not self.turn(turn_amount):
                     return False
                 self.update_robot_position()  # Update after turn
             else:
-                # Move forward in small increments
+                # Move forward or backward in increments
                 move_distance = min(max_distance_per_step, distance_to_target)
                 
-                if target_type == "collect" and distance_to_target <= COLLECTION_DISTANCE_CM:
+                if is_backing:
+                    # Move backward
+                    move_distance = -move_distance  # Negative for backward
+                    logger.info(f"Backing up: {abs(move_distance):.1f} cm")
+                    if not self.move(move_distance):
+                        return False
+                elif target_type == "collect" and distance_to_target <= COLLECTION_DISTANCE_CM:
                     # Final approach for collection
                     logger.info(f"Final collection approach: {move_distance:.1f} cm")
                     return self.collect(move_distance)
                 else:
-                    logger.info(f"Live movement: {move_distance:.1f} cm")
+                    logger.info(f"Live movement ({target_type}): {move_distance:.1f} cm")
                     if not self.move(move_distance):
                         return False
-                    self.update_robot_position()  # Update after move
+                
+                self.update_robot_position()  # Update after move
             
             step_count += 1
             
@@ -758,7 +886,7 @@ class BallCollector:
                     current_heading = self.robot_heading
                     remaining_balls = current_batch.copy()
 
-                    # Add balls to path in nearest-neighbor order
+                    # Add balls to path with smooth approach planning
                     while remaining_balls:
                         closest_ball = min(remaining_balls, 
                                          key=lambda b: math.hypot(
@@ -767,7 +895,7 @@ class BallCollector:
                                          ))
                         
                         ball_pos = (closest_ball[0], closest_ball[1])
-                        approach_pos, target_angle = self.get_approach_vector(ball_pos)
+                        approach_pos, target_angle, movement_type = self.get_smooth_approach_vector(ball_pos)
                         
                         # Check for wall collisions
                         if check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
@@ -775,24 +903,89 @@ class BallCollector:
                             remaining_balls.remove(closest_ball)
                             continue
                         
-                        if check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
+                        if movement_type not in ['backward', 'back_reposition'] and check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
                             logger.warning(f"Approach to ball at {ball_pos} blocked by wall, skipping")
                             remaining_balls.remove(closest_ball)
                             continue
                         
-                        path.append({
-                            'type': 'approach',
-                            'pos': approach_pos,
-                            'angle': target_angle
-                        })
-                        path.append({
-                            'type': 'collect',
-                            'pos': ball_pos,
-                            'ball_type': closest_ball[2]
-                        })
+                        # Add appropriate waypoints based on movement type
+                        if movement_type == 'backward':
+                            path.append({
+                                'type': 'backward_approach',
+                                'pos': approach_pos,
+                                'angle': target_angle,
+                                'is_backing': True
+                            })
+                            path.append({
+                                'type': 'backward_collect',
+                                'pos': ball_pos,
+                                'ball_type': closest_ball[2],
+                                'is_backing': True
+                            })
+                        
+                        elif movement_type == 'back_reposition':
+                            path.append({
+                                'type': 'backup',
+                                'pos': approach_pos,
+                                'angle': target_angle,
+                                'is_backing': True
+                            })
+                            # After backing, turn to face the ball
+                            face_ball_angle = math.degrees(math.atan2(
+                                ball_pos[1] - approach_pos[1],
+                                ball_pos[0] - approach_pos[0]
+                            ))
+                            path.append({
+                                'type': 'turn_to_ball',
+                                'pos': approach_pos,
+                                'angle': face_ball_angle,
+                                'target_ball': ball_pos
+                            })
+                            path.append({
+                                'type': 'collect',
+                                'pos': ball_pos,
+                                'ball_type': closest_ball[2]
+                            })
+                        
+                        elif movement_type == 'curve':
+                            path.append({
+                                'type': 'curve_approach',
+                                'pos': approach_pos,
+                                'angle': target_angle
+                            })
+                            # Add the final approach to ball
+                            final_angle = math.degrees(math.atan2(
+                                ball_pos[1] - approach_pos[1],
+                                ball_pos[0] - approach_pos[0]
+                            ))
+                            path.append({
+                                'type': 'approach',
+                                'pos': ball_pos,
+                                'angle': final_angle
+                            })
+                            path.append({
+                                'type': 'collect',
+                                'pos': ball_pos,
+                                'ball_type': closest_ball[2]
+                            })
+                        
+                        else:  # forward approach
+                            path.append({
+                                'type': 'approach',
+                                'pos': approach_pos,
+                                'angle': target_angle
+                            })
+                            path.append({
+                                'type': 'collect',
+                                'pos': ball_pos,
+                                'ball_type': closest_ball[2]
+                            })
                         
                         current_pos = ball_pos
-                        current_heading = target_angle
+                        current_heading = math.degrees(math.atan2(
+                            ball_pos[1] - approach_pos[1],
+                            ball_pos[0] - approach_pos[0]
+                        ))
                         remaining_balls.remove(closest_ball)
 
                     # Add goal approach path if we have collected any balls
@@ -858,6 +1051,49 @@ class BallCollector:
                                     # After reaching goal position, deliver balls
                                     if not self.deliver_balls():
                                         raise Exception("Ball delivery failed")
+                                elif point['type'] == 'backup':
+                                    logger.info(f"Backing up to improve approach angle")
+                                    if not self.move_to_target_live(target_pos, "approach", is_backing=True):
+                                        raise Exception("Backup movement failed")
+                                elif point['type'] == 'backward_approach':
+                                    logger.info(f"Moving backward to approach ball")
+                                    if not self.move_to_target_live(target_pos, "approach", is_backing=True):
+                                        raise Exception("Backward approach movement failed")
+                                elif point['type'] == 'backward_collect':
+                                    logger.info(f"Collecting {point['ball_type']} ball while moving backward")
+                                    # For backward collection, we need to get close first then collect
+                                    dx = target_pos[0] - self.robot_pos[0]
+                                    dy = target_pos[1] - self.robot_pos[1]
+                                    distance_to_ball = math.hypot(dx, dy)
+                                    
+                                    if distance_to_ball > COLLECTION_DISTANCE_CM:
+                                        # Move backward to get closer
+                                        move_distance = -(distance_to_ball - COLLECTION_DISTANCE_CM)
+                                        if not self.move(move_distance):
+                                            raise Exception("Backward movement to ball failed")
+                                        self.update_robot_position()
+                                    
+                                    # Now collect while facing away from ball
+                                    if not self.collect(COLLECTION_DISTANCE_CM):
+                                        raise Exception("Backward collection failed")
+                                elif point['type'] == 'curve_approach':
+                                    logger.info(f"Moving through curve point for smooth approach")
+                                    if not self.move_to_target_live(target_pos, "approach"):
+                                        raise Exception("Curve approach movement failed")
+                                elif point['type'] == 'turn_to_ball':
+                                    logger.info(f"Turning to face ball after backup")
+                                    # Calculate turn to face the target ball
+                                    ball_pos = point['target_ball']
+                                    dx = ball_pos[0] - self.robot_pos[0]
+                                    dy = ball_pos[1] - self.robot_pos[1]
+                                    target_angle = math.degrees(math.atan2(dy, dx))
+                                    angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                                    
+                                    if abs(angle_diff) > 5:
+                                        logger.info(f"Turning {angle_diff:.1f} degrees to face ball")
+                                        if not self.turn(angle_diff):
+                                            raise Exception("Turn to ball failed")
+                                    self.update_robot_position()
                                 else:  # approach point
                                     logger.info(f"Live movement to approach point")
                                     if not self.move_to_target_live(target_pos, "approach"):
