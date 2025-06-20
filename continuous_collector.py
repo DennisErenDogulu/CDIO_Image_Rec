@@ -797,6 +797,7 @@ class BallCollector:
         cv2.namedWindow("Path Planning")
         last_plan_time = 0
         last_plan_positions = []
+        current_path = []  # Store current path for continuous display
         
         while True:
             try:
@@ -859,7 +860,7 @@ class BallCollector:
                     current_batch = balls[:MAX_BALLS_PER_TRIP]
 
                     # Plan path through all balls in the batch
-                    path = []
+                    current_path = []  # Reset current path
                     current_pos = self.robot_pos
                     current_heading = self.robot_heading
                     remaining_balls = current_batch.copy()
@@ -886,12 +887,12 @@ class BallCollector:
                             remaining_balls.remove(closest_ball)
                             continue
                         
-                        path.append({
+                        current_path.append({
                             'type': 'approach',
                             'pos': approach_pos,
                             'angle': target_angle
                         })
-                        path.append({
+                        current_path.append({
                             'type': 'collect',
                             'pos': ball_pos,
                             'ball_type': closest_ball[2]
@@ -902,63 +903,68 @@ class BallCollector:
                         remaining_balls.remove(closest_ball)
 
                     # Add goal approach path if we have collected any balls
-                    if path:
+                    if current_path:
                         goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
-                        path.extend(goal_path)
+                        current_path.extend(goal_path)
 
-                    # Draw path on frame
-                    frame_with_path = self.draw_path(frame, path)
+                # Always draw the current path if it exists
+                if current_path:
+                    frame = self.draw_path(frame, current_path)
+                
+                # Add key command help
+                help_text = [
+                    "Commands:",
+                    "SPACE - Execute path",
+                    "Q - Quit",
+                    "R - Reset robot position"
+                ]
+                y = 150
+                for text in help_text:
+                    cv2.putText(frame, text,
+                              (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                              0.5, (255, 255, 255), 1)
+                    y += 20
+                
+                # Always show the frame
+                cv2.imshow("Path Planning", frame)
+                
+                # Handle key commands
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('r'):
+                    self.robot_pos = None
+                    self.robot_heading = None
+                    current_path = []  # Clear current path
+                    logger.info("Reset robot position to start")
+                elif key == ord(' ') and current_path:
+                    # Execute the planned path
+                    logger.info("Executing path with {} points".format(len(current_path)))
                     
-                    # Add key command help
-                    help_text = [
-                        "Commands:",
-                        "SPACE - Execute path",
-                        "Q - Quit",
-                        "R - Reset robot position"
-                    ]
-                    y = 150
-                    for text in help_text:
-                        cv2.putText(frame_with_path, text,
-                                  (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                                  0.5, (255, 255, 255), 1)
-                        y += 20
-                    
-                    cv2.imshow("Path Planning", frame_with_path)
-                    
-                    # Handle key commands
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('r'):
-                        self.robot_pos = None
-                        self.robot_heading = None
-                        logger.info("Reset robot position to start")
-                    elif key == ord(' '):
-                        # Execute the planned path
-                        logger.info("Executing path with {} points".format(len(path)))
+                    try:
+                        for point in current_path:
+                            # Move to target position with reassessment
+                            if not self.move_with_reassessment(
+                                point['pos'],
+                                is_collecting=(point['type'] == 'collect')
+                            ):
+                                raise Exception("Movement failed")
+                            
+                            # If this was a goal point, deliver balls
+                            if point['type'] == 'goal':
+                                if not self.deliver_balls():
+                                    raise Exception("Ball delivery failed")
                         
-                        try:
-                            for point in path:
-                                # Move to target position with reassessment
-                                if not self.move_with_reassessment(
-                                    point['pos'],
-                                    is_collecting=(point['type'] == 'collect')
-                                ):
-                                    raise Exception("Movement failed")
-                                
-                                # If this was a goal point, deliver balls
-                                if point['type'] == 'goal':
-                                    if not self.deliver_balls():
-                                        raise Exception("Ball delivery failed")
-                            
-                            # Pause briefly after completing the path
-                            cv2.waitKey(1000)
-                            
-                        except Exception as e:
-                            logger.error("Path execution failed: {}".format(e))
-                            self.stop()
-                            cv2.waitKey(2000)
-                    
+                        # Clear the path after successful execution
+                        current_path = []
+                        # Pause briefly after completing the path
+                        cv2.waitKey(1000)
+                        
+                    except Exception as e:
+                        logger.error("Path execution failed: {}".format(e))
+                        self.stop()
+                        cv2.waitKey(2000)
+                
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
                 cv2.waitKey(1000)
