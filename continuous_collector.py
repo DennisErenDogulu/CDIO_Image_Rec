@@ -275,11 +275,108 @@ class BallCollector:
         
         return (approach_x, approach_y), target_angle
 
+    def draw_path(self, frame, path):
+        """Draw the planned path on the frame"""
+        if self.homography_matrix is None:
+            return frame
+
+        overlay = frame.copy()
+        
+        # Colors for different point types
+        colors = {
+            'approach': (0, 255, 255),  # Yellow
+            'collect': (0, 255, 0),     # Green
+            'goal': (0, 0, 255)         # Red
+        }
+        
+        # Draw lines between points
+        for i in range(len(path)):
+            # Convert current point from cm to pixels
+            pt_cm = np.array([[[path[i]['pos'][0], path[i]['pos'][1]]]], dtype="float32")
+            pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
+            
+            # Draw point
+            color = colors[path[i]['type']]
+            cv2.circle(overlay, tuple(pt_px), 5, color, -1)
+            
+            # Draw line to next point
+            if i < len(path) - 1:
+                next_cm = np.array([[[path[i+1]['pos'][0], path[i+1]['pos'][1]]]], dtype="float32")
+                next_px = cv2.perspectiveTransform(next_cm, self.homography_matrix)[0][0].astype(int)
+                cv2.line(overlay, tuple(pt_px), tuple(next_px), (150, 150, 150), 2)
+            
+            # Draw direction arrow for approach and goal points
+            if path[i]['type'] in ['approach', 'goal']:
+                angle_rad = math.radians(path[i]['angle'])
+                end_x = pt_px[0] + int(20 * math.cos(angle_rad))
+                end_y = pt_px[1] + int(20 * math.sin(angle_rad))
+                cv2.arrowedLine(overlay, tuple(pt_px), (end_x, end_y), color, 2)
+            
+            # Add labels
+            label = ""
+            if path[i]['type'] == 'collect':
+                label = path[i]['ball_type']
+            elif path[i]['type'] == 'approach':
+                label = 'A'
+            elif path[i]['type'] == 'goal':
+                label = 'G'
+            
+            if label:
+                cv2.putText(overlay, label, 
+                          (pt_px[0] + 10, pt_px[1] + 10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # Draw robot position and heading
+        if self.robot_pos:
+            robot_cm = np.array([[[self.robot_pos[0], self.robot_pos[1]]]], dtype="float32")
+            robot_px = cv2.perspectiveTransform(robot_cm, self.homography_matrix)[0][0].astype(int)
+            
+            # Robot circle
+            cv2.circle(overlay, tuple(robot_px), 8, (255, 0, 0), -1)
+            
+            # Robot heading
+            angle_rad = math.radians(self.robot_heading)
+            end_x = robot_px[0] + int(25 * math.cos(angle_rad))
+            end_y = robot_px[1] + int(25 * math.sin(angle_rad))
+            cv2.arrowedLine(overlay, tuple(robot_px), (end_x, end_y), (255, 0, 0), 2)
+        
+        # Blend overlay with original frame
+        alpha = 0.7
+        return cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+    def draw_status(self, frame):
+        """Draw status information on frame"""
+        # Create semi-transparent overlay for status
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (300, 120), (0, 0, 0), -1)
+        alpha = 0.7
+        frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+        
+        # Add status text
+        y = 30
+        cv2.putText(frame, f"Robot Position: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f})",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        y += 20
+        cv2.putText(frame, f"Robot Heading: {self.robot_heading:.1f}°",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        y += 20
+        cv2.putText(frame, "Commands:",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        y += 20
+        cv2.putText(frame, "SPACE - Execute Path | Q - Quit",
+                    (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return frame
+
     def collect_balls(self):
         """Main ball collection loop"""
         cv2.namedWindow("Collection")
         last_plan_time = 0
         last_plan_positions = []
+        current_path = []
         
         while True:
             try:
@@ -316,73 +413,114 @@ class BallCollector:
                     current_batch = balls[:MAX_BALLS_PER_TRIP]
                     logger.info(f"Planning to collect {len(current_batch)} balls")
 
-                    # Process each ball
+                    # Create path plan
+                    current_path = []
+                    current_pos = self.robot_pos
+                    current_heading = self.robot_heading
+
+                    # Add each ball to the path
                     for ball in current_batch:
                         ball_pos = (ball[0], ball[1])
                         
                         # Get approach position
                         approach_pos, target_angle = self.get_approach_vector(ball_pos)
                         
-                        # Turn to face target
-                        angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                        if abs(angle_diff) > 5:
-                            logger.info(f"Turning {angle_diff:.1f} degrees")
-                            if not self.turn(angle_diff):
-                                raise Exception("Turn failed")
-                            time.sleep(0.5)
+                        # Add approach point
+                        current_path.append({
+                            'type': 'approach',
+                            'pos': approach_pos,
+                            'angle': target_angle
+                        })
                         
-                        # Move to approach position
-                        distance = math.hypot(
-                            approach_pos[0] - self.robot_pos[0],
-                            approach_pos[1] - self.robot_pos[1]
-                        )
-                        logger.info(f"Moving {distance:.1f} cm to approach")
-                        if not self.move(distance):
-                            raise Exception("Move failed")
-                        time.sleep(0.5)
+                        # Add collection point
+                        current_path.append({
+                            'type': 'collect',
+                            'pos': ball_pos,
+                            'ball_type': ball[2],
+                            'angle': target_angle
+                        })
                         
-                        # Collect ball
-                        logger.info("Collecting ball")
-                        if not self.collect(COLLECTION_DISTANCE_CM):
-                            raise Exception("Collection failed")
-                        time.sleep(0.5)
+                        current_pos = ball_pos
+                        current_heading = target_angle
 
-                    # After collecting batch, return to goal
+                    # Add goal point if we have any balls
                     if current_batch:
-                        # Calculate goal position (right side, center)
                         goal_x = FIELD_WIDTH_CM - 30  # 30cm from right edge
                         goal_y = FIELD_HEIGHT_CM / 2
+                        goal_angle = 0  # Face right at goal
                         
-                        # Turn to face goal
-                        dx = goal_x - self.robot_pos[0]
-                        dy = goal_y - self.robot_pos[1]
-                        goal_angle = math.degrees(math.atan2(dy, dx))
-                        
-                        angle_diff = (goal_angle - self.robot_heading + 180) % 360 - 180
-                        if abs(angle_diff) > 5:
-                            logger.info(f"Turning {angle_diff:.1f} degrees to goal")
-                            if not self.turn(angle_diff):
-                                raise Exception("Turn to goal failed")
-                            time.sleep(0.5)
-                        
-                        # Move to goal
-                        distance = math.hypot(dx, dy)
-                        logger.info(f"Moving {distance:.1f} cm to goal")
-                        if not self.move(distance):
-                            raise Exception("Move to goal failed")
-                        time.sleep(0.5)
-                        
-                        # Deliver balls
-                        logger.info("Delivering balls")
-                        if not self.deliver_balls():
-                            raise Exception("Ball delivery failed")
-                        time.sleep(0.5)
+                        current_path.append({
+                            'type': 'goal',
+                            'pos': (goal_x, goal_y),
+                            'angle': goal_angle
+                        })
 
-                # Show frame
-                cv2.imshow("Collection", frame)
+                # Draw current path and status
+                frame_with_path = frame.copy()
+                if current_path:
+                    frame_with_path = self.draw_path(frame_with_path, current_path)
+                frame_with_path = self.draw_status(frame_with_path)
+                cv2.imshow("Collection", frame_with_path)
+
+                # Handle key commands
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
+                elif key == ord(' ') and current_path:
+                    logger.info("Executing planned path...")
+                    
+                    try:
+                        # Execute each point in the path
+                        for point in current_path:
+                            # Calculate turn angle
+                            angle_diff = (point['angle'] - self.robot_heading + 180) % 360 - 180
+                            if abs(angle_diff) > 5:
+                                logger.info(f"Turning {angle_diff:.1f} degrees")
+                                if not self.turn(angle_diff):
+                                    raise Exception("Turn failed")
+                                time.sleep(0.5)
+                            
+                            # Calculate movement distance
+                            dx = point['pos'][0] - self.robot_pos[0]
+                            dy = point['pos'][1] - self.robot_pos[1]
+                            distance = math.hypot(dx, dy)
+                            
+                            # Execute movement based on point type
+                            if point['type'] == 'collect':
+                                logger.info(f"Collecting {point['ball_type']} ball")
+                                if not self.collect(COLLECTION_DISTANCE_CM):
+                                    raise Exception("Collection failed")
+                            elif point['type'] == 'goal':
+                                logger.info("Moving to goal")
+                                if not self.move(distance):
+                                    raise Exception("Move to goal failed")
+                                # Deliver balls at goal
+                                logger.info("Delivering balls")
+                                if not self.deliver_balls():
+                                    raise Exception("Ball delivery failed")
+                            else:  # approach
+                                logger.info(f"Moving {distance:.1f} cm")
+                                if not self.move(distance):
+                                    raise Exception("Move failed")
+                            
+                            time.sleep(0.5)
+                            
+                            # Update position and visualization
+                            ret, frame = self.cap.read()
+                            if ret:
+                                self.update_robot_position(frame)
+                                frame_with_path = self.draw_path(frame, current_path)
+                                frame_with_path = self.draw_status(frame_with_path)
+                                cv2.imshow("Collection", frame_with_path)
+                                cv2.waitKey(1)
+                        
+                        # Clear path after successful execution
+                        current_path = []
+                        
+                    except Exception as e:
+                        logger.error(f"Path execution failed: {e}")
+                        self.stop()
+                        time.sleep(1)
 
             except Exception as e:
                 logger.error(f"Error in collection loop: {e}")
