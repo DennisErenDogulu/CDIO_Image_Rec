@@ -23,8 +23,8 @@ import time
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 ROBOFLOW_API_KEY = "LdvRakmEpZizttEFtQap"
-RF_WORKSPACE = "GolfBot"
-RF_PROJECT = "LegoMS3" 
+RF_WORKSPACE = "legoms3"
+RF_PROJECT = "golfbot-fyxfe-etdz0" 
 RF_VERSION = 2
 
 # Color detection ranges (HSV)
