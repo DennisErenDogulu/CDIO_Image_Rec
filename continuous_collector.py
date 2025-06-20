@@ -26,11 +26,13 @@ EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 
 # Model configuration
-WEIGHTS_PATH = "weights(1).pt"  # Path to your YOLOv8 weights
-CONFIDENCE_THRESHOLD = 0.5   # Minimum confidence for detections (50%)
-IOU_THRESHOLD = 0.5         # IoU threshold for overlapping detections (50%)
+WEIGHTS_PATH = "weights(2).pt"  # Path to your YOLOv8 weights
+CONFIDENCE_THRESHOLD = 0.50   # Match Roboflow visualization (50%)
+IOU_THRESHOLD = 0.50         # Match Roboflow visualization (50%)
 OPACITY_THRESHOLD = 0.75    # Opacity threshold (75%)
-TARGET_CLASS = ["white_ball", "orange_ball"]  # Classes to detect
+TARGET_CLASS = ["white_ball", "orange_ball"]  # Classes to collect
+OBSTACLE_CLASS = ["cross"]   # Classes to avoid
+MODEL_IMAGE_SIZE = 640      # Model expects 640x640 input
 
 # Wall configuration
 WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
@@ -60,6 +62,11 @@ IGNORED_AREA = {
     "x_min": 50, "x_max": 100,
     "y_min": 50, "y_max": 100
 }
+
+# Camera configuration
+CAMERA_WIDTH = 640   # Match model's input size
+CAMERA_HEIGHT = 640  # Match model's input size
+CAMERA_FPS = 30
 
 # Setup logging
 logging.basicConfig(
@@ -163,14 +170,14 @@ class BallCollector:
             raise
         
         # Initialize camera
-        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
+        self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
         
-        # Set camera properties
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        # Set camera properties to match model's expected input
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
         
         # Robot state
         self.robot_pos = None  # Will be updated by vision
@@ -356,13 +363,14 @@ class BallCollector:
             frame,
             conf=CONFIDENCE_THRESHOLD,
             iou=IOU_THRESHOLD,
-            imgsz=640  # EXACTLY matches your Roboflow resize
+            imgsz=MODEL_IMAGE_SIZE
         )[0]
 
         # Get area of the resized image that YOLO actually used
         resized_area = results.orig_shape[0] * results.orig_shape[1]
 
         balls = []
+        obstacles = []  # Track obstacle positions for avoidance
 
         # Process detections
         for detection in results.boxes.data:
@@ -377,14 +385,12 @@ class BallCollector:
             # Compute relative area (opacity) correctly using resized dimensions
             opacity = (w * h) / resized_area
 
-            # Skip if too small (optional: tweak this threshold)
+            # Skip if too small
             if opacity < OPACITY_THRESHOLD:
                 continue
 
-            # Check class name
+            # Get class name
             class_name = results.names[class_id]
-            if class_name not in TARGET_CLASS:
-                continue
 
             # Convert detection point to real-world cm using homography
             if self.homography_matrix is not None:
@@ -399,14 +405,22 @@ class BallCollector:
                     IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
                     continue
 
-                balls.append((x_cm, y_cm, class_name))
+                # Store balls and obstacles separately
+                if class_name in TARGET_CLASS:
+                    balls.append((x_cm, y_cm, class_name))
+                    color = (0, 255, 0)  # Green for balls
+                elif class_name in OBSTACLE_CLASS:
+                    obstacles.append((x_cm, y_cm, class_name))
+                    color = (0, 0, 255)  # Red for obstacles
 
-                # Optional: draw detection for debugging
-                cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
-                cv2.putText(frame, f"{confidence:.2f}",
-                            (int(x) + 10, int(y)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Draw detection for debugging
+                cv2.circle(frame, (int(x), int(y)), 5, color, -1)
+                cv2.putText(frame, f"{class_name} {confidence:.2f}",
+                           (int(x) + 10, int(y)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+        # Store obstacles for path planning
+        self.detected_obstacles = obstacles
         return balls
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
