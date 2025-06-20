@@ -26,9 +26,9 @@ EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 
 # Model configuration
-WEIGHTS_PATH = "weights.pt"  # Path to your YOLOv8 weights
-CONFIDENCE_THRESHOLD = 0.9   # Minimum confidence for detections
-TARGET_CLASS = "WhitetableTennisBalls"  # Only detect this class
+WEIGHTS_PATH = "weights(1).pt"  # Path to your YOLOv8 weights
+CONFIDENCE_THRESHOLD = 0.7   # Minimum confidence for detections
+TARGET_CLASS = ["white_ball", "orange_ball"]  # Classes to detect
 
 # Wall configuration
 WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
@@ -366,8 +366,8 @@ class BallCollector:
             # Get class name from model's names dictionary
             class_name = results.names[class_id]
             
-            # Skip if not the target class
-            if class_name != TARGET_CLASS:
+            # Skip if not one of the target classes
+            if class_name not in TARGET_CLASS:
                 continue
             
             # Convert to cm using homography
