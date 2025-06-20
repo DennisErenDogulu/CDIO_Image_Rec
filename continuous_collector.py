@@ -18,6 +18,12 @@ import numpy as np
 from typing import List, Tuple, Optional
 from ultralytics import YOLO
 import time
+import random
+
+# ArUco marker configuration
+ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+ARUCO_PARAMS = cv2.aruco.DetectorParameters()
+ARUCO_MARKER_ID = 0  # ID of the marker to track
 
 # Configuration
 EV3_IP = "172.20.10.6"
@@ -26,13 +32,13 @@ EV3_PORT = 12345
 # Model configuration
 MODEL_PATH = "weights(2).pt"  # Using local weights
 CONFIDENCE_THRESHOLD = 0.5
+IOU_THRESHOLD = 0.45  # Non-maximum suppression threshold
 MODEL_IMAGE_SIZE = 640  # YOLOv8 default size
 
-# Color detection ranges (HSV)
-GREEN_LOWER = np.array([35, 50, 50])   # Robot base marker
-GREEN_UPPER = np.array([85, 255, 255])
-PINK_LOWER = np.array([145, 50, 50])   # Direction marker
-PINK_UPPER = np.array([175, 255, 255])
+# Camera settings
+CAMERA_WIDTH = 640   # Match model input size
+CAMERA_HEIGHT = 640  # Square aspect ratio for better detection
+CAMERA_FPS = 30
 
 # Field dimensions (cm)
 FIELD_WIDTH_CM = 180
@@ -51,11 +57,27 @@ COLLECTION_DISTANCE_CM = 20  # Distance to move forward when collecting
 APPROACH_DISTANCE_CM = 30    # Distance to keep from ball for approach
 WALL_SAFETY_MARGIN = 15     # cm to keep away from walls
 
+# Obstacle detection parameters
+OBSTACLE_GRID_SIZE = 10     # cm per grid cell
+MIN_OBSTACLE_AREA = 100     # minimum pixel area for obstacles
+MAX_OBSTACLE_AREA = 400     # maximum cm² area for obstacles
+
+# Color detection ranges (HSV)
+GREEN_LOWER = np.array([35, 50, 50])   # Robot base marker
+GREEN_UPPER = np.array([85, 255, 255])
+PINK_LOWER = np.array([145, 50, 50])   # Direction marker
+PINK_UPPER = np.array([175, 255, 255])
+
 # Ignored area (center obstacle)
 IGNORED_AREA = {
     "x_min": 50, "x_max": 100,
     "y_min": 50, "y_max": 100
 }
+
+# Ball tracking parameters
+BALL_TRACKING_HISTORY = 5  # Number of frames to keep ball history
+MIN_DETECTION_CONF = 0.5   # Minimum confidence for ball detection
+TRACKING_DISTANCE_THRESHOLD = 30  # Maximum cm between tracked positions
 
 # Setup logging
 logging.basicConfig(
@@ -80,9 +102,9 @@ class BallCollector:
             raise RuntimeError("Could not open camera")
 
         # Set camera properties
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
 
         # Robot state
         self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)
@@ -91,59 +113,66 @@ class BallCollector:
         # Calibration
         self.calibration_points = []
         self.homography_matrix = None
+        
+        # Ball tracking
+        self.tracked_balls = {}  # Dictionary to store ball tracking history
+        self.ball_history = []   # List to store recent ball positions
+        self.frame_count = 0     # Counter for tracking frames
+        
+        # Initialize class colors for visualization
+        self.class_colors = {}
 
     def detect_markers(self, frame):
-        """Detect green base and pink direction markers"""
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        """Detect ArUco markers for robot position tracking"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
         
-        # Detect green base marker
-        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
-        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Detect pink direction marker
-        pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
-        pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Find largest green contour
-        green_center = None
-        if green_contours:
-            largest_green = max(green_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_green) > 100:
-                M = cv2.moments(largest_green)
-                if M["m00"] != 0:
-                    green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-        
-        # Find largest pink contour
-        pink_center = None
-        if pink_contours:
-            largest_pink = max(pink_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_pink) > 50:
-                M = cv2.moments(largest_pink)
-                if M["m00"] != 0:
-                    pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-        
-        return green_center, pink_center
+        if ids is not None:
+            for idx, marker_id in enumerate(ids.flatten()):
+                if marker_id != ARUCO_MARKER_ID:
+                    continue
+                    
+                # Get marker corners and center
+                pts = corners[idx][0]
+                center_x = int(pts[:, 0].mean())
+                center_y = int(pts[:, 1].mean())
+                
+                # Calculate heading from marker orientation
+                # Using first two points to determine direction
+                dx = pts[1][0] - pts[0][0]
+                dy = pts[1][1] - pts[0][1]
+                heading = math.degrees(math.atan2(dy, dx))
+                
+                # Convert to cm coordinates if homography matrix exists
+                if self.homography_matrix is not None:
+                    pt_px = np.array([[[center_x, center_y]]], dtype="float32")
+                    pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
+                    return pt_cm[0], pt_cm[1], heading
+                    
+        return None, None, None
 
     def update_robot_position(self, frame):
-        """Update robot position and heading based on visual markers"""
-        green_center, pink_center = self.detect_markers(frame)
+        """Update robot position and heading based on ArUco markers"""
+        x_cm, y_cm, heading = self.detect_markers(frame)
         
-        if green_center and pink_center and self.homography_matrix is not None:
-            # Convert green center (robot base) to cm coordinates
-            green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
-            green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
+        if x_cm is not None and y_cm is not None:
+            self.robot_pos = (x_cm, y_cm)
+            self.robot_heading = heading
             
-            # Convert pink center (direction marker) to cm coordinates
-            pink_px = np.array([[[float(pink_center[0]), float(pink_center[1])]]], dtype="float32")
-            pink_cm = cv2.perspectiveTransform(pink_px, np.linalg.inv(self.homography_matrix))[0][0]
-            
-            # Update robot position and heading
-            self.robot_pos = (green_cm[0], green_cm[1])
-            dx = pink_cm[0] - green_cm[0]
-            dy = pink_cm[1] - green_cm[1]
-            self.robot_heading = math.degrees(math.atan2(dy, dx))
+            # Draw marker visualization
+            if self.homography_matrix is not None:
+                pt_cm = np.array([[[x_cm, y_cm]]], dtype="float32")
+                pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
+                cv2.circle(frame, tuple(pt_px), 5, (0, 255, 0), -1)
+                
+                # Draw heading line
+                angle_rad = math.radians(heading)
+                end_x = pt_px[0] + int(30 * math.cos(angle_rad))
+                end_y = pt_px[1] + int(30 * math.sin(angle_rad))
+                cv2.line(frame, tuple(pt_px), (end_x, end_y), (0, 255, 0), 2)
             
             return True
+            
         return False
 
     def detect_balls(self) -> List[Tuple[float, float, str]]:
@@ -152,17 +181,30 @@ class BallCollector:
         if not ret:
             return []
 
-        # Run YOLOv8 inference
-        results = self.model(frame, conf=CONFIDENCE_THRESHOLD)[0]
-        balls = []
+        # Run YOLOv8 inference with optimized settings
+        results = self.model(
+            frame,
+            conf=CONFIDENCE_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            verbose=False
+        )[0]
+        
+        current_balls = []
 
         # Process detections
         for det in results.boxes.data.tolist():
-            x, y, x2, y2, conf, cls = det
+            x1, y1, x2, y2, conf, cls = det
             
+            # Skip low confidence detections
+            if conf < MIN_DETECTION_CONF:
+                continue
+                
             # Calculate center point
-            center_x = (x + x2) / 2
-            center_y = (y + y2) / 2
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            
+            # Get class name
+            class_name = results.names[int(cls)]
             
             # Convert to cm using homography if available
             if self.homography_matrix is not None:
@@ -171,18 +213,52 @@ class BallCollector:
                 x_cm, y_cm = pt_cm
                 
                 # Skip if in ignored area
-                if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                    class_name = results.names[int(cls)]
-                    balls.append((x_cm, y_cm, class_name))
+                if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                    IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                    continue
+                
+                # Only process ball detections
+                if 'ball' in class_name.lower():
+                    current_balls.append((x_cm, y_cm, class_name))
                     
-                    # Draw detection for debugging
-                    cv2.rectangle(frame, (int(x), int(y)), (int(x2), int(y2)), (0, 255, 0), 2)
-                    cv2.putText(frame, f"{class_name} {conf:.2f}",
-                              (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX,
-                              0.5, (0, 255, 0), 2)
+                    # Get color for visualization
+                    color = self.class_colors.setdefault(class_name, (
+                        random.randint(0,255),
+                        random.randint(0,255),
+                        random.randint(0,255)
+                    ))
+                    
+                    # Draw detection box
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                    
+                    # Draw confidence and position
+                    label = f"{class_name} ({conf:.2f})"
+                    cv2.putText(frame, label, (int(x1), int(y1)-10),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    # Draw position in cm
+                    pos_text = f"({x_cm:.1f}, {y_cm:.1f})"
+                    cv2.putText(frame, pos_text, (int(x1), int(y1)+20),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        return balls
+        # Update ball tracking
+        self.update_ball_tracking(current_balls)
+        
+        # Get stable ball positions
+        stable_balls = self.get_stable_balls()
+        
+        # Draw tracking visualization
+        if self.homography_matrix is not None:
+            for ball in stable_balls:
+                x_cm, y_cm = ball[0], ball[1]
+                pt_cm = np.array([[[x_cm, y_cm]]], dtype="float32")
+                pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
+                
+                # Draw circle for stable balls
+                cv2.circle(frame, tuple(pt_px), 15, (0, 255, 0), 2)
+                cv2.circle(frame, tuple(pt_px), 2, (0, 255, 0), -1)
+
+        return stable_balls
 
     def calibrate(self):
         """Perform camera calibration by clicking 4 corners"""
@@ -550,6 +626,125 @@ class BallCollector:
             self.stop()
             self.cap.release()
             cv2.destroyAllWindows()
+
+    def detect_red_cross_obstacles(self, frame):
+        """Detect red cross obstacles in the frame"""
+        if self.homography_matrix is None:
+            return set()
+            
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Red color range in HSV (handles both red ranges)
+        mask1 = cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
+        red_mask = cv2.bitwise_or(mask1, mask2)
+        
+        # Clean up mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        obstacles = set()
+        min_area_px = 100  # Minimum area to consider
+        max_area_cm2 = 400  # Maximum area in cm²
+        
+        # Calculate pixels per cm
+        px_per_x = frame.shape[1] / FIELD_WIDTH_CM
+        px_per_y = frame.shape[0] / FIELD_HEIGHT_CM
+        
+        for cnt in contours:
+            area_px = cv2.contourArea(cnt)
+            if area_px < min_area_px:
+                continue
+                
+            x, y, w, h = cv2.boundingRect(cnt)
+            area_cm2 = (w / px_per_x) * (h / px_per_y)
+            
+            if area_cm2 > max_area_cm2:
+                continue
+                
+            # Sample points within contour
+            for sx in range(x, x + w, 10):
+                for sy in range(y, y + h, 10):
+                    if cv2.pointPolygonTest(cnt, (sx, sy), False) >= 0:
+                        # Convert to cm coordinates
+                        pt_px = np.array([[[float(sx), float(sy)]]], dtype="float32")
+                        pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
+                        
+                        # Add to obstacles if within field bounds
+                        if (0 <= pt_cm[0] <= FIELD_WIDTH_CM and 
+                            0 <= pt_cm[1] <= FIELD_HEIGHT_CM):
+                            obstacles.add((pt_cm[0], pt_cm[1]))
+                            
+            # Draw obstacle visualization
+            cv2.drawContours(frame, [cnt], -1, (0, 0, 255), 2)
+            
+        return obstacles
+
+    def update_ball_tracking(self, current_balls):
+        """Update ball tracking with new detections"""
+        self.frame_count += 1
+        
+        # Convert current balls to dictionary for easier lookup
+        current_dict = {(x, y): label for x, y, label in current_balls}
+        
+        # Update tracked balls
+        new_tracked = {}
+        for pos, label in current_dict.items():
+            matched = False
+            
+            # Try to match with existing tracked balls
+            for tracked_pos in self.tracked_balls:
+                dist = math.hypot(pos[0] - tracked_pos[0], pos[1] - tracked_pos[1])
+                if dist < TRACKING_DISTANCE_THRESHOLD:
+                    # Update tracking history
+                    history = self.tracked_balls[tracked_pos]
+                    history.append((self.frame_count, pos))
+                    # Keep only recent history
+                    while len(history) > BALL_TRACKING_HISTORY:
+                        history.pop(0)
+                    new_tracked[pos] = history
+                    matched = True
+                    break
+            
+            # If no match found, start new track
+            if not matched:
+                new_tracked[pos] = [(self.frame_count, pos)]
+        
+        self.tracked_balls = new_tracked
+        
+        # Clean up old tracks
+        for pos in list(self.tracked_balls.keys()):
+            history = self.tracked_balls[pos]
+            if self.frame_count - history[-1][0] > BALL_TRACKING_HISTORY:
+                del self.tracked_balls[pos]
+
+    def get_stable_balls(self):
+        """Get balls that have been consistently tracked"""
+        stable_balls = []
+        
+        for pos, history in self.tracked_balls.items():
+            # Only consider balls with enough history
+            if len(history) >= BALL_TRACKING_HISTORY - 1:
+                # Calculate average position
+                recent_positions = [p for _, p in history[-3:]]  # Use last 3 positions
+                avg_x = sum(x for x, _ in recent_positions) / len(recent_positions)
+                avg_y = sum(y for y, _ in recent_positions) / len(recent_positions)
+                
+                # Calculate position stability
+                max_deviation = max(
+                    math.hypot(x - avg_x, y - avg_y)
+                    for x, y in recent_positions
+                )
+                
+                # If position is stable, add to result
+                if max_deviation < TRACKING_DISTANCE_THRESHOLD / 2:
+                    stable_balls.append((avg_x, avg_y, "ball"))
+        
+        return stable_balls
 
 if __name__ == "__main__":
     collector = BallCollector()
