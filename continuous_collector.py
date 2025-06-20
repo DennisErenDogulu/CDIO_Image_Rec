@@ -347,60 +347,66 @@ class BallCollector:
         cv2.destroyWindow("Calibration")
 
     def detect_balls(self) -> List[Tuple[float, float, str]]:
-        """Detect balls in current camera view, return list of (x_cm, y_cm, label)"""
         ret, frame = self.cap.read()
         if not ret:
             return []
 
-        # Run YOLOv8 inference with NMS parameters
+        # Run YOLOv8 inference with correct input size and thresholds
         results = self.model(
             frame,
-            conf=CONFIDENCE_THRESHOLD,  # Confidence threshold (50%)
-            iou=IOU_THRESHOLD,         # IoU threshold for NMS (50%)
-            max_det=50                 # Maximum detections per image
+            conf=CONFIDENCE_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            imgsz=640  # EXACTLY matches your Roboflow resize
         )[0]
-        
+
+        # Get area of the resized image that YOLO actually used
+        resized_area = results.orig_shape[0] * results.orig_shape[1]
+
         balls = []
-        
+
         # Process detections
         for detection in results.boxes.data:
             x, y, w, h, conf, cls = detection
-            x = float(x)  # Center X
-            y = float(y)  # Center Y
-            opacity = float(w * h) / (frame.shape[0] * frame.shape[1])  # Calculate relative area
-            class_id = int(cls)
+            x = float(x)
+            y = float(y)
+            w = float(w)
+            h = float(h)
             confidence = float(conf)
-            
-            # Skip if opacity is too low
+            class_id = int(cls)
+
+            # Compute relative area (opacity) correctly using resized dimensions
+            opacity = (w * h) / resized_area
+
+            # Skip if too small (optional: tweak this threshold)
             if opacity < OPACITY_THRESHOLD:
                 continue
-                
-            # Get class name from model's names dictionary
+
+            # Check class name
             class_name = results.names[class_id]
-            
-            # Skip if not one of the target classes
             if class_name not in TARGET_CLASS:
                 continue
-            
-            # Convert to cm using homography
+
+            # Convert detection point to real-world cm using homography
             if self.homography_matrix is not None:
                 pt_px = np.array([[[x, y]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(pt_px, 
-                                               np.linalg.inv(self.homography_matrix))[0][0]
+                pt_cm = cv2.perspectiveTransform(
+                    pt_px, np.linalg.inv(self.homography_matrix)
+                )[0][0]
                 x_cm, y_cm = pt_cm
-                
-                # Check if ball is in ignored area
-                if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                    balls.append((x_cm, y_cm, class_name))
-                    
-                    # Draw detection on frame for debugging
-                    pt_px = (int(x), int(y))
-                    cv2.circle(frame, pt_px, 5, (0, 255, 0), -1)
-                    cv2.putText(frame, f"{confidence:.2f}", 
-                              (pt_px[0] + 10, pt_px[1]), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
+
+                # Ignore detections in the ignored area
+                if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                    IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                    continue
+
+                balls.append((x_cm, y_cm, class_name))
+
+                # Optional: draw detection for debugging
+                cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
+                cv2.putText(frame, f"{confidence:.2f}",
+                            (int(x) + 10, int(y)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
         return balls
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
