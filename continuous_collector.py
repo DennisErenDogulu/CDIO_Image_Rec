@@ -20,11 +20,6 @@ from ultralytics import YOLO
 import time
 import random
 
-# ArUco marker configuration
-ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-ARUCO_PARAMS = cv2.aruco.DetectorParameters()
-ARUCO_MARKER_ID = 0  # ID of the marker to track
-
 # Configuration
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
@@ -123,53 +118,60 @@ class BallCollector:
         self.class_colors = {}
 
     def detect_markers(self, frame):
-        """Detect ArUco markers for robot position tracking"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
+        """Detect green base and pink direction markers"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        if ids is not None:
-            for idx, marker_id in enumerate(ids.flatten()):
-                if marker_id != ARUCO_MARKER_ID:
-                    continue
-                    
-                # Get marker corners and center
-                pts = corners[idx][0]
-                center_x = int(pts[:, 0].mean())
-                center_y = int(pts[:, 1].mean())
-                
-                # Calculate heading from marker orientation
-                # Using first two points to determine direction
-                dx = pts[1][0] - pts[0][0]
-                dy = pts[1][1] - pts[0][1]
-                heading = math.degrees(math.atan2(dy, dx))
-                
-                # Convert to cm coordinates if homography matrix exists
-                if self.homography_matrix is not None:
-                    pt_px = np.array([[[center_x, center_y]]], dtype="float32")
-                    pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
-                    return pt_cm[0], pt_cm[1], heading
-                    
-        return None, None, None
+        # Detect green base marker
+        green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Detect pink direction marker
+        pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
+        pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Find largest green contour
+        green_center = None
+        if green_contours:
+            largest_green = max(green_contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_green) > 100:
+                M = cv2.moments(largest_green)
+                if M["m00"] != 0:
+                    green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+        
+        # Find largest pink contour
+        pink_center = None
+        if pink_contours:
+            largest_pink = max(pink_contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_pink) > 50:
+                M = cv2.moments(largest_pink)
+                if M["m00"] != 0:
+                    pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+        
+        return green_center, pink_center
 
     def update_robot_position(self, frame):
-        """Update robot position and heading based on ArUco markers"""
-        x_cm, y_cm, heading = self.detect_markers(frame)
+        """Update robot position and heading based on visual markers"""
+        green_center, pink_center = self.detect_markers(frame)
         
-        if x_cm is not None and y_cm is not None:
-            self.robot_pos = (x_cm, y_cm)
-            self.robot_heading = heading
+        if green_center and pink_center and self.homography_matrix is not None:
+            # Convert green center (robot base) to cm coordinates
+            green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
+            green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
+            
+            # Convert pink center (direction marker) to cm coordinates
+            pink_px = np.array([[[float(pink_center[0]), float(pink_center[1])]]], dtype="float32")
+            pink_cm = cv2.perspectiveTransform(pink_px, np.linalg.inv(self.homography_matrix))[0][0]
+            
+            # Update robot position and heading
+            self.robot_pos = (green_cm[0], green_cm[1])
+            dx = pink_cm[0] - green_cm[0]
+            dy = pink_cm[1] - green_cm[1]
+            self.robot_heading = math.degrees(math.atan2(dy, dx))
             
             # Draw marker visualization
-            if self.homography_matrix is not None:
-                pt_cm = np.array([[[x_cm, y_cm]]], dtype="float32")
-                pt_px = cv2.perspectiveTransform(pt_cm, self.homography_matrix)[0][0].astype(int)
-                cv2.circle(frame, tuple(pt_px), 5, (0, 255, 0), -1)
-                
-                # Draw heading line
-                angle_rad = math.radians(heading)
-                end_x = pt_px[0] + int(30 * math.cos(angle_rad))
-                end_y = pt_px[1] + int(30 * math.sin(angle_rad))
-                cv2.line(frame, tuple(pt_px), (end_x, end_y), (0, 255, 0), 2)
+            cv2.circle(frame, green_center, 5, (0, 255, 0), -1)
+            cv2.circle(frame, pink_center, 5, (255, 0, 255), -1)
+            cv2.line(frame, green_center, pink_center, (255, 255, 0), 2)
             
             return True
             
