@@ -132,10 +132,11 @@ class BallCollector:
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
         
-        # Set camera properties
+        # Set camera properties for reduced lag
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce lag
         
         # Robot state
         self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)  # Starting position
@@ -186,8 +187,14 @@ class BallCollector:
         
         return green_center, pink_center
 
-    def update_robot_position(self, frame):
+    def update_robot_position(self, frame=None):
         """Update robot position and heading based on visual markers"""
+        # Capture fresh frame if none provided
+        if frame is None:
+            ret, frame = self.cap.read()
+            if not ret:
+                return False
+        
         green_center, pink_center = self.detect_markers(frame)
         
         if green_center and pink_center and self.homography_matrix is not None:
@@ -548,6 +555,65 @@ class BallCollector:
         
         return frame
 
+    def move_to_target_live(self, target_pos: Tuple[float, float], target_type: str = "approach") -> bool:
+        """Move to target using continuous position updates and small adjustments"""
+        max_distance_per_step = 10  # Maximum distance to move in one step (cm)
+        angle_tolerance = 15  # Degrees - tolerance for direction alignment
+        distance_tolerance = 5  # cm - how close we need to get to target
+        
+        step_count = 0
+        max_steps = 50  # Prevent infinite loops
+        
+        while step_count < max_steps:
+            # Update current position
+            if not self.update_robot_position():
+                logger.warning("Lost robot tracking during live movement")
+                return False
+            
+            # Calculate distance and angle to target
+            dx = target_pos[0] - self.robot_pos[0]
+            dy = target_pos[1] - self.robot_pos[1]
+            distance_to_target = math.hypot(dx, dy)
+            target_angle = math.degrees(math.atan2(dy, dx))
+            
+            # Check if we've reached the target
+            if distance_to_target <= distance_tolerance:
+                logger.info(f"Reached target at {target_pos}")
+                return True
+            
+            # Calculate angle difference
+            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+            
+            # If we need to turn significantly, make a small turn
+            if abs(angle_diff) > angle_tolerance:
+                # Limit turn to max 30 degrees per adjustment
+                turn_amount = max(-30, min(30, angle_diff))
+                logger.info(f"Live adjustment: turning {turn_amount:.1f} degrees")
+                if not self.turn(turn_amount):
+                    return False
+                self.update_robot_position()  # Update after turn
+            else:
+                # Move forward in small increments
+                move_distance = min(max_distance_per_step, distance_to_target)
+                
+                if target_type == "collect" and distance_to_target <= COLLECTION_DISTANCE_CM:
+                    # Final approach for collection
+                    logger.info(f"Final collection approach: {move_distance:.1f} cm")
+                    return self.collect(move_distance)
+                else:
+                    logger.info(f"Live movement: {move_distance:.1f} cm")
+                    if not self.move(move_distance):
+                        return False
+                    self.update_robot_position()  # Update after move
+            
+            step_count += 1
+            
+            # Brief pause to allow for processing
+            time.sleep(0.1)
+        
+        logger.warning(f"Max steps reached trying to reach {target_pos}")
+        return False
+
     def deliver_balls(self) -> bool:
         """Run collector in reverse to deliver balls"""
         try:
@@ -626,8 +692,9 @@ class BallCollector:
         
         while True:
             try:
-                # Capture frame for visualization
-                ret, frame = self.cap.read()
+                # Capture frame for visualization - ensure fresh frame
+                self.cap.grab()  # Grab latest frame from buffer
+                ret, frame = self.cap.retrieve()  # Retrieve the grabbed frame
                 if not ret:
                     continue
 
@@ -778,47 +845,23 @@ class BallCollector:
                         
                         try:
                             for point in path:
-                                # Wait for visual marker detection
-                                retries = 0
-                                while not self.update_robot_position(frame) and retries < 10:
-                                    ret, frame = self.cap.read()
-                                    retries += 1
-                                    time.sleep(0.1)
-                                
-                                if retries >= 10:
-                                    raise Exception("Lost robot marker tracking")
-
-                                # Calculate turn angle from current heading
                                 target_pos = point['pos']
-                                dx = target_pos[0] - self.robot_pos[0]
-                                dy = target_pos[1] - self.robot_pos[1]
-                                target_angle = math.degrees(math.atan2(dy, dx))
-                                
-                                # Turn to face target
-                                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                                if abs(angle_diff) > 5:
-                                    logger.info(f"Turning {angle_diff:.1f} degrees")
-                                    if not self.turn(angle_diff):
-                                        raise Exception("Turn command failed")
-                                
-                                # Move to target position
-                                distance = math.hypot(dx, dy)
                                 
                                 if point['type'] == 'collect':
-                                    logger.info(f"Collecting {point['ball_type']} ball")
-                                    if not self.collect(COLLECTION_DISTANCE_CM):
-                                        raise Exception("Collect command failed")
+                                    logger.info(f"Live approach to collect {point['ball_type']} ball")
+                                    if not self.move_to_target_live(target_pos, "collect"):
+                                        raise Exception("Live collection movement failed")
                                 elif point['type'] == 'goal':
-                                    logger.info(f"Moving {distance:.1f} cm to goal")
-                                    if not self.move(distance):
-                                        raise Exception("Move command failed")
+                                    logger.info(f"Live movement to goal")
+                                    if not self.move_to_target_live(target_pos, "goal"):
+                                        raise Exception("Live goal movement failed")
                                     # After reaching goal position, deliver balls
                                     if not self.deliver_balls():
                                         raise Exception("Ball delivery failed")
                                 else:  # approach point
-                                    logger.info(f"Moving {distance:.1f} cm")
-                                    if not self.move(distance):
-                                        raise Exception("Move command failed")
+                                    logger.info(f"Live movement to approach point")
+                                    if not self.move_to_target_live(target_pos, "approach"):
+                                        raise Exception("Live approach movement failed")
                                 
                                 # Update visualization during execution
                                 ret, frame = self.cap.read()
@@ -827,7 +870,7 @@ class BallCollector:
                                     frame = self.draw_status(frame)
                                     frame = self.draw_robot_markers(frame)
                                     frame_with_path = self.draw_path(frame, path)
-                                    cv2.putText(frame_with_path, "EXECUTING PATH...", 
+                                    cv2.putText(frame_with_path, "EXECUTING PATH LIVE...", 
                                               (10, frame_with_path.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
                                               0.7, (0, 255, 0), 2)
                                     cv2.imshow("Path Planning", frame_with_path)
