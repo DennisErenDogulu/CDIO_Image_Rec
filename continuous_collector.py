@@ -16,16 +16,18 @@ import socket
 import logging
 import numpy as np
 from typing import List, Tuple, Optional
-from roboflow import Roboflow
+from ultralytics import YOLO
 import time
 
 # Configuration
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
-ROBOFLOW_API_KEY = "LdvRakmEpZizttEFtQap"
-RF_WORKSPACE = "legoms3"
-RF_PROJECT = "golfbot-fyxfe-etdz0" 
-RF_VERSION = 2
+
+# Model configuration
+MODEL_PATH = "weights(3).pt"  # Using local weights
+CONFIDENCE_THRESHOLD = 0.5
+IOU_THRESHOLD = 0.45  # Non-maximum suppression threshold
+MODEL_IMAGE_SIZE = 640  # YOLOv8 default size
 
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
@@ -122,10 +124,8 @@ def check_wall_collision(start_pos, end_pos, walls, safety_margin):
 
 class BallCollector:
     def __init__(self):
-        # Initialize Roboflow
-        self.rf = Roboflow(api_key=ROBOFLOW_API_KEY)
-        self.project = self.rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
-        self.model = self.project.version(RF_VERSION).model
+        # Initialize YOLO model (local weights)
+        self.model = YOLO(MODEL_PATH)
         
         # Initialize camera
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
@@ -392,41 +392,34 @@ class BallCollector:
         if not ret:
             return []
 
-        # Resize for Roboflow model
-        small = cv2.resize(frame, (416, 416))
-        
-        # Get predictions
-        predictions = self.model.predict(small, confidence=30, overlap=20).json()
-        
+        # Run YOLOv8 inference
+        results = self.model(frame, conf=CONFIDENCE_THRESHOLD)[0]
         balls = []
-        scale_x = frame.shape[1] / 416
-        scale_y = frame.shape[0] / 416
-        
+
         # Target only white and orange balls
         target_ball_types = ['white_ball', 'orange_ball']
-        
-        for pred in predictions.get('predictions', []):
-            ball_class = pred['class']
-            
-            # Only process white_ball and orange_ball
-            if ball_class not in target_ball_types:
+
+        for det in results.boxes.data.tolist():
+            x1, y1, x2, y2, conf, cls = det
+            class_name = results.names[int(cls)]
+            if class_name not in target_ball_types:
                 continue
-                
-            x_px = int(pred['x'] * scale_x)
-            y_px = int(pred['y'] * scale_y)
-            
-            # Convert to cm using homography
+
+            # Calculate center point
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+
+            # Convert to cm using homography if available
             if self.homography_matrix is not None:
-                pt_px = np.array([[[x_px, y_px]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(pt_px, 
-                                               np.linalg.inv(self.homography_matrix))[0][0]
+                pt_px = np.array([[[center_x, center_y]]], dtype="float32")
+                pt_cm = cv2.perspectiveTransform(pt_px, np.linalg.inv(self.homography_matrix))[0][0]
                 x_cm, y_cm = pt_cm
-                
+
                 # Check if ball is in ignored area
                 if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                    balls.append((x_cm, y_cm, ball_class))
-        
+                        IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                    balls.append((x_cm, y_cm, class_name))
+
         return balls
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
