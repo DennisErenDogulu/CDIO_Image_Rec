@@ -20,13 +20,21 @@ import numpy as np
 from typing import List, Tuple, Optional
 from ultralytics import YOLO
 import time
+from roboflow import Roboflow
 
 # Configuration
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 
 # Model configuration
-WEIGHTS_PATH = "weights(2).pt"  # Path to your YOLOv8 weights
+from roboflow import Roboflow
+
+# Roboflow configuration
+ROBOFLOW_API_KEY = "LdvRakmEpZizttEFtQap"
+RF_WORKSPACE = "legoms3"
+RF_PROJECT = "golfbot-fyxfe-etdz0"
+RF_VERSION = 2
+
 CONFIDENCE_THRESHOLD = 0.50   # Match Roboflow visualization (50%)
 IOU_THRESHOLD = 0.50         # Match Roboflow visualization (50%)
 OPACITY_THRESHOLD = 0.75    # Opacity threshold (75%)
@@ -161,14 +169,16 @@ def detect_colored_marker(frame, lower_color, upper_color):
 
 class BallCollector:
     def __init__(self):
-        # Initialize YOLO model
+        # Initialize Roboflow
         try:
-            self.model = YOLO(WEIGHTS_PATH)
-            logger.info("Successfully loaded YOLO model from %s", WEIGHTS_PATH)
+            rf = Roboflow(api_key=ROBOFLOW_API_KEY)
+            self.project = rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
+            self.model = self.project.version(RF_VERSION).model
+            logger.info("Successfully connected to Roboflow API")
         except Exception as e:
-            logger.error("Failed to load YOLO model: %s", e)
+            logger.error("Failed to initialize Roboflow: %s", e)
             raise
-        
+
         # Initialize camera
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
@@ -180,8 +190,9 @@ class BallCollector:
         self.cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
         
         # Robot state
-        self.robot_pos = None  # Will be updated by vision
-        self.robot_heading = None  # Will be updated by vision
+        self.robot_pos = None
+        self.robot_heading = None
+        self.detected_obstacles = []
         
         # Calibration points for homography
         self.calibration_points = []
@@ -358,70 +369,69 @@ class BallCollector:
         if not ret:
             return []
 
-        # Run YOLOv8 inference with correct input size and thresholds
-        results = self.model(
-            frame,
-            conf=CONFIDENCE_THRESHOLD,
-            iou=IOU_THRESHOLD,
-            imgsz=MODEL_IMAGE_SIZE
-        )[0]
+        # Run inference through Roboflow API
+        try:
+            # Get predictions from Roboflow
+            predictions = self.model.predict(frame, confidence=CONFIDENCE_THRESHOLD, overlap=IOU_THRESHOLD).json()
+            
+            balls = []
+            obstacles = []
 
-        # Get area of the resized image that YOLO actually used
-        resized_area = results.orig_shape[0] * results.orig_shape[1]
+            # Process predictions
+            for pred in predictions.get('predictions', []):
+                x = pred['x']
+                y = pred['y']
+                width = pred['width']
+                height = pred['height']
+                confidence = pred['confidence']
+                class_name = pred['class']
 
-        balls = []
-        obstacles = []  # Track obstacle positions for avoidance
+                # Calculate opacity
+                opacity = (width * height) / (CAMERA_WIDTH * CAMERA_HEIGHT)
 
-        # Process detections
-        for detection in results.boxes.data:
-            x, y, w, h, conf, cls = detection
-            x = float(x)
-            y = float(y)
-            w = float(w)
-            h = float(h)
-            confidence = float(conf)
-            class_id = int(cls)
-
-            # Compute relative area (opacity) correctly using resized dimensions
-            opacity = (w * h) / resized_area
-
-            # Skip if too small
-            if opacity < OPACITY_THRESHOLD:
-                continue
-
-            # Get class name
-            class_name = results.names[class_id]
-
-            # Convert detection point to real-world cm using homography
-            if self.homography_matrix is not None:
-                pt_px = np.array([[[x, y]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(
-                    pt_px, np.linalg.inv(self.homography_matrix)
-                )[0][0]
-                x_cm, y_cm = pt_cm
-
-                # Ignore detections in the ignored area
-                if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                    IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                # Skip if too small
+                if opacity < OPACITY_THRESHOLD:
                     continue
 
-                # Store balls and obstacles separately
-                if class_name in TARGET_CLASS:
-                    balls.append((x_cm, y_cm, class_name))
-                    color = (0, 255, 0)  # Green for balls
-                elif class_name in OBSTACLE_CLASS:
-                    obstacles.append((x_cm, y_cm, class_name))
-                    color = (0, 0, 255)  # Red for obstacles
+                # Convert detection point to real-world cm using homography
+                if self.homography_matrix is not None:
+                    pt_px = np.array([[[x, y]]], dtype="float32")
+                    pt_cm = cv2.perspectiveTransform(
+                        pt_px, np.linalg.inv(self.homography_matrix)
+                    )[0][0]
+                    x_cm, y_cm = pt_cm
 
-                # Draw detection for debugging
-                cv2.circle(frame, (int(x), int(y)), 5, color, -1)
-                cv2.putText(frame, f"{class_name} {confidence:.2f}",
-                           (int(x) + 10, int(y)),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    # Ignore detections in the ignored area
+                    if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                        IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                        continue
 
-        # Store obstacles for path planning
-        self.detected_obstacles = obstacles
-        return balls
+                    # Store balls and obstacles separately
+                    if class_name in TARGET_CLASS:
+                        balls.append((x_cm, y_cm, class_name))
+                        color = (0, 255, 0)  # Green for balls
+                    elif class_name in OBSTACLE_CLASS:
+                        obstacles.append((x_cm, y_cm, class_name))
+                        color = (0, 0, 255)  # Red for obstacles
+
+                    # Draw detection for debugging
+                    x1 = int(x - width/2)
+                    y1 = int(y - height/2)
+                    x2 = int(x + width/2)
+                    y2 = int(y + height/2)
+                    
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f"{class_name} {confidence:.2f}",
+                               (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.5, color, 2)
+
+            # Store obstacles for path planning
+            self.detected_obstacles = obstacles
+            return balls
+
+        except Exception as e:
+            logger.error(f"Error during Roboflow inference: {e}")
+            return []
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
         """Calculate approach position and angle for a target position"""
