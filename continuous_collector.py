@@ -25,12 +25,18 @@ import time
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
 
-# Model configuration
-WEIGHTS_PATH = "weights(1).pt"  # Path to your YOLOv8 weights
-CONFIDENCE_THRESHOLD = 0.5   # Minimum confidence for detections (50%)
-IOU_THRESHOLD = 0.5         # IoU threshold for overlapping detections (50%)
-OPACITY_THRESHOLD = 0.75    # Opacity threshold (75%)
+# Model configuration  
+WEIGHTS_PATH = "weights(2).pt"  # Try the original weights first
+# Alternative weights to try: "weights(1).pt", "weights(2).pt"
+CONFIDENCE_THRESHOLD = 0.7   # Higher confidence to reduce false positives
+IOU_THRESHOLD = 0.3         # Lower IOU for better suppression of overlapping detections
 TARGET_CLASS = ["white_ball", "orange_ball"]  # Classes to detect
+
+# Detection filtering
+MIN_BALL_SIZE_PX = 15       # Minimum ball size in pixels
+MAX_BALL_SIZE_PX = 200      # Maximum ball size in pixels
+MIN_ASPECT_RATIO = 0.5      # Minimum width/height ratio for balls
+MAX_ASPECT_RATIO = 2.0      # Maximum width/height ratio for balls
 
 # Wall configuration
 WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
@@ -63,7 +69,7 @@ IGNORED_AREA = {
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Back to INFO to reduce spam
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -158,6 +164,13 @@ class BallCollector:
         try:
             self.model = YOLO(WEIGHTS_PATH)
             logger.info("Successfully loaded YOLO model from %s", WEIGHTS_PATH)
+            
+            # Debug: Print available classes
+            if hasattr(self.model, 'names'):
+                logger.info(f"Available model classes: {list(self.model.names.values())}")
+            else:
+                logger.warning("Could not retrieve model class names")
+                
         except Exception as e:
             logger.error("Failed to load YOLO model: %s", e)
             raise
@@ -351,62 +364,110 @@ class BallCollector:
         if not ret:
             return []
 
-        # Run YOLOv8 inference with correct input size and thresholds
+        # Store original frame dimensions
+        orig_height, orig_width = frame.shape[:2]
+        
+        # Run YOLOv8 inference - use original frame for better accuracy
         results = self.model(
             frame,
             conf=CONFIDENCE_THRESHOLD,
             iou=IOU_THRESHOLD,
-            imgsz=640  # EXACTLY matches your Roboflow resize
+            verbose=False
         )[0]
-
-        # Get area of the resized image that YOLO actually used
-        resized_area = results.orig_shape[0] * results.orig_shape[1]
 
         balls = []
 
-        # Process detections
-        for detection in results.boxes.data:
-            x, y, w, h, conf, cls = detection
-            x = float(x)
-            y = float(y)
-            w = float(w)
-            h = float(h)
-            confidence = float(conf)
-            class_id = int(cls)
+        # Count total detections
+        total_detections = len(results.boxes.data) if results.boxes is not None else 0
+        ball_class_detections = 0
+        
+        # Process detections if any exist
+        if results.boxes is not None and len(results.boxes) > 0:
+            for detection in results.boxes.data:
+                x1, y1, x2, y2, conf, cls = detection
+                
+                # Convert to float
+                x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+                confidence = float(conf)
+                class_id = int(cls)
 
-            # Compute relative area (opacity) correctly using resized dimensions
-            opacity = (w * h) / resized_area
+                # Calculate center point and box dimensions
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                box_width = x2 - x1
+                box_height = y2 - y1
 
-            # Skip if too small (optional: tweak this threshold)
-            if opacity < OPACITY_THRESHOLD:
-                continue
+                # Check class name first
+                class_name = results.names[class_id]
+                
+                if class_name not in TARGET_CLASS:
+                    continue
+                
+                ball_class_detections += 1
 
-            # Check class name
-            class_name = results.names[class_id]
-            if class_name not in TARGET_CLASS:
-                continue
-
-            # Convert detection point to real-world cm using homography
-            if self.homography_matrix is not None:
-                pt_px = np.array([[[x, y]]], dtype="float32")
-                pt_cm = cv2.perspectiveTransform(
-                    pt_px, np.linalg.inv(self.homography_matrix)
-                )[0][0]
-                x_cm, y_cm = pt_cm
-
-                # Ignore detections in the ignored area
-                if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                    IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                # Apply size filtering for balls
+                if (box_width < MIN_BALL_SIZE_PX or box_width > MAX_BALL_SIZE_PX or
+                    box_height < MIN_BALL_SIZE_PX or box_height > MAX_BALL_SIZE_PX):
                     continue
 
-                balls.append((x_cm, y_cm, class_name))
+                # Check aspect ratio (balls should be roughly circular)
+                aspect_ratio = box_width / box_height if box_height > 0 else 0
+                if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
+                    continue
 
-                # Optional: draw detection for debugging
-                cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 0), -1)
-                cv2.putText(frame, f"{confidence:.2f}",
-                            (int(x) + 10, int(y)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Additional confidence check for balls
+                if confidence < 0.5:  # Even stricter for balls specifically
+                    continue
 
+                # Convert detection center point to real-world cm using homography
+                if self.homography_matrix is not None:
+                    # Convert center point from pixels to cm
+                    pt_px = np.array([[[center_x, center_y]]], dtype="float32")
+                    pt_cm = cv2.perspectiveTransform(
+                        pt_px, np.linalg.inv(self.homography_matrix)
+                    )[0][0]
+                    x_cm, y_cm = pt_cm
+
+                    # Ignore detections in the ignored area
+                    if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                        IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
+                        continue
+
+                    balls.append((x_cm, y_cm, class_name))
+                    logger.info(f"✅ Valid ball found: {class_name} at ({x_cm:.1f}, {y_cm:.1f}) cm")
+
+                    # Draw VALID detection with thick green border
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 3)
+                    cv2.circle(frame, (int(center_x), int(center_y)), 5, (0, 255, 0), -1)
+                    cv2.putText(frame, f"✅ {class_name}: {confidence:.2f}",
+                                (int(x1), int(y1) - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    # Add position info
+                    cv2.putText(frame, f"({x_cm:.0f}, {y_cm:.0f}) cm",
+                                (int(x1), int(y2) + 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+        # Show all detections in a debug window (press 'd' to toggle)
+        debug_frame = frame.copy()
+        if results.boxes is not None:
+            for detection in results.boxes.data:
+                x1, y1, x2, y2, conf, cls = detection
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                class_name = results.names[int(cls)]
+                
+                # Draw all detections in red
+                cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(debug_frame, f"{class_name}: {float(conf):.2f}",
+                           (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
+        cv2.imshow("All Detections (Debug)", debug_frame)
+        cv2.waitKey(1)
+        
+        # Summary logging
+        if total_detections > 0:
+            logger.info(f"Detection Summary: {len(balls)} valid balls | {ball_class_detections} ball-class detections | {total_detections} total detections")
+        
         return balls
 
     def get_approach_vector(self, target_pos: Tuple[float, float]) -> Tuple[Tuple[float, float], float]:
