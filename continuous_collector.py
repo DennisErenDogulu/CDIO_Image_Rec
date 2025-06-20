@@ -27,7 +27,9 @@ EV3_PORT = 12345
 
 # Model configuration
 WEIGHTS_PATH = "weights(1).pt"  # Path to your YOLOv8 weights
-CONFIDENCE_THRESHOLD = 0.7   # Minimum confidence for detections
+CONFIDENCE_THRESHOLD = 0.5   # Minimum confidence for detections (50%)
+IOU_THRESHOLD = 0.5         # IoU threshold for overlapping detections (50%)
+OPACITY_THRESHOLD = 0.75    # Opacity threshold (75%)
 TARGET_CLASS = ["white_ball", "orange_ball"]  # Classes to detect
 
 # Wall configuration
@@ -350,19 +352,29 @@ class BallCollector:
         if not ret:
             return []
 
-        # Run YOLOv8 inference
-        results = self.model(frame, conf=CONFIDENCE_THRESHOLD)[0]
+        # Run YOLOv8 inference with NMS parameters
+        results = self.model(
+            frame,
+            conf=CONFIDENCE_THRESHOLD,  # Confidence threshold (50%)
+            iou=IOU_THRESHOLD,         # IoU threshold for NMS (50%)
+            max_det=50                 # Maximum detections per image
+        )[0]
         
         balls = []
         
         # Process detections
         for detection in results.boxes.data:
-            x, y, _, _, conf, cls = detection
+            x, y, w, h, conf, cls = detection
             x = float(x)  # Center X
             y = float(y)  # Center Y
+            opacity = float(w * h) / (frame.shape[0] * frame.shape[1])  # Calculate relative area
             class_id = int(cls)
             confidence = float(conf)
             
+            # Skip if opacity is too low
+            if opacity < OPACITY_THRESHOLD:
+                continue
+                
             # Get class name from model's names dictionary
             class_name = results.names[class_id]
             
