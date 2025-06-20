@@ -22,10 +22,10 @@ import time
 # Configuration
 EV3_IP = "172.20.10.6"
 EV3_PORT = 12345
-ROBOFLOW_API_KEY = "qJTLU5ku2vpBGQUwjBx2"
-RF_WORKSPACE = "cdio-nczdp"
-RF_PROJECT = "cdio-golfbot2025" 
-RF_VERSION = 13
+ROBOFLOW_API_KEY = "LdvRakmEpZizttEFtQap"
+RF_WORKSPACE = "legoms3"
+RF_PROJECT = "golfbot-fyxfe-etdz0" 
+RF_VERSION = 3
 
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
