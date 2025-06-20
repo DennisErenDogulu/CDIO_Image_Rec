@@ -4,7 +4,7 @@ Continuous Ball Collection Client
 
 This script implements a continuous ball collection strategy:
 1. Detect balls using local YOLOv8 model
-2. Track robot position using colored markers
+2. Track robot position using colored markers (green base, pink direction)
 3. Plan and execute paths to collect balls
 4. Return to goal area to deliver balls
 """
@@ -62,6 +62,10 @@ GREEN_LOWER = np.array([35, 50, 50])   # Robot base marker
 GREEN_UPPER = np.array([85, 255, 255])
 PINK_LOWER = np.array([145, 50, 50])   # Direction marker
 PINK_UPPER = np.array([175, 255, 255])
+
+# Robot marker detection parameters
+MIN_GREEN_AREA = 100  # Minimum area for green marker
+MIN_PINK_AREA = 50    # Minimum area for pink marker
 
 # Ignored area (center obstacle)
 IGNORED_AREA = {
@@ -133,7 +137,7 @@ class BallCollector:
         green_center = None
         if green_contours:
             largest_green = max(green_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_green) > 100:
+            if cv2.contourArea(largest_green) > MIN_GREEN_AREA:
                 M = cv2.moments(largest_green)
                 if M["m00"] != 0:
                     green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
@@ -142,7 +146,7 @@ class BallCollector:
         pink_center = None
         if pink_contours:
             largest_pink = max(pink_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_pink) > 50:
+            if cv2.contourArea(largest_pink) > MIN_PINK_AREA:
                 M = cv2.moments(largest_pink)
                 if M["m00"] != 0:
                     pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
