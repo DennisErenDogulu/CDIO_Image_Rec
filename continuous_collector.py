@@ -47,30 +47,26 @@ RED_RANGES = [
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
 RED_MARKER_WIDTH_CM = 5     # Width of red direction marker
 
-# Robot configuration
-ROBOT_START_X = 20  # cm from left edge
-ROBOT_START_Y = 20  # cm from bottom edge
-ROBOT_WIDTH = 26.5   # cm (actual measured width)
-ROBOT_LENGTH = 20  # cm
-ROBOT_START_HEADING = 0  # degrees (0 = facing east)
-
-# Safety margins based on robot size
-ROBOT_RADIUS = ROBOT_WIDTH / 2  # 13.25cm radius
-MIN_CLEARANCE_CM = ROBOT_RADIUS + 1  # Robot radius + 1cm safety = ~14.25cm
-
-# Wall configuration  
-WALL_SAFETY_MARGIN = MIN_CLEARANCE_CM  # cm, minimum distance to keep from walls (robot radius + safety)
+# Wall configuration
+WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
 
 # Goal configuration
 SMALL_GOAL_SIDE = "right"  # "left" or "right" - where the small goal (A) is placed
 GOAL_OFFSET_CM = 6   # cm, distance to stop before goal edge (closer to goal)
 
+# Robot configuration
+ROBOT_START_X = 20  # cm from left edge
+ROBOT_START_Y = 20  # cm from bottom edge
+ROBOT_WIDTH = 26.5   # cm
+ROBOT_LENGTH = 20  # cm
+ROBOT_START_HEADING = 0  # degrees (0 = facing east)
+
 # Physical constraints
 FIELD_WIDTH_CM = 180
 FIELD_HEIGHT_CM = 120
 COLLECTION_DISTANCE_CM = 20  # Distance to move forward when collecting
-APPROACH_DISTANCE_CM = MIN_CLEARANCE_CM + 15    # Distance to keep from ball for approach (robot clearance + extra)
-MAX_BALLS_PER_TRIP = 3
+APPROACH_DISTANCE_CM = 30    # Distance to keep from ball for approach
+MAX_BALLS_PER_TRIP = 5
 
 # Ignored area (center obstacle) - will be set during calibration
 IGNORED_AREA = {
@@ -111,8 +107,7 @@ def point_to_line_distance(point, line_start, line_end):
     return math.hypot(x - proj_x, y - proj_y)
 
 def check_wall_collision(start_pos, end_pos, walls, safety_margin):
-    """Check if a path between two points collides with any walls or obstacles"""
-    # Check wall collisions
+    """Check if a path between two points collides with any walls"""
     for wall_start_x, wall_start_y, wall_end_x, wall_end_y in walls:
         # Check if either endpoint is too close to the wall
         if (point_to_line_distance(start_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin or
@@ -135,47 +130,6 @@ def check_wall_collision(start_pos, end_pos, walls, safety_margin):
         
         if 0 <= t <= 1 and 0 <= u <= 1:
             return True
-    
-    # Check obstacle collisions
-    if (IGNORED_AREA["x_max"] > IGNORED_AREA["x_min"] and 
-        IGNORED_AREA["y_max"] > IGNORED_AREA["y_min"]):
-        
-        # Expand obstacle bounds by safety margin
-        expanded_x_min = IGNORED_AREA["x_min"] - safety_margin
-        expanded_x_max = IGNORED_AREA["x_max"] + safety_margin
-        expanded_y_min = IGNORED_AREA["y_min"] - safety_margin
-        expanded_y_max = IGNORED_AREA["y_max"] + safety_margin
-        
-        # Check if either endpoint is inside expanded obstacle
-        for pos in [start_pos, end_pos]:
-            if (expanded_x_min <= pos[0] <= expanded_x_max and 
-                expanded_y_min <= pos[1] <= expanded_y_max):
-                return True
-        
-        # Check if path intersects with obstacle edges (treat as 4 wall segments)
-        obstacle_walls = [
-            (expanded_x_min, expanded_y_min, expanded_x_max, expanded_y_min),  # bottom
-            (expanded_x_max, expanded_y_min, expanded_x_max, expanded_y_max),  # right
-            (expanded_x_max, expanded_y_max, expanded_x_min, expanded_y_max),  # top
-            (expanded_x_min, expanded_y_max, expanded_x_min, expanded_y_min),  # left
-        ]
-        
-        x1, y1 = start_pos
-        x2, y2 = end_pos
-        
-        for wall_start_x, wall_start_y, wall_end_x, wall_end_y in obstacle_walls:
-            x3, y3 = wall_start_x, wall_start_y
-            x4, y4 = wall_end_x, wall_end_y
-            
-            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-            if denom == 0:  # Lines are parallel
-                continue
-                
-            t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-            u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-            
-            if 0 <= t <= 1 and 0 <= u <= 1:
-                return True
             
     return False
 
@@ -225,9 +179,6 @@ class BallCollector:
         # Frame skipping for lag reduction
         self.frame_skip_counter = 0
         self.frame_skip_interval = 2  # Process every 3rd frame for better performance
-        
-        # Ball tracking
-        self.ignored_balls = []  # Balls ignored because they're in obstacle area
 
     def _build_goal_ranges(self) -> dict:
         """
@@ -484,12 +435,12 @@ class BallCollector:
         return debug_frame
 
     def setup_walls(self):
-        """Set up wall segments based on actual field boundaries, excluding goal areas"""
+        """Set up wall segments based on calibration points, excluding goal areas"""
         if len(self.calibration_points) != 4:
             return
 
-        # The walls represent the actual field boundaries (at 0 and max coordinates)
-        # The safety margin is used during collision detection, not wall placement
+        # Create wall segments with small safety margin
+        margin = WALL_SAFETY_MARGIN
         
         # Get goal Y ranges for both goals
         goal_a_y_vals = [y for (x, y) in self.goal_ranges['A']]
@@ -501,40 +452,40 @@ class BallCollector:
         goal_b_y_max = max(goal_b_y_vals)
 
         self.walls = [
-            # Bottom wall (full width) - actual field boundary
-            (0, 0, FIELD_WIDTH_CM, 0),
+            # Bottom wall (full width)
+            (margin, margin, FIELD_WIDTH_CM - margin, margin),
             
-            # Top wall (full width) - actual field boundary
-            (0, FIELD_HEIGHT_CM, FIELD_WIDTH_CM, FIELD_HEIGHT_CM),
+            # Top wall (full width)
+            (margin, FIELD_HEIGHT_CM - margin, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin),
         ]
         
-        # Left wall segments (excluding goals) - actual field boundary
+        # Left wall segments (excluding goals)
         if self.small_goal_side == "left":
             # Goal A on left, so exclude its Y range
-            if goal_a_y_min > 0:
-                self.walls.append((0, 0, 0, goal_a_y_min))
-            if goal_a_y_max < FIELD_HEIGHT_CM:
-                self.walls.append((0, goal_a_y_max, 0, FIELD_HEIGHT_CM))
+            if goal_a_y_min > margin:
+                self.walls.append((margin, margin, margin, goal_a_y_min))
+            if goal_a_y_max < FIELD_HEIGHT_CM - margin:
+                self.walls.append((margin, goal_a_y_max, margin, FIELD_HEIGHT_CM - margin))
         else:
             # Goal B on left, so exclude its Y range
-            if goal_b_y_min > 0:
-                self.walls.append((0, 0, 0, goal_b_y_min))
-            if goal_b_y_max < FIELD_HEIGHT_CM:
-                self.walls.append((0, goal_b_y_max, 0, FIELD_HEIGHT_CM))
+            if goal_b_y_min > margin:
+                self.walls.append((margin, margin, margin, goal_b_y_min))
+            if goal_b_y_max < FIELD_HEIGHT_CM - margin:
+                self.walls.append((margin, goal_b_y_max, margin, FIELD_HEIGHT_CM - margin))
         
-        # Right wall segments (excluding goals) - actual field boundary
+        # Right wall segments (excluding goals)
         if self.small_goal_side == "right":
             # Goal A on right, so exclude its Y range
-            if goal_a_y_min > 0:
-                self.walls.append((FIELD_WIDTH_CM, 0, FIELD_WIDTH_CM, goal_a_y_min))
-            if goal_a_y_max < FIELD_HEIGHT_CM:
-                self.walls.append((FIELD_WIDTH_CM, goal_a_y_max, FIELD_WIDTH_CM, FIELD_HEIGHT_CM))
+            if goal_a_y_min > margin:
+                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_a_y_min))
+            if goal_a_y_max < FIELD_HEIGHT_CM - margin:
+                self.walls.append((FIELD_WIDTH_CM - margin, goal_a_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
         else:
             # Goal B on right, so exclude its Y range
-            if goal_b_y_min > 0:
-                self.walls.append((FIELD_WIDTH_CM, 0, FIELD_WIDTH_CM, goal_b_y_min))
-            if goal_b_y_max < FIELD_HEIGHT_CM:
-                self.walls.append((FIELD_WIDTH_CM, goal_b_y_max, FIELD_WIDTH_CM, FIELD_HEIGHT_CM))
+            if goal_b_y_min > margin:
+                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_b_y_min))
+            if goal_b_y_max < FIELD_HEIGHT_CM - margin:
+                self.walls.append((FIELD_WIDTH_CM - margin, goal_b_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
 
     def draw_walls(self, frame):
         """Draw walls, safety margins, goals, and starting box on the frame"""
@@ -552,54 +503,27 @@ class BallCollector:
                 start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
                 end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
                 
-                # Draw the actual wall line (thin red line)
+                # Draw the wall line
                 cv2.line(overlay, tuple(start_px), tuple(end_px), (0, 0, 255), 2)
                 
-                # Draw safety margin area - create a parallel line inside the field
-                wall_vec = np.array([end_px[0] - start_px[0], end_px[1] - start_px[1]])
-                wall_length = np.linalg.norm(wall_vec)
+                # Draw safety margin area (semi-transparent)
+                margin_pts = []
+                angle = math.atan2(end_px[1] - start_px[1], end_px[0] - start_px[0])
+                margin_px = int(WALL_SAFETY_MARGIN * 10)  # Convert cm to approximate pixels
                 
-                if wall_length > 0:
-                    # Normalize wall vector
-                    wall_unit = wall_vec / wall_length
-                    
-                    # Calculate perpendicular vector pointing inward to field
-                    perp_vec = np.array([-wall_unit[1], wall_unit[0]])
-                    
-                    # Determine which direction is "inward" based on wall position
-                    wall_center = (start_px + end_px) / 2
-                    field_center = np.array([frame.shape[1]/2, frame.shape[0]/2])
-                    to_center = field_center - wall_center
-                    
-                    # Make sure perpendicular vector points toward field center
-                    if np.dot(perp_vec, to_center) < 0:
-                        perp_vec = -perp_vec
-                    
-                    # Convert safety margin from cm to pixels (approximate)
-                    # Use homography to get a better pixel/cm ratio
-                    margin_cm_pt1 = np.array([[[0, 0]]], dtype="float32")
-                    margin_cm_pt2 = np.array([[[WALL_SAFETY_MARGIN, 0]]], dtype="float32")
-                    margin_px_pt1 = cv2.perspectiveTransform(margin_cm_pt1, self.homography_matrix)[0][0]
-                    margin_px_pt2 = cv2.perspectiveTransform(margin_cm_pt2, self.homography_matrix)[0][0]
-                    margin_px = np.linalg.norm(margin_px_pt2 - margin_px_pt1)
-                    
-                    # Calculate safety margin line
-                    margin_offset = perp_vec * margin_px
-                    margin_start = start_px + margin_offset
-                    margin_end = end_px + margin_offset
-                    
-                    # Draw safety margin line (very thin, semi-transparent red)
-                    cv2.line(overlay, tuple(margin_start.astype(int)), tuple(margin_end.astype(int)), (0, 0, 200), 1)
-                    
-                    # Draw safety zone area (fill between wall and safety line)
-                    safety_zone_pts = np.array([
-                        start_px,
-                        end_px,
-                        margin_end,
-                        margin_start
-                    ], np.int32)
-                    
-                    cv2.fillPoly(overlay, [safety_zone_pts], (0, 0, 255, 32))  # Very light semi-transparent red fill
+                # Calculate margin points
+                dx = int(margin_px * math.sin(angle))
+                dy = int(margin_px * math.cos(angle))
+                
+                margin_pts = np.array([
+                    [start_px[0] - dx, start_px[1] + dy],
+                    [end_px[0] - dx, end_px[1] + dy],
+                    [end_px[0] + dx, end_px[1] - dy],
+                    [start_px[0] + dx, start_px[1] - dy]
+                ], np.int32)
+                
+                # Draw safety margin area
+                cv2.fillPoly(overlay, [margin_pts], (0, 0, 255, 128))
             
             # Draw goal areas
             for goal_label, goal_points in self.goal_ranges.items():
@@ -660,25 +584,6 @@ class BallCollector:
                 center_y = sum(pt[1] for pt in obstacle_px_points) // 4
                 cv2.putText(overlay, "OBSTACLE", (center_x - 40, center_y),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                # Draw ignored balls within obstacle area
-                if hasattr(self, 'ignored_balls') and self.ignored_balls:
-                    for ball_x, ball_y, ball_type in self.ignored_balls:
-                        # Convert ball position to pixels
-                        ball_cm = np.array([[[ball_x, ball_y]]], dtype="float32")
-                        ball_px = cv2.perspectiveTransform(ball_cm, self.homography_matrix)[0][0].astype(int)
-                        
-                        # Draw ignored ball with gray color and X mark
-                        cv2.circle(overlay, tuple(ball_px), 8, (128, 128, 128), -1)  # Gray filled circle
-                        cv2.circle(overlay, tuple(ball_px), 10, (64, 64, 64), 2)     # Darker gray border
-                        
-                        # Draw X mark to indicate ignored
-                        cv2.line(overlay, (ball_px[0]-6, ball_px[1]-6), (ball_px[0]+6, ball_px[1]+6), (255, 255, 255), 2)
-                        cv2.line(overlay, (ball_px[0]-6, ball_px[1]+6), (ball_px[0]+6, ball_px[1]-6), (255, 255, 255), 2)
-                        
-                        # Add label
-                        cv2.putText(overlay, f"IGNORED", (ball_px[0] + 12, ball_px[1] - 8),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             
             # Blend the overlay with the original frame
             alpha = 0.3
@@ -856,7 +761,6 @@ class BallCollector:
         predictions = self.model.predict(small, confidence=30, overlap=20).json()
         
         balls = []
-        ignored_balls = []  # Track ignored balls for visualization
         scale_x = frame.shape[1] / 416
         scale_y = frame.shape[0] / 416
         
@@ -880,23 +784,10 @@ class BallCollector:
                                                np.linalg.inv(self.homography_matrix))[0][0]
                 x_cm, y_cm = pt_cm
                 
-                # Check if ball is in ignored area (obstacle)
-                ball_in_obstacle = False
-                if (IGNORED_AREA["x_max"] > IGNORED_AREA["x_min"] and 
-                    IGNORED_AREA["y_max"] > IGNORED_AREA["y_min"]):
-                    # Ball is inside obstacle if within the defined boundaries
-                    if (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
-                        IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
-                        ball_in_obstacle = True
-                        ignored_balls.append((x_cm, y_cm, ball_class))
-                        logger.debug(f"Ignoring {ball_class} ball at ({x_cm:.1f}, {y_cm:.1f}) - inside obstacle area")
-                
-                # Only add ball if it's not in the obstacle area
-                if not ball_in_obstacle:
+                # Check if ball is in ignored area
+                if not (IGNORED_AREA["x_min"] <= x_cm <= IGNORED_AREA["x_max"] and
+                       IGNORED_AREA["y_min"] <= y_cm <= IGNORED_AREA["y_max"]):
                     balls.append((x_cm, y_cm, ball_class))
-        
-        # Store ignored balls for visualization (as instance variable)
-        self.ignored_balls = ignored_balls
         
         return balls
 
@@ -1188,109 +1079,8 @@ class BallCollector:
             logger.error("Exception during ball delivery: {}".format(e))
             return False
 
-    def check_clearance_and_escape(self, required_clearance_cm: float = None) -> bool:
-        """Check if robot is too close to walls/obstacles and move to safety"""
-        if not self.robot_pos or not self.walls:
-            return True
-        
-        if required_clearance_cm is None:
-            required_clearance_cm = MIN_CLEARANCE_CM
-        
-        current_x, current_y = self.robot_pos
-        escape_vectors = []  # List of (direction_angle, distance_needed, reason)
-        
-        # Check distance to walls
-        for wall in self.walls:
-            wall_start = (wall[0], wall[1])
-            wall_end = (wall[2], wall[3])
-            distance = point_to_line_distance(self.robot_pos, wall_start, wall_end)
-            
-            if distance < required_clearance_cm:
-                # Calculate direction away from wall
-                # Find closest point on wall to robot
-                wall_vec = (wall_end[0] - wall_start[0], wall_end[1] - wall_start[1])
-                robot_vec = (current_x - wall_start[0], current_y - wall_start[1])
-                wall_length_sq = wall_vec[0]**2 + wall_vec[1]**2
-                
-                if wall_length_sq > 0:
-                    t = max(0, min(1, (robot_vec[0] * wall_vec[0] + robot_vec[1] * wall_vec[1]) / wall_length_sq))
-                    closest_x = wall_start[0] + t * wall_vec[0]
-                    closest_y = wall_start[1] + t * wall_vec[1]
-                    
-                    # Direction away from wall
-                    away_x = current_x - closest_x
-                    away_y = current_y - closest_y
-                    away_angle = math.degrees(math.atan2(away_y, away_x))
-                    
-                    distance_needed = required_clearance_cm - distance + 5  # Extra 5cm safety
-                    escape_vectors.append((away_angle, distance_needed, f"wall (distance: {distance:.1f}cm)"))
-        
-        # Check distance to obstacle
-        if (IGNORED_AREA["x_max"] > IGNORED_AREA["x_min"] and 
-            IGNORED_AREA["y_max"] > IGNORED_AREA["y_min"]):
-            
-            # Check if robot is inside or too close to obstacle
-            obstacle_margin = required_clearance_cm
-            
-            # Expand obstacle bounds by the required clearance
-            expanded_x_min = IGNORED_AREA["x_min"] - obstacle_margin
-            expanded_x_max = IGNORED_AREA["x_max"] + obstacle_margin
-            expanded_y_min = IGNORED_AREA["y_min"] - obstacle_margin
-            expanded_y_max = IGNORED_AREA["y_max"] + obstacle_margin
-            
-            if (expanded_x_min <= current_x <= expanded_x_max and 
-                expanded_y_min <= current_y <= expanded_y_max):
-                
-                # Calculate direction away from obstacle center
-                obstacle_center_x = (IGNORED_AREA["x_min"] + IGNORED_AREA["x_max"]) / 2
-                obstacle_center_y = (IGNORED_AREA["y_min"] + IGNORED_AREA["y_max"]) / 2
-                
-                away_x = current_x - obstacle_center_x
-                away_y = current_y - obstacle_center_y
-                away_angle = math.degrees(math.atan2(away_y, away_x))
-                
-                # Calculate minimum distance to get clear
-                dist_to_left = abs(current_x - IGNORED_AREA["x_min"])
-                dist_to_right = abs(current_x - IGNORED_AREA["x_max"])
-                dist_to_bottom = abs(current_y - IGNORED_AREA["y_min"])
-                dist_to_top = abs(current_y - IGNORED_AREA["y_max"])
-                
-                min_dist = min(dist_to_left, dist_to_right, dist_to_bottom, dist_to_top)
-                distance_needed = required_clearance_cm - min_dist + 8  # Extra 8cm safety for obstacles
-                
-                escape_vectors.append((away_angle, distance_needed, f"obstacle (distance: {min_dist:.1f}cm)"))
-        
-        if escape_vectors:
-            # Choose the escape vector that requires the least movement
-            best_escape = min(escape_vectors, key=lambda x: x[1])
-            escape_angle, escape_distance, reason = best_escape
-            
-            logger.info(f"⚠️ Robot too close to {reason} - moving {escape_distance:.1f}cm at {escape_angle:.1f}° for safety")
-            
-            # Turn to escape direction and move
-            angle_diff = (escape_angle - self.robot_heading + 180) % 360 - 180
-            
-            # Turn towards escape direction
-            if abs(angle_diff) > 5:  # Only turn if significantly off
-                if not self.turn(angle_diff):
-                    logger.error("Failed to turn for escape maneuver")
-                    return False
-                self.update_robot_position()  # Update after turn
-            
-            # Move in escape direction
-            if not self.move(escape_distance):
-                logger.error("Failed to move for escape maneuver")
-                return False
-            
-            self.update_robot_position()  # Update after move
-            
-            # Verify we achieved clearance
-            return self.check_clearance_and_escape(required_clearance_cm - 3)  # Slightly less strict on retry
-        
-        return True
-
     def calculate_goal_approach_path(self, current_pos, current_heading):
-        """Calculate a smooth path to the selected goal using the new goal system"""
+        """Calculate a smooth path to the selected goal via center staging area"""
         # Get goal candidates for selected goal
         goal_candidates = self.goal_ranges.get(self.selected_goal, [])
         if not goal_candidates:
@@ -1306,65 +1096,74 @@ class BallCollector:
         
         if goal_x_edge == 0:  # Left side goal
             goal_x = GOAL_OFFSET_CM  # Stop before left edge
+            # Staging area in center, slightly towards right side for left goal
+            staging_x = FIELD_WIDTH_CM * 0.6  # 60% across field
         else:  # Right side goal
             goal_x = FIELD_WIDTH_CM - GOAL_OFFSET_CM  # Stop before right edge
+            # Staging area in center, slightly towards left side for right goal
+            staging_x = FIELD_WIDTH_CM * 0.4  # 40% across field
         
-        # Calculate direct distance and angle to goal
-        dx = goal_x - current_pos[0]
-        dy = goal_y - current_pos[1]
-        direct_distance = math.hypot(dx, dy)
-        angle_to_goal = math.degrees(math.atan2(dy, dx))
+        # Staging area Y coordinate - center of field, aligned with goal
+        staging_y = goal_y
         
-        # If we're already well-aligned with the goal (within 15 degrees), just go straight
-        angle_diff = (angle_to_goal - current_heading + 180) % 360 - 180
-        if abs(angle_diff) < 15 and not check_wall_collision(current_pos, (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
-            return [{
-                'type': 'goal',
-                'pos': (goal_x, goal_y),
-                'angle': 0  # Face straight ahead at goal
-            }]
+        # Calculate distances
+        distance_to_staging = math.hypot(staging_x - current_pos[0], staging_y - current_pos[1])
+        distance_staging_to_goal = math.hypot(goal_x - staging_x, goal_y - staging_y)
         
-        # Otherwise, calculate a curved approach path
-        # First point: swing out to create better approach angle
-        swing_distance = min(50, direct_distance * 0.4)  # Don't swing out too far
-        
-        # If we're to the left of the goal, swing right, and vice versa
-        swing_direction = 1 if current_pos[1] < goal_y else -1
-        swing_angle = current_heading + (45 * swing_direction)  # 45-degree swing
-        
-        # Calculate swing point
-        swing_x = current_pos[0] + swing_distance * math.cos(math.radians(swing_angle))
-        swing_y = current_pos[1] + swing_distance * math.sin(math.radians(swing_angle))
-        
-        # Second point: intermediate approach point
-        if goal_x_edge == 0:  # Left side goal
-            approach_x = goal_x + (GOAL_OFFSET_CM * 1.5)  # Further from left edge
-        else:  # Right side goal  
-            approach_x = goal_x - (GOAL_OFFSET_CM * 1.5)  # Further from right edge
-        approach_y = goal_y  # Aligned with goal
-        
-        # Check if points are reachable
         path = []
-        if not check_wall_collision(current_pos, (swing_x, swing_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'approach',
-                'pos': (swing_x, swing_y),
-                'angle': swing_angle
-            })
         
-        if not check_wall_collision((swing_x, swing_y), (approach_x, approach_y), self.walls, WALL_SAFETY_MARGIN):
-            path.append({
-                'type': 'approach',
-                'pos': (approach_x, approach_y),
-                'angle': angle_to_goal  # Face toward goal
-            })
+        # Only add staging point if we're not already close to the staging area
+        if distance_to_staging > 20:  # If more than 20cm from staging area
+            # Check if we can reach staging area directly
+            if not check_wall_collision(current_pos, (staging_x, staging_y), self.walls, WALL_SAFETY_MARGIN):
+                # Calculate angle to staging area
+                angle_to_staging = math.degrees(math.atan2(staging_y - current_pos[1], staging_x - current_pos[0]))
+                
+                path.append({
+                    'type': 'tank_approach',
+                    'pos': (staging_x, staging_y),
+                    'angle': angle_to_staging
+                })
         
-        if not check_wall_collision((approach_x, approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
+        # Always add the final goal approach from staging area (or current position if close to staging)
+        if not check_wall_collision((staging_x, staging_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
+            # Calculate angle from staging area to goal
+            angle_to_goal = math.degrees(math.atan2(goal_y - staging_y, goal_x - staging_x))
+            
             path.append({
                 'type': 'goal',
                 'pos': (goal_x, goal_y),
-                'angle': 0
+                'angle': angle_to_goal
             })
+        else:
+            # If direct path from staging to goal is blocked, try a different approach
+            logger.warning("Direct path from staging to goal is blocked, using fallback approach")
+            
+            # Fallback: approach goal from slightly off-center
+            if goal_x_edge == 0:  # Left side goal
+                fallback_approach_x = goal_x + 15  # 15cm right of goal
+            else:  # Right side goal
+                fallback_approach_x = goal_x - 15  # 15cm left of goal
+            
+            fallback_approach_y = goal_y
+            
+            # Add intermediate approach point
+            if not check_wall_collision((staging_x, staging_y), (fallback_approach_x, fallback_approach_y), self.walls, WALL_SAFETY_MARGIN):
+                angle_to_approach = math.degrees(math.atan2(fallback_approach_y - staging_y, fallback_approach_x - staging_x))
+                path.append({
+                    'type': 'tank_approach',
+                    'pos': (fallback_approach_x, fallback_approach_y),
+                    'angle': angle_to_approach
+                })
+            
+            # Final goal approach
+            if not check_wall_collision((fallback_approach_x, fallback_approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
+                angle_to_goal = math.degrees(math.atan2(goal_y - fallback_approach_y, goal_x - fallback_approach_x))
+                path.append({
+                    'type': 'goal',
+                    'pos': (goal_x, goal_y),
+                    'angle': angle_to_goal
+                })
         
         return path
 
@@ -1565,13 +1364,6 @@ class BallCollector:
                               (10, y + 10), cv2.FONT_HERSHEY_SIMPLEX,
                               0.5, (255, 255, 0), 1)
                 
-                # Show ignored balls count if any
-                if hasattr(self, 'ignored_balls') and self.ignored_balls:
-                    ignored_count = len(self.ignored_balls)
-                    cv2.putText(display_frame, f"Ignored balls in obstacle: {ignored_count}",
-                              (10, y + 50), cv2.FONT_HERSHEY_SIMPLEX,
-                              0.5, (128, 128, 128), 1)
-                
                 cv2.imshow("Path Planning", display_frame)
                 
                 # Handle key commands
@@ -1610,14 +1402,6 @@ class BallCollector:
                         logger.info("Executing path with {} points".format(len(path)))
                         
                         try:
-                            # First, ensure robot has safe clearance before starting
-                            logger.info("🔍 Checking robot clearance before path execution...")
-                            self.update_robot_position()
-                            clearance_check = self.check_clearance_and_escape()
-                            if not clearance_check:
-                                logger.warning("⚠️ Could not achieve safe clearance - proceeding anyway")
-                            
-                            time.sleep(0.5)  # Brief pause after any clearance movement
                             for point in path:
                                 target_pos = point['pos']
                                 
@@ -1649,18 +1433,9 @@ class BallCollector:
                                     
                                     # Always back up 20cm after delivery attempt to clear the goal area
                                     logger.info("Backing up 20cm after delivery")
-                                    backup_success = self.move(-20)
-                                    if not backup_success:
+                                    if not self.move(-20):
                                         logger.error("Failed to back up after delivery - this could cause issues")
                                         # Don't raise exception here to avoid stopping the whole sequence
-                                    
-                                    # Update position after backup and check clearance
-                                    if backup_success:
-                                        self.update_robot_position()
-                                        # Check if robot needs additional clearance from walls/obstacles
-                                        clearance_success = self.check_clearance_and_escape()
-                                        if not clearance_success:
-                                            logger.warning("Failed to achieve required clearance from walls/obstacles")
                                     
                                     if delivery_success:
                                         logger.info("✅ Delivery sequence complete, ready for next collection")
