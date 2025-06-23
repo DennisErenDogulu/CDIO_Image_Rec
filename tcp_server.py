@@ -36,7 +36,8 @@ power = PowerSupply()               # For battery monitoring
 NORMAL_SPEED_RPM = -40
 SLOW_SPEED_RPM = -25
 TURN_SPEED_RPM = -50  # Even slower turns for more precision
-COLLECTOR_SPEED = 50  # Percentage
+COLLECTOR_SPEED = 50  # Percentage for collection
+DELIVERY_SPEED = 80   # Percentage for ball delivery (higher speed)
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
@@ -174,22 +175,23 @@ def execute_collect(distance_cm):
 
 @safe_motor_control
 def execute_collect_reverse(duration):
-    """Run collector in reverse to deliver balls"""
+    """Run collector in reverse to deliver balls at high speed"""
     try:
-        # Start collector motor in reverse with gradual speed increase
-        for speed in range(0, -COLLECTOR_SPEED - 1, -5):
+        # Start collector motor in reverse with gradual speed increase to delivery speed
+        for speed in range(0, -DELIVERY_SPEED - 1, -5):
             collector.on(speed)
             time.sleep(0.05)
         
-        # Run for specified duration
+        # Run for specified duration at high delivery speed
         time.sleep(duration)
         
         # Gradually stop collector
-        for speed in range(-COLLECTOR_SPEED, 1, 5):
+        for speed in range(-DELIVERY_SPEED, 1, 5):
             collector.on(speed)
             time.sleep(0.05)
         
         collector.off(brake=True)
+        print("Ball delivery complete at {}% speed".format(DELIVERY_SPEED))
         return True
     except Exception as e:
         print("Reverse collection error: {}".format(e))

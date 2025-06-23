@@ -29,7 +29,7 @@ This project combines computer vision with EV3 robot control to create a system 
 ## Running the Program
 
 1. Connect to your EV3 brick
-2. Upload the `robot_vision.py` file to your EV3 brick
+2. Upload the `tcp_server.py` file to your EV3 brick
 3. Run the program on the EV3 brick
 
 The robot will:
@@ -44,13 +44,12 @@ The robot will:
 
 You can adjust the following parameters in the code:
 
-- HSV color ranges for ball detection
 - Maximum number of balls to collect
 - Movement parameters (speed, turning angle)
 - Camera settings (resolution, camera index)
 
 ## Troubleshooting
 
-- If balls are not being detected correctly, adjust the HSV color ranges
+- If balls are not being detected correctly
 - If the robot moves too quickly or slowly, adjust the movement parameters
 - If the camera isn't working, check the camera index and connection 
