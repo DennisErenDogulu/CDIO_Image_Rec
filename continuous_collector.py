@@ -47,13 +47,6 @@ RED_RANGES = [
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
 RED_MARKER_WIDTH_CM = 5     # Width of red direction marker
 
-# Wall configuration  
-WALL_SAFETY_MARGIN = MIN_CLEARANCE_CM  # cm, minimum distance to keep from walls (robot radius + safety)
-
-# Goal configuration
-SMALL_GOAL_SIDE = "right"  # "left" or "right" - where the small goal (A) is placed
-GOAL_OFFSET_CM = 6   # cm, distance to stop before goal edge (closer to goal)
-
 # Robot configuration
 ROBOT_START_X = 20  # cm from left edge
 ROBOT_START_Y = 20  # cm from bottom edge
@@ -63,7 +56,14 @@ ROBOT_START_HEADING = 0  # degrees (0 = facing east)
 
 # Safety margins based on robot size
 ROBOT_RADIUS = ROBOT_WIDTH / 2  # 13.25cm radius
-MIN_CLEARANCE_CM = ROBOT_RADIUS + 5  # Robot radius + 5cm safety = ~18cm
+MIN_CLEARANCE_CM = ROBOT_RADIUS + 1  # Robot radius + 1cm safety = ~14.25cm
+
+# Wall configuration  
+WALL_SAFETY_MARGIN = MIN_CLEARANCE_CM  # cm, minimum distance to keep from walls (robot radius + safety)
+
+# Goal configuration
+SMALL_GOAL_SIDE = "right"  # "left" or "right" - where the small goal (A) is placed
+GOAL_OFFSET_CM = 6   # cm, distance to stop before goal edge (closer to goal)
 
 # Physical constraints
 FIELD_WIDTH_CM = 180
@@ -484,12 +484,12 @@ class BallCollector:
         return debug_frame
 
     def setup_walls(self):
-        """Set up wall segments based on calibration points, excluding goal areas"""
+        """Set up wall segments based on actual field boundaries, excluding goal areas"""
         if len(self.calibration_points) != 4:
             return
 
-        # Create wall segments with small safety margin
-        margin = WALL_SAFETY_MARGIN
+        # The walls represent the actual field boundaries (at 0 and max coordinates)
+        # The safety margin is used during collision detection, not wall placement
         
         # Get goal Y ranges for both goals
         goal_a_y_vals = [y for (x, y) in self.goal_ranges['A']]
@@ -501,40 +501,40 @@ class BallCollector:
         goal_b_y_max = max(goal_b_y_vals)
 
         self.walls = [
-            # Bottom wall (full width)
-            (margin, margin, FIELD_WIDTH_CM - margin, margin),
+            # Bottom wall (full width) - actual field boundary
+            (0, 0, FIELD_WIDTH_CM, 0),
             
-            # Top wall (full width)
-            (margin, FIELD_HEIGHT_CM - margin, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin),
+            # Top wall (full width) - actual field boundary
+            (0, FIELD_HEIGHT_CM, FIELD_WIDTH_CM, FIELD_HEIGHT_CM),
         ]
         
-        # Left wall segments (excluding goals)
+        # Left wall segments (excluding goals) - actual field boundary
         if self.small_goal_side == "left":
             # Goal A on left, so exclude its Y range
-            if goal_a_y_min > margin:
-                self.walls.append((margin, margin, margin, goal_a_y_min))
-            if goal_a_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((margin, goal_a_y_max, margin, FIELD_HEIGHT_CM - margin))
+            if goal_a_y_min > 0:
+                self.walls.append((0, 0, 0, goal_a_y_min))
+            if goal_a_y_max < FIELD_HEIGHT_CM:
+                self.walls.append((0, goal_a_y_max, 0, FIELD_HEIGHT_CM))
         else:
             # Goal B on left, so exclude its Y range
-            if goal_b_y_min > margin:
-                self.walls.append((margin, margin, margin, goal_b_y_min))
-            if goal_b_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((margin, goal_b_y_max, margin, FIELD_HEIGHT_CM - margin))
+            if goal_b_y_min > 0:
+                self.walls.append((0, 0, 0, goal_b_y_min))
+            if goal_b_y_max < FIELD_HEIGHT_CM:
+                self.walls.append((0, goal_b_y_max, 0, FIELD_HEIGHT_CM))
         
-        # Right wall segments (excluding goals)
+        # Right wall segments (excluding goals) - actual field boundary
         if self.small_goal_side == "right":
             # Goal A on right, so exclude its Y range
-            if goal_a_y_min > margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_a_y_min))
-            if goal_a_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, goal_a_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
+            if goal_a_y_min > 0:
+                self.walls.append((FIELD_WIDTH_CM, 0, FIELD_WIDTH_CM, goal_a_y_min))
+            if goal_a_y_max < FIELD_HEIGHT_CM:
+                self.walls.append((FIELD_WIDTH_CM, goal_a_y_max, FIELD_WIDTH_CM, FIELD_HEIGHT_CM))
         else:
             # Goal B on right, so exclude its Y range
-            if goal_b_y_min > margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_b_y_min))
-            if goal_b_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, goal_b_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
+            if goal_b_y_min > 0:
+                self.walls.append((FIELD_WIDTH_CM, 0, FIELD_WIDTH_CM, goal_b_y_min))
+            if goal_b_y_max < FIELD_HEIGHT_CM:
+                self.walls.append((FIELD_WIDTH_CM, goal_b_y_max, FIELD_WIDTH_CM, FIELD_HEIGHT_CM))
 
     def draw_walls(self, frame):
         """Draw walls, safety margins, goals, and starting box on the frame"""
@@ -552,27 +552,54 @@ class BallCollector:
                 start_px = cv2.perspectiveTransform(start_cm, self.homography_matrix)[0][0].astype(int)
                 end_px = cv2.perspectiveTransform(end_cm, self.homography_matrix)[0][0].astype(int)
                 
-                # Draw the wall line
+                # Draw the actual wall line (thin red line)
                 cv2.line(overlay, tuple(start_px), tuple(end_px), (0, 0, 255), 2)
                 
-                # Draw safety margin area (semi-transparent)
-                margin_pts = []
-                angle = math.atan2(end_px[1] - start_px[1], end_px[0] - start_px[0])
-                margin_px = int(WALL_SAFETY_MARGIN * 10)  # Convert cm to approximate pixels
+                # Draw safety margin area - create a parallel line inside the field
+                wall_vec = np.array([end_px[0] - start_px[0], end_px[1] - start_px[1]])
+                wall_length = np.linalg.norm(wall_vec)
                 
-                # Calculate margin points
-                dx = int(margin_px * math.sin(angle))
-                dy = int(margin_px * math.cos(angle))
-                
-                margin_pts = np.array([
-                    [start_px[0] - dx, start_px[1] + dy],
-                    [end_px[0] - dx, end_px[1] + dy],
-                    [end_px[0] + dx, end_px[1] - dy],
-                    [start_px[0] + dx, start_px[1] - dy]
-                ], np.int32)
-                
-                # Draw safety margin area
-                cv2.fillPoly(overlay, [margin_pts], (0, 0, 255, 128))
+                if wall_length > 0:
+                    # Normalize wall vector
+                    wall_unit = wall_vec / wall_length
+                    
+                    # Calculate perpendicular vector pointing inward to field
+                    perp_vec = np.array([-wall_unit[1], wall_unit[0]])
+                    
+                    # Determine which direction is "inward" based on wall position
+                    wall_center = (start_px + end_px) / 2
+                    field_center = np.array([frame.shape[1]/2, frame.shape[0]/2])
+                    to_center = field_center - wall_center
+                    
+                    # Make sure perpendicular vector points toward field center
+                    if np.dot(perp_vec, to_center) < 0:
+                        perp_vec = -perp_vec
+                    
+                    # Convert safety margin from cm to pixels (approximate)
+                    # Use homography to get a better pixel/cm ratio
+                    margin_cm_pt1 = np.array([[[0, 0]]], dtype="float32")
+                    margin_cm_pt2 = np.array([[[WALL_SAFETY_MARGIN, 0]]], dtype="float32")
+                    margin_px_pt1 = cv2.perspectiveTransform(margin_cm_pt1, self.homography_matrix)[0][0]
+                    margin_px_pt2 = cv2.perspectiveTransform(margin_cm_pt2, self.homography_matrix)[0][0]
+                    margin_px = np.linalg.norm(margin_px_pt2 - margin_px_pt1)
+                    
+                    # Calculate safety margin line
+                    margin_offset = perp_vec * margin_px
+                    margin_start = start_px + margin_offset
+                    margin_end = end_px + margin_offset
+                    
+                    # Draw safety margin line (very thin, semi-transparent red)
+                    cv2.line(overlay, tuple(margin_start.astype(int)), tuple(margin_end.astype(int)), (0, 0, 200), 1)
+                    
+                    # Draw safety zone area (fill between wall and safety line)
+                    safety_zone_pts = np.array([
+                        start_px,
+                        end_px,
+                        margin_end,
+                        margin_start
+                    ], np.int32)
+                    
+                    cv2.fillPoly(overlay, [safety_zone_pts], (0, 0, 255, 32))  # Very light semi-transparent red fill
             
             # Draw goal areas
             for goal_label, goal_points in self.goal_ranges.items():
