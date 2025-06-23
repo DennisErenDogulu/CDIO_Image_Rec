@@ -30,8 +30,18 @@ RF_VERSION = 3
 # Color detection ranges (HSV)
 GREEN_LOWER = np.array([35, 50, 50])
 GREEN_UPPER = np.array([85, 255, 255])
-PINK_LOWER = np.array([145, 50, 50])
-PINK_UPPER = np.array([175, 255, 255])
+
+# Multiple pink ranges to handle different lighting conditions
+PINK_RANGES = [
+    # Primary pink range (original)
+    (np.array([145, 50, 50]), np.array([175, 255, 255])),
+    # Brighter pink (higher value, lower saturation for bright light)
+    (np.array([140, 30, 100]), np.array([180, 200, 255])),
+    # Darker pink (for shadows or dim lighting)
+    (np.array([150, 80, 30]), np.array([175, 255, 200])),
+    # Extended hue range for color variations
+    (np.array([135, 40, 40]), np.array([185, 255, 255]))
+]
 
 # Marker dimensions
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
@@ -131,12 +141,17 @@ class BallCollector:
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera")
-        
-        # Set camera properties for reduced lag
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer to reduce lag
+
+        # Set camera properties for reduced lag - use lower resolution for better performance
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)   # Reduced from 1280
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Reduced from 720
+        self.cap.set(cv2.CAP_PROP_FPS, 15)            # Reduced from 30 for smoother processing
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)      # Minimize buffer to reduce lag
+        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)       # Disable autofocus for consistent performance
+
+        # Additional lag reduction settings
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Disable auto exposure
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))  # Use MJPG codec
         
         # Robot state
         self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)  # Starting position
@@ -153,37 +168,125 @@ class BallCollector:
         self.goal_y_center = FIELD_HEIGHT_CM / 2  # Center Y coordinate of goal
         self.goal_approach_distance = 20  # Distance to stop in front of goal
         self.delivery_time = 2.0  # Seconds to run collector in reverse
+        
+        # Frame skipping for lag reduction
+        self.frame_skip_counter = 0
+        self.frame_skip_interval = 2  # Process every 3rd frame for better performance
+
+    def flush_camera_buffer(self):
+        """Flush camera buffer to get the most recent frame"""
+        # Read and discard multiple frames to clear buffer
+        for _ in range(3):
+            self.cap.grab()
+
+    def get_fresh_frame(self):
+        """Get the most recent frame with minimal lag"""
+        # Flush buffer first
+        self.flush_camera_buffer()
+        
+        # Get the latest frame
+        ret, frame = self.cap.read()
+        return ret, frame
 
     def detect_markers(self, frame):
-        """Detect green base and pink direction markers"""
+        """Detect green base and pink direction markers with improved lighting robustness"""
         # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         # Detect green base marker
         green_mask = cv2.inRange(hsv, GREEN_LOWER, GREEN_UPPER)
+        
+        # Apply morphological operations to clean up green mask
+        kernel = np.ones((3,3), np.uint8)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
+        
         green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Detect pink direction marker
-        pink_mask = cv2.inRange(hsv, PINK_LOWER, PINK_UPPER)
+        # Detect pink direction marker using multiple color ranges
+        pink_mask = np.zeros_like(hsv[:,:,0])
+        
+        # Try each pink range and combine the results
+        for pink_lower, pink_upper in PINK_RANGES:
+            range_mask = cv2.inRange(hsv, pink_lower, pink_upper)
+            pink_mask = cv2.bitwise_or(pink_mask, range_mask)
+        
+        # Apply morphological operations to clean up pink mask
+        kernel_small = np.ones((2,2), np.uint8)
+        pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_OPEN, kernel_small)
+        pink_mask = cv2.morphologyEx(pink_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Apply Gaussian blur to reduce noise
+        pink_mask = cv2.GaussianBlur(pink_mask, (3, 3), 0)
+        
         pink_contours, _ = cv2.findContours(pink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Find largest green contour (base marker)
         green_center = None
         if green_contours:
-            largest_green = max(green_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_green) > 100:  # Minimum area threshold
+            # Filter contours by area and aspect ratio
+            valid_green_contours = []
+            for contour in green_contours:
+                area = cv2.contourArea(contour)
+                if area > 100:  # Minimum area threshold
+                    # Check aspect ratio to filter out non-rectangular shapes
+                    rect = cv2.minAreaRect(contour)
+                    width, height = rect[1]
+                    if width > 0 and height > 0:
+                        aspect_ratio = max(width, height) / min(width, height)
+                        if aspect_ratio < 3:  # Reasonable aspect ratio for marker
+                            valid_green_contours.append(contour)
+            
+            if valid_green_contours:
+                largest_green = max(valid_green_contours, key=cv2.contourArea)
                 M = cv2.moments(largest_green)
                 if M["m00"] != 0:
                     green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
-        # Find largest pink contour (direction marker)
+        # Find best pink contour (direction marker) with improved filtering
         pink_center = None
         if pink_contours:
-            largest_pink = max(pink_contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_pink) > 50:  # Minimum area threshold
-                M = cv2.moments(largest_pink)
+            # Filter and score pink contours
+            scored_contours = []
+            
+            for contour in pink_contours:
+                area = cv2.contourArea(contour)
+                if area > 30:  # Lower minimum area for pink marker
+                    # Calculate circularity (how round the contour is)
+                    perimeter = cv2.arcLength(contour, True)
+                    if perimeter > 0:
+                        circularity = 4 * np.pi * area / (perimeter * perimeter)
+                        
+                        # Calculate compactness
+                        hull = cv2.convexHull(contour)
+                        hull_area = cv2.contourArea(hull)
+                        compactness = area / hull_area if hull_area > 0 else 0
+                        
+                        # Score based on area, circularity, and compactness
+                        score = area * 0.1 + circularity * 100 + compactness * 50
+                        
+                        # Bonus for reasonable size (not too big, not too small)
+                        if 30 < area < 500:
+                            score += 20
+                            
+                        scored_contours.append((contour, score))
+            
+            if scored_contours:
+                # Sort by score and take the best one
+                scored_contours.sort(key=lambda x: x[1], reverse=True)
+                best_contour = scored_contours[0][0]
+                
+                M = cv2.moments(best_contour)
                 if M["m00"] != 0:
                     pink_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                    
+                    # Additional validation: pink marker should be reasonably close to green marker
+                    if green_center:
+                        distance = math.hypot(pink_center[0] - green_center[0], 
+                                           pink_center[1] - green_center[1])
+                        # If pink marker is too far from green marker, ignore it
+                        if distance > 200:  # Max pixel distance between markers
+                            pink_center = None
         
         return green_center, pink_center
 
@@ -191,7 +294,7 @@ class BallCollector:
         """Update robot position and heading based on visual markers"""
         # Capture fresh frame if none provided
         if frame is None:
-            ret, frame = self.cap.read()
+            ret, frame = self.get_fresh_frame()
             if not ret:
                 return False
         
@@ -237,6 +340,45 @@ class BallCollector:
             cv2.line(frame, green_center, pink_center, (255, 255, 255), 2)
         
         return frame
+
+    def show_detection_debug(self, frame):
+        """Show debug view of marker detection masks"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Create combined pink mask using all ranges
+        pink_mask_combined = np.zeros_like(hsv[:,:,0])
+        individual_masks = []
+        
+        for i, (pink_lower, pink_upper) in enumerate(PINK_RANGES):
+            range_mask = cv2.inRange(hsv, pink_lower, pink_upper)
+            individual_masks.append(range_mask)
+            pink_mask_combined = cv2.bitwise_or(pink_mask_combined, range_mask)
+        
+        # Apply the same filtering as in detect_markers
+        kernel_small = np.ones((2,2), np.uint8)
+        kernel = np.ones((3,3), np.uint8)
+        pink_mask_filtered = cv2.morphologyEx(pink_mask_combined, cv2.MORPH_OPEN, kernel_small)
+        pink_mask_filtered = cv2.morphologyEx(pink_mask_filtered, cv2.MORPH_CLOSE, kernel)
+        pink_mask_filtered = cv2.GaussianBlur(pink_mask_filtered, (3, 3), 0)
+        
+        # Create a visualization combining original frame and masks
+        debug_frame = frame.copy()
+        
+        # Show pink detections as colored overlay
+        pink_colored = cv2.applyColorMap(pink_mask_filtered, cv2.COLORMAP_HOT)
+        debug_frame = cv2.addWeighted(debug_frame, 0.7, pink_colored, 0.3, 0)
+        
+        # Add text showing how many ranges detected something
+        active_ranges = sum(1 for mask in individual_masks if cv2.countNonZero(mask) > 0)
+        cv2.putText(debug_frame, f"Active pink ranges: {active_ranges}/{len(PINK_RANGES)}", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Show total pink pixels detected
+        total_pink_pixels = cv2.countNonZero(pink_mask_filtered)
+        cv2.putText(debug_frame, f"Pink pixels: {total_pink_pixels}", 
+                   (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return debug_frame
 
     def setup_walls(self):
         """Set up wall segments based on calibration points, excluding goal areas"""
@@ -377,7 +519,7 @@ class BallCollector:
         cv2.setMouseCallback("Calibration", mouse_callback)
         
         while len(self.calibration_points) < 4:
-            ret, frame = self.cap.read()
+            ret, frame = self.get_fresh_frame()
             if not ret:
                 continue
                 
@@ -395,11 +537,11 @@ class BallCollector:
 
     def detect_balls(self) -> List[Tuple[float, float, str]]:
         """Detect balls in current camera view, return list of (x_cm, y_cm, label)"""
-        ret, frame = self.cap.read()
+        ret, frame = self.get_fresh_frame()
         if not ret:
             return []
 
-        # Resize for Roboflow model
+        # Resize for Roboflow model (optimized for our lower camera resolution)
         small = cv2.resize(frame, (416, 416))
         
         # Get predictions
@@ -817,14 +959,18 @@ class BallCollector:
         last_plan_time = 0
         last_plan_positions = []
         path = []
+        show_debug = False  # Toggle for showing detection debug view
         
         while True:
             try:
-                # Capture frame for visualization - ensure fresh frame
-                self.cap.grab()  # Grab latest frame from buffer
-                ret, frame = self.cap.retrieve()  # Retrieve the grabbed frame
+                # Get fresh frame with reduced lag
+                ret, frame = self.get_fresh_frame()
                 if not ret:
                     continue
+                
+                # Implement frame skipping for better performance
+                self.frame_skip_counter += 1
+                skip_heavy_processing = (self.frame_skip_counter % self.frame_skip_interval) != 0
 
                 # Update robot position from visual markers
                 if not self.update_robot_position(frame):
@@ -841,9 +987,15 @@ class BallCollector:
 
                 # Add status overlay
                 frame = self.draw_status(frame)
+                
+                # Show debug view if enabled
+                if show_debug:
+                    frame = self.show_detection_debug(frame)
 
-                # Detect balls
-                balls = self.detect_balls()
+                # Detect balls (skip during heavy processing frames for better performance)
+                balls = []
+                if not skip_heavy_processing:
+                    balls = self.detect_balls()
                 current_time = time.time()
                 
                 # Only replan if:
@@ -853,7 +1005,7 @@ class BallCollector:
                 #    b) Ball positions have changed significantly OR
                 #    c) Robot has moved significantly
                 should_replan = False
-                if balls and self.robot_pos:
+                if balls and self.robot_pos and not skip_heavy_processing:
                     if current_time - last_plan_time >= 3:  # Minimum 3 seconds between plans
                         should_replan = True
                     elif last_plan_positions:
@@ -1011,6 +1163,7 @@ class BallCollector:
                 help_text = [
                     "Commands:",
                     "ENTER - Execute planned path",
+                    "D - Toggle detection debug view",
                     "Q - Quit"
                 ]
                 y = 150
@@ -1031,6 +1184,9 @@ class BallCollector:
                 # Handle key commands
                 if key == ord('q'):
                     break
+                elif key == ord('d'):
+                    show_debug = not show_debug
+                    logger.info(f"Debug view {'enabled' if show_debug else 'disabled'}")
                 elif key == 13:  # Enter key
                     if path:
                         # Execute the planned path
@@ -1100,7 +1256,7 @@ class BallCollector:
                                         raise Exception("Live approach movement failed")
                                 
                                 # Update visualization during execution
-                                ret, frame = self.cap.read()
+                                ret, frame = self.get_fresh_frame()
                                 if ret:
                                     self.update_robot_position(frame)
                                     frame = self.draw_status(frame)
@@ -1133,7 +1289,7 @@ class BallCollector:
     def run(self):
         """Main run loop"""
         try:
-            # First calibrate the camera
+            # Calibrate the camera perspective
             logger.info("Starting camera calibration...")
             self.calibrate()
             
