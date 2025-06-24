@@ -1893,10 +1893,18 @@ class BallCollector:
                 cv2.putText(frame, "TARGET", (target_px[0] + 15, target_px[1] - 15),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
-                # Draw line from robot to target
-                robot_cm = np.array([[[self.robot_pos[0], self.robot_pos[1]]]], dtype="float32")
-                robot_px = cv2.perspectiveTransform(robot_cm, self.homography_matrix)[0][0].astype(int)
-                cv2.line(frame, tuple(robot_px), tuple(target_px), (0, 255, 255), 1)
+                # Draw line from heading marker (collector position) to target
+                green_center, purple_center = self.detect_markers(frame)
+                if purple_center:
+                    # Use purple heading marker as starting point (collector position)
+                    cv2.line(frame, purple_center, tuple(target_px), (0, 255, 255), 2)
+                    # Draw a small arrow at purple center pointing to target
+                    cv2.circle(frame, purple_center, 3, (0, 255, 255), -1)
+                else:
+                    # Fallback to robot base position if purple marker not detected
+                    robot_cm = np.array([[[self.robot_pos[0], self.robot_pos[1]]]], dtype="float32")
+                    robot_px = cv2.perspectiveTransform(robot_cm, self.homography_matrix)[0][0].astype(int)
+                    cv2.line(frame, tuple(robot_px), tuple(target_px), (0, 255, 255), 1)
             
             # Progress information overlay
             progress_pct = int((current_step / max_steps) * 100) if max_steps > 0 else 0
