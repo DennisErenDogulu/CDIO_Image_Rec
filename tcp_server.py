@@ -33,10 +33,11 @@ display = Display()                 # EV3 display
 power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
-NORMAL_SPEED_RPM = -40
-SLOW_SPEED_RPM = -25
-TURN_SPEED_RPM = -50  # Even slower turns for more precision
-COLLECTOR_SPEED = 50  # Percentage
+NORMAL_SPEED_RPM = 40
+SLOW_SPEED_RPM = 25
+TURN_SPEED_RPM = 50  # Even slower turns for more precision
+COLLECTOR_SPEED = 50  # Percentage for collection
+DELIVERY_SPEED = 80   # Percentage for ball delivery (higher speed)
 
 # Acceleration control (ramp up/down)
 ACCELERATION_TIME_MS = 200  # Time to reach full speed
@@ -77,7 +78,19 @@ def safe_motor_control(func):
 @safe_motor_control
 def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
-    mdiff.on_for_distance(SpeedRPM(NORMAL_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
+    # Determine direction and adjust speed accordingly
+    if distance_cm < 0:
+        # Moving backward - use negative speed for backward movement
+        speed = -NORMAL_SPEED_RPM  # Negative speed for backward (-40)
+        distance_mm = abs(distance_cm) * 11.1  # Use positive distance
+        print("Moving backward {:.1f} cm".format(abs(distance_cm)))
+    else:
+        # Moving forward - use positive speed for forward movement
+        speed = NORMAL_SPEED_RPM  # Positive speed for forward (+40)
+        distance_mm = distance_cm * 11.1
+        print("Moving forward {:.1f} cm".format(distance_cm))
+    
+    mdiff.on_for_distance(SpeedRPM(speed), distance_mm)
     return True
 
 @safe_motor_control
@@ -123,15 +136,29 @@ def execute_turn(angle_deg):
 
 @safe_motor_control
 def execute_collect(distance_cm):
-    """Move forward slowly while running collector"""
+    """Move forward slowly while running collector with extended collection time"""
     try:
         # Start collector motor with gradual speed increase
         for speed in range(0, COLLECTOR_SPEED + 1, 5):
             collector.on(speed)
             time.sleep(0.05)
         
+        # Run collector for a moment before moving to ensure it's spinning
+        time.sleep(0.5)
+        
         # Move forward slowly
         mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), distance_cm * 11.1)  # adjusted cm to mm conversion
+        
+        # Continue running collector for additional time after movement
+        print("Collection phase 1 complete - continuing collector for extra pickup")
+        time.sleep(1.5)  # Extra collection time while stationary
+        
+        # Move forward a tiny bit more while collecting
+        mdiff.on_for_distance(SpeedRPM(SLOW_SPEED_RPM), 2 * 11.1)  # Extra 2cm forward
+        
+        # Final collection burst
+        print("Final collection burst")
+        time.sleep(1.0)  # Additional collection time
         
         # Gradually stop collector
         for speed in range(COLLECTOR_SPEED, -1, -5):
@@ -139,6 +166,7 @@ def execute_collect(distance_cm):
             time.sleep(0.05)
         
         collector.off(brake=True)
+        print("Collection sequence complete")
         return True
     except Exception as e:
         print("Collection error: {}".format(e))
@@ -147,22 +175,23 @@ def execute_collect(distance_cm):
 
 @safe_motor_control
 def execute_collect_reverse(duration):
-    """Run collector in reverse to deliver balls"""
+    """Run collector in reverse to deliver balls at high speed"""
     try:
-        # Start collector motor in reverse with gradual speed increase
-        for speed in range(0, -COLLECTOR_SPEED - 1, -5):
+        # Start collector motor in reverse with gradual speed increase to delivery speed
+        for speed in range(0, -DELIVERY_SPEED - 1, -5):
             collector.on(speed)
             time.sleep(0.05)
         
-        # Run for specified duration
+        # Run for specified duration at high delivery speed
         time.sleep(duration)
         
         # Gradually stop collector
-        for speed in range(-COLLECTOR_SPEED, 1, 5):
+        for speed in range(-DELIVERY_SPEED, 1, 5):
             collector.on(speed)
             time.sleep(0.05)
         
         collector.off(brake=True)
+        print("Ball delivery complete at {}% speed".format(DELIVERY_SPEED))
         return True
     except Exception as e:
         print("Reverse collection error: {}".format(e))
