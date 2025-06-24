@@ -16,7 +16,7 @@ import socket
 import logging
 import numpy as np
 from typing import List, Tuple, Optional
-from ultralytics import YOLO
+from roboflow import Roboflow
 import time
 
 # Configuration
@@ -55,6 +55,7 @@ ROBOT_START_X = 20  # cm from left edge
 ROBOT_START_Y = 20  # cm from bottom edge
 ROBOT_WIDTH = 26.5   # cm
 ROBOT_LENGTH = 20  # cm
+ROBOT_START_HEADING = 0  # degrees (0 = facing east)
 
 # Physical constraints
 FIELD_WIDTH_CM = 180
@@ -71,7 +72,7 @@ IGNORED_AREA = {
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,  # Back to INFO to reduce spam
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -128,54 +129,12 @@ def point_to_line_distance(point, line_start, line_end):
                 
         return False
 
-def detect_colored_marker(frame, lower_color, upper_color):
-    """Detect colored marker in frame and return its center and orientation"""
-    # Convert to HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    # Create mask and find contours
-    mask = cv2.inRange(hsv, lower_color, upper_color)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return None, None
-    
-    # Find largest contour
-    largest_contour = max(contours, key=cv2.contourArea)
-    
-    # Get center
-    M = cv2.moments(largest_contour)
-    if M["m00"] == 0:
-        return None, None
-        
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-    
-    # Get orientation using PCA
-    data_pts = np.float32(largest_contour).reshape(-1, 2)
-    mean, eigenvectors = cv2.PCACompute(data_pts, mean=np.float32([]))
-    
-    # Calculate angle
-    angle = math.degrees(math.atan2(eigenvectors[0][1], eigenvectors[0][0]))
-    
-    return (cx, cy), angle
-
 class BallCollector:
     def __init__(self):
-        # Initialize YOLO model
-        try:
-            self.model = YOLO(WEIGHTS_PATH)
-            logger.info("Successfully loaded YOLO model from %s", WEIGHTS_PATH)
-            
-            # Debug: Print available classes
-            if hasattr(self.model, 'names'):
-                logger.info(f"Available model classes: {list(self.model.names.values())}")
-            else:
-                logger.warning("Could not retrieve model class names")
-                
-        except Exception as e:
-            logger.error("Failed to load YOLO model: %s", e)
-            raise
+        # Initialize Roboflow
+        self.rf = Roboflow(api_key=ROBOFLOW_API_KEY)
+        self.project = self.rf.workspace(RF_WORKSPACE).project(RF_PROJECT)
+        self.model = self.project.version(RF_VERSION).model
         
         # Initialize camera
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use camera index 1 for USB camera
@@ -194,8 +153,8 @@ class BallCollector:
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))  # Use MJPG codec
         
         # Robot state
-        self.robot_pos = None  # Will be updated by vision
-        self.robot_heading = None  # Will be updated by vision
+        self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)  # Starting position
+        self.robot_heading = ROBOT_START_HEADING  # Starting heading
         
         # Calibration points for homography
         self.calibration_points = []
@@ -1549,105 +1508,6 @@ class BallCollector:
             })
         
         return path
-
-    def update_robot_position(self, frame):
-        """Update robot position and heading using colored markers"""
-        current_time = time.time()
-        
-        # Only update every pos_update_interval seconds
-        if current_time - self.last_pos_update < self.pos_update_interval:
-            return
-            
-        # Detect green marker (robot body)
-        robot_center, robot_angle = detect_colored_marker(frame, GREEN_LOWER, GREEN_UPPER)
-        
-        # Detect pink marker (heading/collection area)
-        heading_center, _ = detect_colored_marker(frame, PINK_LOWER, PINK_UPPER)
-        
-        if robot_center and heading_center and self.homography_matrix is not None:
-            # Convert pixel coordinates to cm
-            robot_px = np.array([[[robot_center[0], robot_center[1]]]], dtype="float32")
-            robot_cm = cv2.perspectiveTransform(robot_px, np.linalg.inv(self.homography_matrix))[0][0]
-            
-            heading_px = np.array([[[heading_center[0], heading_center[1]]]], dtype="float32")
-            heading_cm = cv2.perspectiveTransform(heading_px, np.linalg.inv(self.homography_matrix))[0][0]
-            
-            # Update robot position
-            self.robot_pos = (robot_cm[0], robot_cm[1])
-            
-            # Calculate heading from robot center to heading marker
-            dx = heading_cm[0] - robot_cm[0]
-            dy = heading_cm[1] - robot_cm[1]
-            self.robot_heading = math.degrees(math.atan2(dy, dx))
-            
-            self.last_pos_update = current_time
-            
-            # Draw debug visualization
-            cv2.circle(frame, robot_center, 5, (0, 255, 0), -1)
-            cv2.circle(frame, heading_center, 5, (255, 192, 203), -1)
-            cv2.line(frame, robot_center, heading_center, (255, 255, 0), 2)
-
-    def move_with_reassessment(self, target_pos, is_collecting=False):
-        """Move to target position with periodic reassessment"""
-        while True:
-            # Get current position
-            if self.robot_pos is None or self.robot_heading is None:
-                logger.error("Lost robot position during movement")
-                return False
-
-            # Calculate remaining distance and angle
-            dx = target_pos[0] - self.robot_pos[0]
-            dy = target_pos[1] - self.robot_pos[1]
-            distance = math.hypot(dx, dy)
-            target_angle = math.degrees(math.atan2(dy, dx))
-
-            # If we're close enough to target, we're done
-            if distance < 2:  # 2cm threshold
-                return True
-
-            # Calculate turn angle
-            angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-            if abs(angle_diff) > 5:
-                logger.info(f"Turning {angle_diff:.1f} degrees")
-                if not self.turn(angle_diff):
-                    return False
-                self.robot_heading = target_angle
-
-            # Calculate movement distance for this segment
-            move_distance = min(REASSESS_DISTANCE_CM, distance)
-
-            # Execute movement
-            if is_collecting:
-                logger.info(f"Collecting for {move_distance:.1f} cm")
-                if not self.collect(move_distance):
-                    return False
-            else:
-                logger.info(f"Moving {move_distance:.1f} cm")
-                if not self.move(move_distance):
-                    return False
-
-            # Pause for reassessment
-            logger.info("Pausing for position reassessment...")
-            time.sleep(REASSESS_PAUSE_SEC)
-
-            # Update visualization during pause
-            ret, frame = self.cap.read()
-            if ret:
-                self.update_robot_position(frame)
-                frame = self.draw_status(frame)
-                frame = self.draw_walls(frame)
-                cv2.imshow("Path Planning", frame)
-                cv2.waitKey(1)
-
-            # Check if we need to adjust path due to significant position error
-            if self.robot_pos is not None:
-                actual_dx = self.robot_pos[0] - target_pos[0]
-                actual_dy = self.robot_pos[1] - target_pos[1]
-                position_error = math.hypot(actual_dx, actual_dy)
-                
-                if position_error > 5:  # More than 5cm error
-                    logger.info(f"Position error of {position_error:.1f}cm detected, adjusting path")
-                    continue  # This will recalculate the path from current position
 
     def collect_balls(self):
         """Main ball collection loop"""
