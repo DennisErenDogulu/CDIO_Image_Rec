@@ -33,9 +33,9 @@ display = Display()                 # EV3 display
 power = PowerSupply()               # For battery monitoring
 
 # Movement speeds
-NORMAL_SPEED_RPM = -40
-SLOW_SPEED_RPM = -25
-TURN_SPEED_RPM = -50  # Even slower turns for more precision
+NORMAL_SPEED_RPM = 40
+SLOW_SPEED_RPM = 25
+TURN_SPEED_RPM = 50  # Even slower turns for more precision
 COLLECTOR_SPEED = 50  # Percentage for collection
 DELIVERY_SPEED = 80   # Percentage for ball delivery (higher speed)
 
@@ -80,13 +80,13 @@ def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
     # Determine direction and adjust speed accordingly
     if distance_cm < 0:
-        # Moving backward - use positive speed for backward movement
-        speed = abs(NORMAL_SPEED_RPM)  # Positive speed for backward
+        # Moving backward - use negative speed for backward movement
+        speed = -NORMAL_SPEED_RPM  # Negative speed for backward (-40)
         distance_mm = abs(distance_cm) * 11.1  # Use positive distance
         print("Moving backward {:.1f} cm".format(abs(distance_cm)))
     else:
-        # Moving forward - use negative speed (normal forward movement)
-        speed = NORMAL_SPEED_RPM  # Negative speed for forward
+        # Moving forward - use positive speed for forward movement
+        speed = NORMAL_SPEED_RPM  # Positive speed for forward (+40)
         distance_mm = distance_cm * 11.1
         print("Moving forward {:.1f} cm".format(distance_cm))
     

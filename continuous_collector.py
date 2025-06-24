@@ -31,21 +31,17 @@ RF_VERSION = 4
 GREEN_LOWER = np.array([35, 50, 50])
 GREEN_UPPER = np.array([85, 255, 255])
 
-# Multiple red ranges to handle different lighting conditions
-RED_RANGES = [
-    # Primary red range (lower hue values)
-    (np.array([0, 50, 50]), np.array([10, 255, 255])),
-    # Upper red range (higher hue values - red wraps around in HSV)
-    (np.array([170, 50, 50]), np.array([180, 255, 255])),
-    # Brighter red (higher value, lower saturation for bright light)
-    (np.array([0, 30, 100]), np.array([15, 200, 255])),
-    # Darker red (for shadows or dim lighting)
-    (np.array([165, 80, 30]), np.array([180, 255, 200]))
+# Purple ranges for the direction marker (much more selective than red!)
+PURPLE_RANGES = [
+    # Main purple range (violet/purple hues)
+    (np.array([120, 60, 60]), np.array([150, 255, 255])),
+    # Magenta-purple range (for different lighting)
+    (np.array([145, 50, 50]), np.array([170, 255, 255])),
 ]
 
 # Marker dimensions
 GREEN_MARKER_WIDTH_CM = 20  # Width of green base sheet
-RED_MARKER_WIDTH_CM = 5     # Width of red direction marker
+PURPLE_MARKER_WIDTH_CM = 5  # Width of purple direction marker
 
 # Wall configuration
 WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
@@ -106,32 +102,32 @@ def point_to_line_distance(point, line_start, line_end):
     
     return math.hypot(x - proj_x, y - proj_y)
 
-def check_wall_collision(start_pos, end_pos, walls, safety_margin):
-    """Check if a path between two points collides with any walls"""
-    for wall_start_x, wall_start_y, wall_end_x, wall_end_y in walls:
-        # Check if either endpoint is too close to the wall
-        if (point_to_line_distance(start_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin or
-            point_to_line_distance(end_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin):
-            return True
+    def check_wall_collision(start_pos, end_pos, walls, safety_margin):
+        """Check if a path between two points collides with any walls"""
+        for wall_start_x, wall_start_y, wall_end_x, wall_end_y in walls:
+            # Check if either endpoint is too close to the wall
+            if (point_to_line_distance(start_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin or
+                point_to_line_distance(end_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin):
+                return True
+                
+            # Check if path intersects with wall
+            # Using line segment intersection formula
+            x1, y1 = start_pos
+            x2, y2 = end_pos
+            x3, y3 = wall_start_x, wall_start_y
+            x4, y4 = wall_end_x, wall_end_y
             
-        # Check if path intersects with wall
-        # Using line segment intersection formula
-        x1, y1 = start_pos
-        x2, y2 = end_pos
-        x3, y3 = wall_start_x, wall_start_y
-        x4, y4 = wall_end_x, wall_end_y
-        
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if denom == 0:  # Lines are parallel
-            continue
+            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+            if denom == 0:  # Lines are parallel
+                continue
+                
+            t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+            u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
             
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-        
-        if 0 <= t <= 1 and 0 <= u <= 1:
-            return True
-            
-    return False
+            if 0 <= t <= 1 and 0 <= u <= 1:
+                return True
+                
+        return False
 
 class BallCollector:
     def __init__(self):
@@ -261,41 +257,41 @@ class BallCollector:
                 if M["m00"] != 0:
                     green_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
-        # Find red direction marker within 40 pixels of green marker
-        red_center = None
-        if green_center:  # Only search for red if green marker is found
+        # Find purple direction marker within 40 pixels of green marker
+        purple_center = None
+        if green_center:  # Only search for purple if green marker is found
             # Create a mask for the search area (40 pixel radius around green marker)
             search_mask = np.zeros_like(hsv[:,:,0])
             cv2.circle(search_mask, green_center, 40, 255, -1)
             
-            # Detect red direction marker using multiple color ranges
-            red_mask = np.zeros_like(hsv[:,:,0])
+            # Detect purple direction marker using multiple color ranges
+            purple_mask = np.zeros_like(hsv[:,:,0])
             
-            # Try each red range and combine the results
-            for red_lower, red_upper in RED_RANGES:
-                range_mask = cv2.inRange(hsv, red_lower, red_upper)
-                red_mask = cv2.bitwise_or(red_mask, range_mask)
+            # Try each purple range and combine the results
+            for purple_lower, purple_upper in PURPLE_RANGES:
+                range_mask = cv2.inRange(hsv, purple_lower, purple_upper)
+                purple_mask = cv2.bitwise_or(purple_mask, range_mask)
             
-            # Apply the search area mask to limit detection to within 100 pixels of green
-            red_mask = cv2.bitwise_and(red_mask, search_mask)
+            # Apply the search area mask to limit detection to within 40 pixels of green
+            purple_mask = cv2.bitwise_and(purple_mask, search_mask)
             
-            # Apply morphological operations to clean up red mask
+            # Apply morphological operations to clean up purple mask
             kernel_small = np.ones((2,2), np.uint8)
-            red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel_small)
-            red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
+            purple_mask = cv2.morphologyEx(purple_mask, cv2.MORPH_OPEN, kernel_small)
+            purple_mask = cv2.morphologyEx(purple_mask, cv2.MORPH_CLOSE, kernel)
             
             # Apply Gaussian blur to reduce noise
-            red_mask = cv2.GaussianBlur(red_mask, (3, 3), 0)
+            purple_mask = cv2.GaussianBlur(purple_mask, (3, 3), 0)
             
-            red_contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            purple_contours, _ = cv2.findContours(purple_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            if red_contours:
-                # Filter and score red contours
+            if purple_contours:
+                # Filter and score purple contours
                 scored_contours = []
                 
-                for contour in red_contours:
+                for contour in purple_contours:
                     area = cv2.contourArea(contour)
-                    if area > 30:  # Lower minimum area for red marker
+                    if area > 30:  # Lower minimum area for purple marker
                         # Calculate circularity (how round the contour is)
                         perimeter = cv2.arcLength(contour, True)
                         if perimeter > 0:
@@ -322,9 +318,9 @@ class BallCollector:
                     
                     M = cv2.moments(best_contour)
                     if M["m00"] != 0:
-                        red_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                        purple_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
         
-        return green_center, red_center
+        return green_center, purple_center
 
     def update_robot_position(self, frame=None):
         """Update robot position and heading based on visual markers"""
@@ -334,23 +330,23 @@ class BallCollector:
             if not ret:
                 return False
         
-        green_center, red_center = self.detect_markers(frame)
+        green_center, purple_center = self.detect_markers(frame)
         
-        if green_center and red_center and self.homography_matrix is not None:
+        if green_center and purple_center and self.homography_matrix is not None:
             # Convert green center (robot base) to cm coordinates
             green_px = np.array([[[float(green_center[0]), float(green_center[1])]]], dtype="float32")
             green_cm = cv2.perspectiveTransform(green_px, np.linalg.inv(self.homography_matrix))[0][0]
             
-            # Convert red center (direction marker) to cm coordinates
-            red_px = np.array([[[float(red_center[0]), float(red_center[1])]]], dtype="float32")
-            red_cm = cv2.perspectiveTransform(red_px, np.linalg.inv(self.homography_matrix))[0][0]
+            # Convert purple center (direction marker) to cm coordinates
+            purple_px = np.array([[[float(purple_center[0]), float(purple_center[1])]]], dtype="float32")
+            purple_cm = cv2.perspectiveTransform(purple_px, np.linalg.inv(self.homography_matrix))[0][0]
             
             # Update robot position (green marker center)
             self.robot_pos = (green_cm[0], green_cm[1])
             
-            # Calculate heading from green to red marker
-            dx = red_cm[0] - green_cm[0]
-            dy = red_cm[1] - green_cm[1]
+            # Calculate heading from green to purple marker
+            dx = purple_cm[0] - green_cm[0]
+            dy = purple_cm[1] - green_cm[1]
             self.robot_heading = math.degrees(math.atan2(dy, dx))
             
             return True
@@ -359,23 +355,23 @@ class BallCollector:
 
     def draw_robot_markers(self, frame):
         """Draw detected robot markers on frame"""
-        green_center, red_center = self.detect_markers(frame)
+        green_center, purple_center = self.detect_markers(frame)
         
         if green_center:
             # Draw green base marker
             cv2.circle(frame, green_center, 10, (0, 255, 0), -1)
             cv2.circle(frame, green_center, 12, (255, 255, 255), 2)
-            # Draw search area for red marker (40 pixel radius)
+            # Draw search area for purple marker (40 pixel radius)
             cv2.circle(frame, green_center, 40, (0, 255, 255), 1)  # Yellow circle to show search area
         
-        if red_center:
-            # Draw red direction marker
-            cv2.circle(frame, red_center, 8, (0, 0, 255), -1)  # Red color in BGR
-            cv2.circle(frame, red_center, 10, (255, 255, 255), 2)
+        if purple_center:
+            # Draw purple direction marker
+            cv2.circle(frame, purple_center, 8, (128, 0, 128), -1)  # Purple color in BGR
+            cv2.circle(frame, purple_center, 10, (255, 255, 255), 2)
         
-        if green_center and red_center:
+        if green_center and purple_center:
             # Draw line from base to direction marker
-            cv2.line(frame, green_center, red_center, (255, 255, 255), 2)
+            cv2.line(frame, green_center, purple_center, (255, 255, 255), 2)
         
         return frame
 
@@ -386,50 +382,50 @@ class BallCollector:
         # First detect green to get search area
         green_center, _ = self.detect_markers(frame)
         
-        # Create combined red mask using all ranges
-        red_mask_combined = np.zeros_like(hsv[:,:,0])
+        # Create combined purple mask using all ranges
+        purple_mask_combined = np.zeros_like(hsv[:,:,0])
         individual_masks = []
         
-        for i, (red_lower, red_upper) in enumerate(RED_RANGES):
-            range_mask = cv2.inRange(hsv, red_lower, red_upper)
+        for i, (purple_lower, purple_upper) in enumerate(PURPLE_RANGES):
+            range_mask = cv2.inRange(hsv, purple_lower, purple_upper)
             individual_masks.append(range_mask)
-            red_mask_combined = cv2.bitwise_or(red_mask_combined, range_mask)
+            purple_mask_combined = cv2.bitwise_or(purple_mask_combined, range_mask)
         
         # Apply search area restriction if green marker is found
         if green_center:
             search_mask = np.zeros_like(hsv[:,:,0])
             cv2.circle(search_mask, green_center, 40, 255, -1)
-            red_mask_combined = cv2.bitwise_and(red_mask_combined, search_mask)
+            purple_mask_combined = cv2.bitwise_and(purple_mask_combined, search_mask)
         
         # Apply the same filtering as in detect_markers
         kernel_small = np.ones((2,2), np.uint8)
         kernel = np.ones((3,3), np.uint8)
-        red_mask_filtered = cv2.morphologyEx(red_mask_combined, cv2.MORPH_OPEN, kernel_small)
-        red_mask_filtered = cv2.morphologyEx(red_mask_filtered, cv2.MORPH_CLOSE, kernel)
-        red_mask_filtered = cv2.GaussianBlur(red_mask_filtered, (3, 3), 0)
+        purple_mask_filtered = cv2.morphologyEx(purple_mask_combined, cv2.MORPH_OPEN, kernel_small)
+        purple_mask_filtered = cv2.morphologyEx(purple_mask_filtered, cv2.MORPH_CLOSE, kernel)
+        purple_mask_filtered = cv2.GaussianBlur(purple_mask_filtered, (3, 3), 0)
         
         # Create a visualization combining original frame and masks
         debug_frame = frame.copy()
         
-        # Show red detections as colored overlay
-        red_colored = cv2.applyColorMap(red_mask_filtered, cv2.COLORMAP_HOT)
-        debug_frame = cv2.addWeighted(debug_frame, 0.7, red_colored, 0.3, 0)
+        # Show purple detections as colored overlay
+        purple_colored = cv2.applyColorMap(purple_mask_filtered, cv2.COLORMAP_PLASMA)
+        debug_frame = cv2.addWeighted(debug_frame, 0.7, purple_colored, 0.3, 0)
         
         # Draw search area if green marker found
         if green_center:
             cv2.circle(debug_frame, green_center, 40, (0, 255, 255), 2)
-            cv2.putText(debug_frame, "Red search area", 
+            cv2.putText(debug_frame, "Purple search area", 
                        (green_center[0] + 10, green_center[1] - 50), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
         # Add text showing how many ranges detected something
         active_ranges = sum(1 for mask in individual_masks if cv2.countNonZero(mask) > 0)
-        cv2.putText(debug_frame, f"Active red ranges: {active_ranges}/{len(RED_RANGES)}", 
+        cv2.putText(debug_frame, f"Active purple ranges: {active_ranges}/{len(PURPLE_RANGES)}", 
                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Show total red pixels detected
-        total_red_pixels = cv2.countNonZero(red_mask_filtered)
-        cv2.putText(debug_frame, f"Red pixels: {total_red_pixels}", 
+        # Show total purple pixels detected
+        total_purple_pixels = cv2.countNonZero(purple_mask_filtered)
+        cv2.putText(debug_frame, f"Purple pixels: {total_purple_pixels}", 
                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return debug_frame
@@ -591,6 +587,169 @@ class BallCollector:
         
         return frame
 
+    def check_wall_collision(self, start_pos, end_pos, walls, safety_margin):
+        """Check if a path between two points collides with any walls"""
+        for wall_start_x, wall_start_y, wall_end_x, wall_end_y in walls:
+            # Check if either endpoint is too close to the wall
+            if (point_to_line_distance(start_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin or
+                point_to_line_distance(end_pos, (wall_start_x, wall_start_y), (wall_end_x, wall_end_y)) < safety_margin):
+                return True
+                
+            # Check if path intersects with wall
+            # Using line segment intersection formula
+            x1, y1 = start_pos
+            x2, y2 = end_pos
+            x3, y3 = wall_start_x, wall_start_y
+            x4, y4 = wall_end_x, wall_end_y
+            
+            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+            if denom == 0:  # Lines are parallel
+                continue
+                
+            t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+            u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+            
+            if 0 <= t <= 1 and 0 <= u <= 1:
+                return True
+                
+        return False
+
+    def check_obstacle_collision(self, start_pos, end_pos):
+        """Check if a direct path would intersect with the obstacle"""
+        if (IGNORED_AREA["x_max"] <= IGNORED_AREA["x_min"] or 
+            IGNORED_AREA["y_max"] <= IGNORED_AREA["y_min"]):
+            return False  # No obstacle defined
+        
+        # Add bigger safety margin around obstacle for collision detection
+        margin = 15  # Much larger margin for obstacle avoidance (was WALL_SAFETY_MARGIN = 1cm)
+        x_min = IGNORED_AREA["x_min"] - margin
+        x_max = IGNORED_AREA["x_max"] + margin
+        y_min = IGNORED_AREA["y_min"] - margin
+        y_max = IGNORED_AREA["y_max"] + margin
+        
+        # Check if line segment intersects with expanded obstacle rectangle
+        x1, y1 = start_pos
+        x2, y2 = end_pos
+        
+        # Check intersection with each edge of the obstacle rectangle
+        obstacle_edges = [
+            ((x_min, y_min), (x_max, y_min)),  # top
+            ((x_max, y_min), (x_max, y_max)),  # right
+            ((x_max, y_max), (x_min, y_max)),  # bottom
+            ((x_min, y_max), (x_min, y_min))   # left
+        ]
+        
+        for edge_start, edge_end in obstacle_edges:
+            x3, y3 = edge_start
+            x4, y4 = edge_end
+            
+            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+            if denom == 0:  # Lines are parallel
+                continue
+                
+            t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+            u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+            
+            if 0 <= t <= 1 and 0 <= u <= 1:
+                return True
+        
+        return False
+
+    def plan_path_around_obstacle(self, start_pos, target_pos):
+        """Plan a path around the obstacle if direct path is blocked"""
+        # First check if direct path is clear
+        if not self.check_obstacle_collision(start_pos, target_pos):
+            return [target_pos]  # Direct path is fine
+        
+        logger.info(f"Direct path blocked by obstacle, planning adaptive detour...")
+        
+        # Get obstacle center and bounds
+        obs_center_x = (IGNORED_AREA["x_min"] + IGNORED_AREA["x_max"]) / 2
+        obs_center_y = (IGNORED_AREA["y_min"] + IGNORED_AREA["y_max"]) / 2
+        
+        # Determine which side of obstacle to go around based on start and target positions
+        start_to_obs_x = obs_center_x - start_pos[0]
+        start_to_obs_y = obs_center_y - start_pos[1]
+        target_to_obs_x = obs_center_x - target_pos[0]
+        target_to_obs_y = obs_center_y - target_pos[1]
+        
+        # Choose the side that makes most sense geometrically
+        # If start and target are on same side of obstacle, go around the closer edge
+        safety_margin = 25  # Large safety margin
+        
+        # Calculate expanded obstacle bounds
+        x_min = IGNORED_AREA["x_min"] - safety_margin
+        x_max = IGNORED_AREA["x_max"] + safety_margin
+        y_min = IGNORED_AREA["y_min"] - safety_margin
+        y_max = IGNORED_AREA["y_max"] + safety_margin
+        
+        # Ensure waypoints are within field bounds with margin
+        field_margin = 10
+        x_min = max(x_min, field_margin)
+        x_max = min(x_max, FIELD_WIDTH_CM - field_margin)
+        y_min = max(y_min, field_margin)
+        y_max = min(y_max, FIELD_HEIGHT_CM - field_margin)
+        
+        # Determine best route: left, right, top, or bottom around obstacle
+        routes = []
+        
+        # Route 1: Go around left side (via bottom-left, top-left)
+        if x_min > field_margin:
+            left_bottom = (x_min, max(y_min, start_pos[1] - 10))
+            left_top = (x_min, min(y_max, target_pos[1] + 10))
+            routes.append(("left", [left_bottom, left_top, target_pos]))
+        
+        # Route 2: Go around right side (via bottom-right, top-right)  
+        if x_max < FIELD_WIDTH_CM - field_margin:
+            right_bottom = (x_max, max(y_min, start_pos[1] - 10))
+            right_top = (x_max, min(y_max, target_pos[1] + 10))
+            routes.append(("right", [right_bottom, right_top, target_pos]))
+        
+        # Route 3: Go around bottom (via bottom-left, bottom-right)
+        if y_min > field_margin:
+            bottom_left = (max(x_min, start_pos[0] - 10), y_min)
+            bottom_right = (min(x_max, target_pos[0] + 10), y_min)
+            routes.append(("bottom", [bottom_left, bottom_right, target_pos]))
+        
+        # Route 4: Go around top (via top-left, top-right)
+        if y_max < FIELD_HEIGHT_CM - field_margin:
+            top_left = (max(x_min, start_pos[0] - 10), y_max)
+            top_right = (min(x_max, target_pos[0] + 10), y_max)
+            routes.append(("top", [top_left, top_right, target_pos]))
+        
+        # Find the shortest valid route
+        best_route = None
+        best_distance = float('inf')
+        
+        for route_name, waypoints in routes:
+            total_distance = 0
+            valid_route = True
+            
+            # Check if all segments are clear
+            current_pos = start_pos
+            for waypoint in waypoints:
+                # Check collision for this segment
+                if (self.check_obstacle_collision(current_pos, waypoint) or
+                    self.check_wall_collision(current_pos, waypoint, self.walls, WALL_SAFETY_MARGIN)):
+                    valid_route = False
+                    break
+                
+                # Add distance
+                total_distance += math.hypot(waypoint[0] - current_pos[0], waypoint[1] - current_pos[1])
+                current_pos = waypoint
+            
+            if valid_route and total_distance < best_distance:
+                best_distance = total_distance
+                best_route = (route_name, waypoints)
+        
+        if best_route:
+            route_name, waypoints = best_route
+            logger.info(f"Using {route_name} route around obstacle with {len(waypoints)} waypoints")
+            return waypoints
+        else:
+            logger.warning("Could not find safe route around obstacle, trying direct path")
+            return [target_pos]
+
     def send_command(self, command: str, **params) -> bool:
         """Send a command to the EV3 server"""
         try:
@@ -744,8 +903,21 @@ class BallCollector:
             
             logger.info(f"✅ Obstacle area set: ({x_min:.1f}, {y_min:.1f}) to ({x_max:.1f}, {y_max:.1f}) cm")
             
-            # Set up walls after obstacle calibration
+            # Set up field walls first
             self.setup_walls()
+            
+            # ↓↓↓  NEW CODE  ↓↓↓ -----------------------------------------------
+            # Add obstacle walls AFTER field walls are set up
+            # Inflate by the same safety margin you use for the field walls
+            m = WALL_SAFETY_MARGIN
+            self.walls.extend([
+                (x_min - m, y_min - m, x_max + m, y_min - m),  # top
+                (x_max + m, y_min - m, x_max + m, y_max + m),  # right
+                (x_max + m, y_max + m, x_min - m, y_max + m),  # bottom
+                (x_min - m, y_max + m, x_min - m, y_min - m)   # left
+            ])
+            
+            logger.info(f"✅ Added 4 obstacle walls with {m}cm safety margin")
             logger.info("✅ Calibration and wall setup complete")
 
     def detect_balls(self) -> List[Tuple[float, float, str]]:
@@ -897,12 +1069,7 @@ class BallCollector:
                 color = colors[point['type']]
                 cv2.circle(overlay, tuple(pt_px), 5, color, -1)
                 
-                # Draw direction for approach points
-                if point['type'] in ['approach', 'tank_approach', 'goal', 'backward_approach']:
-                    angle_rad = math.radians(point['angle'])
-                    end_x = pt_px[0] + int(20 * math.cos(angle_rad))
-                    end_y = pt_px[1] + int(20 * math.sin(angle_rad))
-                    cv2.arrowedLine(overlay, tuple(pt_px), (end_x, end_y), color, 2)
+                # Skip drawing direction arrows since we simplified to direct movement
                 
                 # Add labels
                 if point['type'] == 'collect':
@@ -960,6 +1127,8 @@ class BallCollector:
         cv2.putText(frame, f"Small goal side: {self.small_goal_side}",
                    (x, y + line_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
+
+        
         if status:
             # Battery status
             battery_pct = status.get("battery_percentage", 0)
@@ -981,88 +1150,249 @@ class BallCollector:
         
         return frame
 
-    def move_to_target_live(self, target_pos: Tuple[float, float], target_type: str = "approach", is_backing: bool = False) -> bool:
-        """Move to target using continuous position updates and small adjustments"""
-        # Different parameters based on movement type
-        if target_type == "goal":
-            max_distance_per_step = 30  # Larger steps for goal approach
-            angle_tolerance = 25       # More lenient angle tolerance for long distance
-            distance_tolerance = 10    # Goal can be reached with less precision
-            heading_adjust_distance = 40  # Only adjust heading when within 40cm of goal
+    def check_wall_proximity(self) -> bool:
+        """Check if robot is too close to any wall and back up if needed"""
+        if not self.walls or not self.robot_pos:
+            return True
+        
+        wall_danger_distance = 8  # cm - closer than this triggers backup
+        
+        for wall in self.walls:
+            wall_start = (wall[0], wall[1])
+            wall_end = (wall[2], wall[3])
+            distance = point_to_line_distance(self.robot_pos, wall_start, wall_end)
+            
+            if distance < wall_danger_distance:
+                logger.warning(f"Robot too close to wall ({distance:.1f}cm)! Backing up 20cm for safety")
+                
+                # Back up 20cm away from the wall
+                if not self.move(-20):
+                    logger.error("Failed to back up from wall - robot may be stuck!")
+                    return False
+                
+                # Update position after backing up
+                if not self.update_robot_position():
+                    logger.warning("Lost robot tracking after wall backup")
+                    return False
+                
+                logger.info(f"Backed away from wall, new position: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f})")
+                return True
+        
+        return True
+
+    def move_to_target_simple(self, target_pos: Tuple[float, float], target_type: str = "approach", is_backing: bool = False) -> bool:
+        """Simple movement with backwards capability and position checking"""
+        # Update current position
+        if not self.update_robot_position():
+            logger.warning("Lost robot tracking")
+            return False
+        
+        # Check for wall proximity and back up if needed
+        if not self.check_wall_proximity():
+            logger.error("Wall avoidance failed")
+            return False
+        
+        # Calculate distance and angle to target
+        dx = target_pos[0] - self.robot_pos[0]
+        dy = target_pos[1] - self.robot_pos[1]
+        distance_to_target = math.hypot(dx, dy)
+        target_angle = math.degrees(math.atan2(dy, dx))
+        
+        # Check if we're already close enough
+        distance_tolerance = 8 if target_type == "goal" else 5
+        if distance_to_target <= distance_tolerance:
+            logger.info(f"Already at target {target_pos}")
+            return True
+        
+        # Calculate angle differences for forward and backward movement
+        forward_angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+        backward_angle_diff = (target_angle - self.robot_heading) % 360 - 180
+        
+        # Decide whether to go forward or backward (choose the option with less turning)
+        should_back_up = abs(backward_angle_diff) < abs(forward_angle_diff) and abs(backward_angle_diff) < 90
+        
+        # CRITICAL: Ball collection MUST be forward motion only!
+        if target_type == "collect":
+            should_back_up = False
+            logger.info("Ball collection: forcing forward movement (collector only works when moving forward)")
+        
+        # SAFETY: Check if backing up would be safe for the entire path to target
+        if should_back_up and self.walls:
+            # Check the full backwards path to target, not just a short backup
+            backup_angle_rad = math.radians(self.robot_heading + 180)  # Opposite to current heading
+            
+            # Check multiple points along the backwards path
+            backup_safe = True
+            min_safe_distance = 12  # cm - minimum safe distance from walls
+            
+            # Check points at 10cm intervals along the backwards path
+            for check_distance in [10, 20, min(30, distance_to_target)]:
+                if check_distance > distance_to_target:
+                    break
+                    
+                test_x = self.robot_pos[0] + check_distance * math.cos(backup_angle_rad)
+                test_y = self.robot_pos[1] + check_distance * math.sin(backup_angle_rad)
+                
+                # Check distance to all walls from this test position
+                min_wall_distance = float('inf')
+                for wall in self.walls:
+                    wall_start = (wall[0], wall[1])
+                    wall_end = (wall[2], wall[3])
+                    wall_distance = point_to_line_distance((test_x, test_y), wall_start, wall_end)
+                    min_wall_distance = min(min_wall_distance, wall_distance)
+                
+                # If any point along the path is too close to walls, backing up is unsafe
+                if min_wall_distance < min_safe_distance:
+                    backup_safe = False
+                    logger.info(f"Safety override: backing up {check_distance}cm would put robot {min_wall_distance:.1f}cm from wall (need {min_safe_distance}cm)")
+                    break
+            
+            # Also check if robot is already close to walls (corner detection)
+            current_min_wall_distance = float('inf')
+            for wall in self.walls:
+                wall_start = (wall[0], wall[1])
+                wall_end = (wall[2], wall[3])
+                current_distance = point_to_line_distance(self.robot_pos, wall_start, wall_end)
+                current_min_wall_distance = min(current_min_wall_distance, current_distance)
+            
+            # If robot is already very close to walls (in corner), always go forward
+            if current_min_wall_distance < 20:
+                backup_safe = False
+                logger.info(f"Safety override: robot in corner/near wall ({current_min_wall_distance:.1f}cm), forcing forward movement")
+            
+            if not backup_safe:
+                should_back_up = False
+        
+        if should_back_up:
+            # Back up to target
+            angle_diff = backward_angle_diff
+            logger.info(f"Backing up to target (requires {abs(angle_diff):.1f}° turn vs {abs(forward_angle_diff):.1f}° forward)")
         else:
-            max_distance_per_step = 10  # Smaller steps for precise ball collection
-            angle_tolerance = 15       # Stricter angle tolerance
-            distance_tolerance = 5     # Need to get closer for ball collection
-            heading_adjust_distance = float('inf')  # Always adjust heading for ball collection
+            # Go forward to target  
+            angle_diff = forward_angle_diff
+            logger.info(f"Going forward to target (requires {abs(angle_diff):.1f}° turn)")
         
-        step_count = 0
-        max_steps = 50  # Prevent infinite loops
+        # Turn to face the right direction
+        if abs(angle_diff) > 10:  # Only turn if significantly off
+            logger.info(f"Turning {angle_diff:.1f} degrees")
+            if not self.turn(angle_diff):
+                return False
+            # Update position after turn
+            self.update_robot_position()
         
-        while step_count < max_steps:
+        # Move to target with position checking for longer distances
+        if distance_to_target > 15:  # For longer movements, break into steps with position checking
+            return self._move_with_position_check(target_pos, target_type, should_back_up, distance_to_target)
+        else:
+            # Short movement - just go directly
+            if target_type == "collect":
+                logger.info(f"Collecting ball at {distance_to_target:.1f}cm")
+                return self.collect(distance_to_target)
+            else:
+                move_distance = -distance_to_target if should_back_up else distance_to_target
+                action = "Backing up" if should_back_up else "Moving forward"
+                logger.info(f"{action} {abs(move_distance):.1f}cm")
+                return self.move(move_distance)
+    
+    def _move_with_position_check(self, target_pos: Tuple[float, float], target_type: str, is_backing: bool, total_distance: float) -> bool:
+        """Move to target in steps with position checking and direction recalculation"""
+        step_size = 10  # Move in 10cm increments for longer distances
+        steps_taken = 0
+        
+        # Adaptive max steps based on distance (with generous buffer for course corrections)
+        estimated_steps = int(total_distance / step_size) + 5  # +5 for course corrections
+        max_steps = max(50, estimated_steps)  # At least 15 steps, more if needed
+        
+        logger.info(f"Starting stepped movement: {total_distance:.1f}cm distance, max {max_steps} steps allowed")
+        
+        # Progress tracking to detect if robot is stuck
+        last_distance = total_distance
+        no_progress_count = 0
+        
+        while steps_taken < max_steps:
             # Update current position
             if not self.update_robot_position():
-                logger.warning("Lost robot tracking during live movement")
+                logger.warning("Lost robot tracking during movement")
                 return False
             
-            # Calculate distance and angle to target
+            # Check for wall proximity before each step
+            if not self.check_wall_proximity():
+                logger.warning("Wall avoidance interrupted movement")
+                # Recalculate position after wall backup
+                if not self.update_robot_position():
+                    return False
+            
+            # Calculate remaining distance and direction
             dx = target_pos[0] - self.robot_pos[0]
             dy = target_pos[1] - self.robot_pos[1]
-            distance_to_target = math.hypot(dx, dy)
+            remaining_distance = math.hypot(dx, dy)
             target_angle = math.degrees(math.atan2(dy, dx))
             
             # Check if we've reached the target
-            if distance_to_target <= distance_tolerance:
-                logger.info(f"Reached target at {target_pos}")
+            distance_tolerance = 8 if target_type == "goal" else 5
+            if remaining_distance <= distance_tolerance:
+                logger.info(f"Reached target with position checking")
                 return True
             
-            # Calculate angle difference
+            # Final approach for ball collection (MUST be forward motion)
+            if target_type == "collect" and remaining_distance <= 15:
+                # Turn to face ball before final collection
+                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                if abs(angle_diff) > 10:
+                    logger.info(f"Final turn to face ball: {angle_diff:.1f} degrees")
+                    if not self.turn(angle_diff):
+                        return False
+                    self.update_robot_position()
+                
+                logger.info(f"Final collection approach: {remaining_distance:.1f}cm (forward motion required)")
+                return self.collect(remaining_distance)
+            
+            # Recalculate direction based on current position
             angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
             
-            # For backing moves, we want to face away from target
+            # For backing moves, face away from target
             if is_backing:
-                target_angle = target_angle + 180  # Face opposite direction
-                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                angle_diff = (angle_diff + 180) % 360 - 180
             
-            # Only adjust heading if within heading_adjust_distance or if angle is very wrong
-            should_adjust_heading = (distance_to_target <= heading_adjust_distance or 
-                                   abs(angle_diff) > 45)
-            
-            # If we need to turn significantly and should adjust heading
-            if abs(angle_diff) > angle_tolerance and should_adjust_heading:
-                # Limit turn to max 30 degrees per adjustment
-                turn_amount = max(-30, min(30, angle_diff))
-                action = "backing turn" if is_backing else "live adjustment"
-                logger.info(f"{action}: turning {turn_amount:.1f} degrees (distance: {distance_to_target:.1f}cm)")
-                if not self.turn(turn_amount):
+            # Adjust heading if significantly off (more than 20 degrees)
+            if abs(angle_diff) > 20:
+                logger.info(f"Adjusting direction: turning {angle_diff:.1f} degrees")
+                if not self.turn(angle_diff):
                     return False
-                self.update_robot_position()  # Update after turn
-            else:
-                # Move forward or backward in increments
-                move_distance = min(max_distance_per_step, distance_to_target)
-                
-                if is_backing:
-                    # Move backward
-                    move_distance = -move_distance  # Negative for backward
-                    logger.info(f"Backing up: {abs(move_distance):.1f} cm")
-                    if not self.move(move_distance):
-                        return False
-                elif target_type == "collect" and distance_to_target <= COLLECTION_DISTANCE_CM:
-                    # Final approach for collection
-                    logger.info(f"Final collection approach: {move_distance:.1f} cm")
-                    return self.collect(move_distance)
-                else:
-                    logger.info(f"Live movement ({target_type}): {move_distance:.1f} cm")
-                    if not self.move(move_distance):
-                        return False
-                
-                self.update_robot_position()  # Update after move
+                self.update_robot_position()
             
-            step_count += 1
+            # Calculate next step distance
+            step_distance = min(step_size, remaining_distance)
             
-            # Brief pause to allow for processing
-            time.sleep(0.1)
+            # Move one step
+            move_distance = -step_distance if is_backing else step_distance
+            action = "Backing" if is_backing else "Forward"
+            logger.info(f"{action} step: {step_distance:.1f}cm (remaining: {remaining_distance:.1f}cm)")
+            
+            if not self.move(move_distance):
+                logger.error("Movement step failed")
+                return False
+            
+            steps_taken += 1
+            
+            # Update live tracking visualization after each step
+            if not self.update_live_tracking(target_pos, remaining_distance, steps_taken, max_steps):
+                logger.warning("Movement interrupted by user")
+                return False
+            
+            # Brief pause for position update
+            time.sleep(0.3)  # Slightly longer pause for better position tracking
         
-        logger.warning(f"Max steps reached trying to reach {target_pos}")
+        # Final position check
+        if not self.update_robot_position():
+            logger.warning("Lost robot tracking at end of movement")
+            return False
+            
+        final_dx = target_pos[0] - self.robot_pos[0]
+        final_dy = target_pos[1] - self.robot_pos[1]
+        final_distance = math.hypot(final_dx, final_dy)
+        
+        logger.warning(f"Max steps reached, still {final_distance:.1f}cm from target")
         return False
 
     def deliver_balls(self) -> bool:
@@ -1080,7 +1410,7 @@ class BallCollector:
             return False
 
     def calculate_goal_approach_path(self, current_pos, current_heading):
-        """Calculate a smooth path to the selected goal via center staging area"""
+        """Calculate path to goal via center staging area with obstacle avoidance"""
         # Get goal candidates for selected goal
         goal_candidates = self.goal_ranges.get(self.selected_goal, [])
         if not goal_candidates:
@@ -1096,74 +1426,68 @@ class BallCollector:
         
         if goal_x_edge == 0:  # Left side goal
             goal_x = GOAL_OFFSET_CM  # Stop before left edge
-            # Staging area in center, slightly towards right side for left goal
-            staging_x = FIELD_WIDTH_CM * 0.6  # 60% across field
+            # Staging area further from obstacle, more towards the goal side
+            staging_x = FIELD_WIDTH_CM * 0.25  # 25% across field (closer to left goal, further from center obstacle)
         else:  # Right side goal
             goal_x = FIELD_WIDTH_CM - GOAL_OFFSET_CM  # Stop before right edge
-            # Staging area in center, slightly towards left side for right goal
-            staging_x = FIELD_WIDTH_CM * 0.4  # 40% across field
+            # Staging area further from obstacle, more towards the goal side
+            staging_x = FIELD_WIDTH_CM * 0.75  # 75% across field (closer to right goal, further from center obstacle)
         
-        # Staging area Y coordinate - center of field, aligned with goal
+        # Staging area Y coordinate - aligned with goal for straight final approach
         staging_y = goal_y
         
-        # Calculate distances
+        # Calculate distance to staging area
         distance_to_staging = math.hypot(staging_x - current_pos[0], staging_y - current_pos[1])
-        distance_staging_to_goal = math.hypot(goal_x - staging_x, goal_y - staging_y)
         
         path = []
         
-        # Only add staging point if we're not already close to the staging area
+        # Plan path to staging area with obstacle avoidance
         if distance_to_staging > 20:  # If more than 20cm from staging area
-            # Check if we can reach staging area directly
-            if not check_wall_collision(current_pos, (staging_x, staging_y), self.walls, WALL_SAFETY_MARGIN):
-                # Calculate angle to staging area
-                angle_to_staging = math.degrees(math.atan2(staging_y - current_pos[1], staging_x - current_pos[0]))
-                
-                path.append({
-                    'type': 'tank_approach',
-                    'pos': (staging_x, staging_y),
-                    'angle': angle_to_staging
-                })
-        
-        # Always add the final goal approach from staging area (or current position if close to staging)
-        if not check_wall_collision((staging_x, staging_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
-            # Calculate angle from staging area to goal
-            angle_to_goal = math.degrees(math.atan2(goal_y - staging_y, goal_x - staging_x))
+            logger.info(f"Planning route via center staging area at ({staging_x:.1f}, {staging_y:.1f})")
             
-            path.append({
-                'type': 'goal',
-                'pos': (goal_x, goal_y),
-                'angle': angle_to_goal
-            })
+            # Get waypoints to staging area around obstacle
+            staging_waypoints = self.plan_path_around_obstacle(current_pos, (staging_x, staging_y))
+            
+            # Add all waypoints as approach points
+            for waypoint in staging_waypoints:
+                path.append({
+                    'type': 'approach',
+                    'pos': waypoint
+                })
+            
+            # Plan final path from staging to goal with obstacle avoidance
+            goal_waypoints = self.plan_path_around_obstacle((staging_x, staging_y), (goal_x, goal_y))
+            
+            # Add goal waypoints (skip first one since it's the staging area)
+            for waypoint in goal_waypoints[1:]:  # Skip first waypoint (staging area)
+                if waypoint == (goal_x, goal_y):
+                    path.append({
+                        'type': 'goal',
+                        'pos': waypoint
+                    })
+                else:
+                    path.append({
+                        'type': 'approach',
+                        'pos': waypoint
+                    })
         else:
-            # If direct path from staging to goal is blocked, try a different approach
-            logger.warning("Direct path from staging to goal is blocked, using fallback approach")
+            logger.info("Already near center, going directly to goal with obstacle avoidance")
             
-            # Fallback: approach goal from slightly off-center
-            if goal_x_edge == 0:  # Left side goal
-                fallback_approach_x = goal_x + 15  # 15cm right of goal
-            else:  # Right side goal
-                fallback_approach_x = goal_x - 15  # 15cm left of goal
+            # Plan direct path to goal with obstacle avoidance
+            goal_waypoints = self.plan_path_around_obstacle(current_pos, (goal_x, goal_y))
             
-            fallback_approach_y = goal_y
-            
-            # Add intermediate approach point
-            if not check_wall_collision((staging_x, staging_y), (fallback_approach_x, fallback_approach_y), self.walls, WALL_SAFETY_MARGIN):
-                angle_to_approach = math.degrees(math.atan2(fallback_approach_y - staging_y, fallback_approach_x - staging_x))
-                path.append({
-                    'type': 'tank_approach',
-                    'pos': (fallback_approach_x, fallback_approach_y),
-                    'angle': angle_to_approach
-                })
-            
-            # Final goal approach
-            if not check_wall_collision((fallback_approach_x, fallback_approach_y), (goal_x, goal_y), self.walls, WALL_SAFETY_MARGIN):
-                angle_to_goal = math.degrees(math.atan2(goal_y - fallback_approach_y, goal_x - fallback_approach_x))
-                path.append({
-                    'type': 'goal',
-                    'pos': (goal_x, goal_y),
-                    'angle': angle_to_goal
-                })
+            # Add all waypoints
+            for waypoint in goal_waypoints:
+                if waypoint == (goal_x, goal_y):
+                    path.append({
+                        'type': 'goal',
+                        'pos': waypoint
+                    })
+                else:
+                    path.append({
+                        'type': 'approach',
+                        'pos': waypoint
+                    })
         
         return path
 
@@ -1212,21 +1536,21 @@ class BallCollector:
                     balls = self.detect_balls()
                 current_time = time.time()
                 
-                # Only replan if:
-                # 1. We have balls AND robot markers are detected AND
+                # Replan if:
+                # 1. Robot markers are detected AND not skipping processing AND
                 # 2. Either:
                 #    a) It's been at least X seconds since last plan OR
                 #    b) Ball positions have changed significantly OR
                 #    c) Robot has moved significantly OR
                 #    d) No current path exists
                 should_replan = False
-                if balls and self.robot_pos and not skip_heavy_processing:
+                if self.robot_pos and not skip_heavy_processing:
                     # Reduce wait time if no path is currently planned (for continuous operation)
                     min_plan_interval = 1 if not path else 3  # 1 second if no path, 3 seconds if path exists
                     
                     if current_time - last_plan_time >= min_plan_interval:
                         should_replan = True
-                    elif last_plan_positions:
+                    elif balls and last_plan_positions:
                         # Check if any ball has moved more than 10cm
                         for ball in balls:
                             if not any(math.hypot(ball[0] - old[0], ball[1] - old[1]) < 10 
@@ -1239,84 +1563,64 @@ class BallCollector:
                 if should_replan:
                     last_plan_time = current_time
                     last_plan_positions = [(b[0], b[1]) for b in balls]
-                    logger.info(f"Planning to collect {len(balls)} balls from position {self.robot_pos}")
-
-                    # Sort balls by distance from current robot position
-                    balls.sort(key=lambda b: math.hypot(
-                        b[0] - self.robot_pos[0],
-                        b[1] - self.robot_pos[1]
-                    ))
-
-                    # Take up to MAX_BALLS_PER_TRIP closest balls
-                    current_batch = balls[:MAX_BALLS_PER_TRIP]
-
+                    
                     # Plan path through all balls in the batch
                     path = []
                     current_pos = self.robot_pos
                     current_heading = self.robot_heading
-                    remaining_balls = current_batch.copy()
 
-                    # Add balls to path with smooth approach planning
-                    while remaining_balls:
-                        closest_ball = min(remaining_balls, 
-                                         key=lambda b: math.hypot(
-                                             b[0] - current_pos[0],
-                                             b[1] - current_pos[1]
-                                         ))
+                    if balls:
+                        logger.info(f"Planning to collect {len(balls)} balls from position {self.robot_pos}")
                         
-                        ball_pos = (closest_ball[0], closest_ball[1])
-                        approach_pos, target_angle, movement_type = self.get_smooth_approach_vector(ball_pos)
-                        
-                        # Check for wall collisions
-                        if check_wall_collision(current_pos, approach_pos, self.walls, WALL_SAFETY_MARGIN):
-                            logger.warning(f"Path to ball at {ball_pos} blocked by wall, skipping")
-                            remaining_balls.remove(closest_ball)
-                            continue
-                        
-                        if movement_type not in ['backward', 'back_reposition'] and check_wall_collision(approach_pos, ball_pos, self.walls, WALL_SAFETY_MARGIN):
-                            logger.warning(f"Approach to ball at {ball_pos} blocked by wall, skipping")
-                            remaining_balls.remove(closest_ball)
-                            continue
-                        
-                        # Add waypoints based on movement type (simplified for tank turns)
-                        if movement_type == 'backward':
-                            path.append({
-                                'type': 'backward_approach',
-                                'pos': approach_pos,
-                                'angle': target_angle,
-                                'is_backing': True
-                            })
-                            path.append({
-                                'type': 'backward_collect',
-                                'pos': ball_pos,
-                                'ball_type': closest_ball[2],
-                                'is_backing': True
-                            })
-                        
-                        else:  # tank_turn_forward (most common case)
-                            # With tank turns, we can do direct approaches
-                            path.append({
-                                'type': 'tank_approach',
-                                'pos': approach_pos,
-                                'angle': target_angle
-                            })
+                        # Sort balls by distance from current robot position
+                        balls.sort(key=lambda b: math.hypot(
+                            b[0] - self.robot_pos[0],
+                            b[1] - self.robot_pos[1]
+                        ))
+
+                        # Take up to MAX_BALLS_PER_TRIP closest balls
+                        current_batch = balls[:MAX_BALLS_PER_TRIP]
+                        remaining_balls = current_batch.copy()
+
+                        # Add balls to path with obstacle avoidance
+                        while remaining_balls:
+                            closest_ball = min(remaining_balls, 
+                                             key=lambda b: math.hypot(
+                                                 b[0] - current_pos[0],
+                                                 b[1] - current_pos[1]
+                                             ))
+                            
+                            ball_pos = (closest_ball[0], closest_ball[1])
+                            
+                            # Plan path around obstacle if needed
+                            waypoints = self.plan_path_around_obstacle(current_pos, ball_pos)
+                            
+                            # Add waypoint approach points if detour is needed
+                            for i, waypoint in enumerate(waypoints[:-1]):  # All except the last (ball) position
+                                path.append({
+                                    'type': 'approach',
+                                    'pos': waypoint
+                                })
+                            
+                            # Add the ball collection point
                             path.append({
                                 'type': 'collect',
                                 'pos': ball_pos,
                                 'ball_type': closest_ball[2]
                             })
-                        
-                        current_pos = ball_pos
-                        current_heading = math.degrees(math.atan2(
-                            ball_pos[1] - approach_pos[1],
-                            ball_pos[0] - approach_pos[0]
-                        ))
-                        remaining_balls.remove(closest_ball)
+                            
+                            current_pos = ball_pos
+                            current_heading = self.robot_heading
+                            remaining_balls.remove(closest_ball)
+                    else:
+                        logger.info(f"No balls detected - planning delivery run from position {self.robot_pos}")
 
-                    # Add goal approach path if we have collected any balls
-                    if path:
-                        goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
-                        path.extend(goal_path)
+                    # ALWAYS add goal approach path for delivery (whether we collected balls or not)
+                    goal_path = self.calculate_goal_approach_path(current_pos, current_heading)
+                    path.extend(goal_path)
+                    
+                    balls_in_path = len([p for p in path if p['type'] == 'collect'])
+                    logger.info(f"Added goal delivery path with {len(goal_path)} waypoints (balls in path: {balls_in_path})")
 
                 # Prepare the display frame
                 display_frame = frame.copy()
@@ -1406,13 +1710,17 @@ class BallCollector:
                                 target_pos = point['pos']
                                 
                                 if point['type'] == 'collect':
-                                    logger.info(f"Live approach to collect {point['ball_type']} ball")
-                                    if not self.move_to_target_live(target_pos, "collect"):
-                                        raise Exception("Live collection movement failed")
+                                    logger.info(f"Collecting {point['ball_type']} ball")
+                                    if not self.move_to_target_simple(target_pos, "collect"):
+                                        raise Exception("Ball collection failed")
+                                elif point['type'] == 'approach':
+                                    logger.info(f"Moving to staging area in center")
+                                    if not self.move_to_target_simple(target_pos, "approach"):
+                                        raise Exception("Approach movement failed")
                                 elif point['type'] == 'goal':
-                                    logger.info(f"Live movement to goal")
-                                    if not self.move_to_target_live(target_pos, "goal"):
-                                        raise Exception("Live goal movement failed")
+                                    logger.info(f"Moving to goal")
+                                    if not self.move_to_target_simple(target_pos, "goal"):
+                                        raise Exception("Goal movement failed")
                                     
                                     # Move closer to goal for delivery (additional 3cm forward)
                                     logger.info("Moving closer to goal for delivery")
@@ -1441,35 +1749,6 @@ class BallCollector:
                                         logger.info("✅ Delivery sequence complete, ready for next collection")
                                     else:
                                         logger.info("⚠️ Delivery had issues but backup completed, ready for next collection")
-                                elif point['type'] == 'tank_approach':
-                                    logger.info(f"Tank turn approach to target")
-                                    if not self.move_to_target_live(target_pos, "approach"):
-                                        raise Exception("Tank approach movement failed")
-                                elif point['type'] == 'backward_approach':
-                                    logger.info(f"Moving backward to approach ball")
-                                    if not self.move_to_target_live(target_pos, "approach", is_backing=True):
-                                        raise Exception("Backward approach movement failed")
-                                elif point['type'] == 'backward_collect':
-                                    logger.info(f"Collecting {point['ball_type']} ball while moving backward")
-                                    # For backward collection, we need to get close first then collect
-                                    dx = target_pos[0] - self.robot_pos[0]
-                                    dy = target_pos[1] - self.robot_pos[1]
-                                    distance_to_ball = math.hypot(dx, dy)
-                                    
-                                    if distance_to_ball > COLLECTION_DISTANCE_CM:
-                                        # Move backward to get closer
-                                        move_distance = -(distance_to_ball - COLLECTION_DISTANCE_CM)
-                                        if not self.move(move_distance):
-                                            raise Exception("Backward movement to ball failed")
-                                        self.update_robot_position()
-                                    
-                                    # Now collect while facing away from ball
-                                    if not self.collect(COLLECTION_DISTANCE_CM):
-                                        raise Exception("Backward collection failed")
-                                else:  # any other approach point (legacy support)
-                                    logger.info(f"Live movement to approach point")
-                                    if not self.move_to_target_live(target_pos, "approach"):
-                                        raise Exception("Live approach movement failed")
                                 
                                 # Update visualization during execution
                                 ret, frame = self.get_fresh_frame()
@@ -1544,6 +1823,93 @@ class BallCollector:
             self.stop()
             self.cap.release()
             cv2.destroyAllWindows()
+
+    def update_live_tracking(self, target_pos, remaining_distance, current_step, max_steps):
+        """Update live visualization during movement with current progress"""
+        try:
+            # Get fresh frame and update robot position
+            ret, frame = self.get_fresh_frame()
+            if not ret:
+                return True
+                
+            # Update robot position from markers
+            if not self.update_robot_position(frame):
+                return True
+            
+            # Draw all the standard overlays
+            frame = self.draw_walls(frame)
+            frame = self.draw_robot_markers(frame)
+            frame = self.draw_status(frame)
+            
+            # Draw target position
+            if self.homography_matrix is not None:
+                target_cm = np.array([[[target_pos[0], target_pos[1]]]], dtype="float32")
+                target_px = cv2.perspectiveTransform(target_cm, self.homography_matrix)[0][0].astype(int)
+                
+                # Draw target with pulsing effect based on step count
+                pulse_size = 8 + int(3 * math.sin(current_step * 0.5))
+                cv2.circle(frame, tuple(target_px), pulse_size, (0, 255, 255), 2)  # Yellow target
+                cv2.putText(frame, "TARGET", (target_px[0] + 15, target_px[1] - 15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Draw line from robot to target
+                robot_cm = np.array([[[self.robot_pos[0], self.robot_pos[1]]]], dtype="float32")
+                robot_px = cv2.perspectiveTransform(robot_cm, self.homography_matrix)[0][0].astype(int)
+                cv2.line(frame, tuple(robot_px), tuple(target_px), (0, 255, 255), 1)
+            
+            # Progress information overlay
+            progress_pct = int((current_step / max_steps) * 100) if max_steps > 0 else 0
+            status_lines = [
+                f"LIVE MOVEMENT TRACKING",
+                f"Target: ({target_pos[0]:.1f}, {target_pos[1]:.1f}) cm",
+                f"Robot: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f}) cm", 
+                f"Remaining: {remaining_distance:.1f} cm",
+                f"Step: {current_step}/{max_steps} ({progress_pct}%)",
+                f"Press ESC to stop movement"
+            ]
+            
+            # Draw semi-transparent background for status
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (10, frame.shape[0] - 150), (400, frame.shape[0] - 10), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+            
+            # Draw status text
+            y_start = frame.shape[0] - 135
+            for i, line in enumerate(status_lines):
+                color = (0, 255, 0) if i == 0 else (255, 255, 255)  # Green for title, white for info
+                cv2.putText(frame, line, (15, y_start + i * 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+            # Progress bar
+            bar_x, bar_y = 15, frame.shape[0] - 25
+            bar_width, bar_height = 200, 10
+            
+            # Background bar
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+            
+            # Progress fill
+            fill_width = int((progress_pct / 100) * bar_width)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), (0, 255, 0), -1)
+            
+            # Progress percentage text
+            cv2.putText(frame, f"{progress_pct}%", (bar_x + bar_width + 10, bar_y + 8),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # Update display
+            cv2.imshow("Path Planning", frame)
+            
+            # Check for user input to stop movement
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC key
+                logger.warning("Movement stopped by user (ESC pressed)")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Live tracking update failed: {e}")
+            
+        return True
+
+
 
 if __name__ == "__main__":
     collector = BallCollector()
