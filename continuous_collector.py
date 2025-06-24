@@ -175,6 +175,9 @@ class BallCollector:
         # Frame skipping for lag reduction
         self.frame_skip_counter = 0
         self.frame_skip_interval = 2  # Process every 3rd frame for better performance
+        
+        # Automatic operation control
+        self.automatic_mode = False  # Becomes True after first delivery
 
     def _build_goal_ranges(self) -> dict:
         """
@@ -1155,7 +1158,7 @@ class BallCollector:
         if not self.walls or not self.robot_pos:
             return True
         
-        wall_danger_distance = 8  # cm - closer than this triggers backup
+        wall_danger_distance = 5  # cm - reduced from 8cm to be less aggressive
         
         for wall in self.walls:
             wall_start = (wall[0], wall[1])
@@ -1163,17 +1166,17 @@ class BallCollector:
             distance = point_to_line_distance(self.robot_pos, wall_start, wall_end)
             
             if distance < wall_danger_distance:
-                logger.warning(f"Robot too close to wall ({distance:.1f}cm)! Backing up 20cm for safety")
+                logger.warning(f"Robot very close to wall ({distance:.1f}cm)! Small backup for safety")
                 
                 # Back up 20cm away from the wall
                 if not self.move(-20):
-                    logger.error("Failed to back up from wall - robot may be stuck!")
-                    return False
+                    logger.warning("Failed to back up from wall - continuing anyway")
+                    return True  # Don't fail the whole movement, just continue
                 
                 # Update position after backing up
                 if not self.update_robot_position():
                     logger.warning("Lost robot tracking after wall backup")
-                    return False
+                    return True  # Don't fail, just continue
                 
                 logger.info(f"Backed away from wall, new position: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f})")
                 return True
@@ -1211,10 +1214,13 @@ class BallCollector:
         # Decide whether to go forward or backward (choose the option with less turning)
         should_back_up = abs(backward_angle_diff) < abs(forward_angle_diff) and abs(backward_angle_diff) < 90
         
-        # CRITICAL: Ball collection MUST be forward motion only!
-        if target_type == "collect":
+        # CRITICAL: Ball collection AND goal delivery MUST be forward motion only!
+        if target_type == "collect" or target_type == "goal":
             should_back_up = False
-            logger.info("Ball collection: forcing forward movement (collector only works when moving forward)")
+            if target_type == "collect":
+                logger.info("Ball collection: forcing forward movement (collector only works when moving forward)")
+            else:
+                logger.info("Goal delivery: forcing forward movement (collector must face goal to deliver balls)")
         
         # SAFETY: Check if backing up would be safe for the entire path to target
         if should_back_up and self.walls:
@@ -1336,15 +1342,8 @@ class BallCollector:
             
             # Final approach for ball collection (MUST be forward motion)
             if target_type == "collect" and remaining_distance <= 15:
-                # Turn to face ball before final collection
-                angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
-                if abs(angle_diff) > 10:
-                    logger.info(f"Final turn to face ball: {angle_diff:.1f} degrees")
-                    if not self.turn(angle_diff):
-                        return False
-                    self.update_robot_position()
-                
-                logger.info(f"Final collection approach: {remaining_distance:.1f}cm (forward motion required)")
+                # NO MORE TURNING for final approach - just collect straight ahead
+                logger.info(f"Final collection approach: {remaining_distance:.1f}cm (no more adjustments)")
                 return self.collect(remaining_distance)
             
             # Recalculate direction based on current position
@@ -1354,10 +1353,15 @@ class BallCollector:
             if is_backing:
                 angle_diff = (angle_diff + 180) % 360 - 180
             
-            # Adjust heading if significantly off (more than 20 degrees)
-            if abs(angle_diff) > 20:
-                logger.info(f"Adjusting direction: turning {angle_diff:.1f} degrees")
-                if not self.turn(angle_diff):
+            # Adjust heading if significantly off (more than 25 degrees)
+            # For ball collection, be even more conservative with adjustments
+            angle_threshold = 30 if target_type == "collect" else 25
+            if abs(angle_diff) > angle_threshold:
+                # Limit turn to maximum 20 degrees per adjustment to avoid over-correction
+                max_turn = 20
+                turn_amount = max(-max_turn, min(max_turn, angle_diff))
+                logger.info(f"Adjusting direction: turning {turn_amount:.1f} degrees (limited from {angle_diff:.1f})")
+                if not self.turn(turn_amount):
                     return False
                 self.update_robot_position()
             
@@ -1402,6 +1406,10 @@ class BallCollector:
             result = self.send_command("COLLECT_REVERSE", duration=self.delivery_time)
             if result:
                 logger.info("COLLECT_REVERSE command executed successfully")
+                # Enable automatic mode after first successful delivery
+                if not self.automatic_mode:
+                    self.automatic_mode = True
+                    logger.info("🤖 AUTOMATIC MODE ENABLED - Will auto-execute future paths")
             else:
                 logger.warning("COLLECT_REVERSE command returned failure")
             return result
@@ -1426,12 +1434,12 @@ class BallCollector:
         
         if goal_x_edge == 0:  # Left side goal
             goal_x = GOAL_OFFSET_CM  # Stop before left edge
-            # Staging area further from obstacle, more towards the goal side
-            staging_x = FIELD_WIDTH_CM * 0.25  # 25% across field (closer to left goal, further from center obstacle)
+            # Staging area much closer to goal since we can tank turn
+            staging_x = 30  # Only 30cm from left edge (much closer than 25% = 45cm)
         else:  # Right side goal
             goal_x = FIELD_WIDTH_CM - GOAL_OFFSET_CM  # Stop before right edge
-            # Staging area further from obstacle, more towards the goal side
-            staging_x = FIELD_WIDTH_CM * 0.75  # 75% across field (closer to right goal, further from center obstacle)
+            # Staging area much closer to goal since we can tank turn
+            staging_x = FIELD_WIDTH_CM - 30  # Only 30cm from right edge (much closer than 75% = 135cm)
         
         # Staging area Y coordinate - aligned with goal for straight final approach
         staging_y = goal_y
@@ -1440,6 +1448,7 @@ class BallCollector:
         distance_to_staging = math.hypot(staging_x - current_pos[0], staging_y - current_pos[1])
         
         path = []
+        logger.info(f"Goal planning: current_pos=({current_pos[0]:.1f}, {current_pos[1]:.1f}), staging=({staging_x:.1f}, {staging_y:.1f}), distance={distance_to_staging:.1f}cm")
         
         # Plan path to staging area with obstacle avoidance
         if distance_to_staging > 20:  # If more than 20cm from staging area
@@ -1471,7 +1480,7 @@ class BallCollector:
                         'pos': waypoint
                     })
         else:
-            logger.info("Already near center, going directly to goal with obstacle avoidance")
+            logger.info("Already near staging area, going directly to goal with obstacle avoidance")
             
             # Plan direct path to goal with obstacle avoidance
             goal_waypoints = self.plan_path_around_obstacle(current_pos, (goal_x, goal_y))
@@ -1488,6 +1497,15 @@ class BallCollector:
                         'type': 'approach',
                         'pos': waypoint
                     })
+        
+        # SAFETY: Ensure we always have a goal point in the path
+        has_goal = any(p['type'] == 'goal' for p in path)
+        if not has_goal:
+            logger.warning("No goal point found in path! Adding direct goal approach...")
+            path.append({
+                'type': 'goal',
+                'pos': (goal_x, goal_y)
+            })
         
         return path
 
@@ -1621,6 +1639,14 @@ class BallCollector:
                     
                     balls_in_path = len([p for p in path if p['type'] == 'collect'])
                     logger.info(f"Added goal delivery path with {len(goal_path)} waypoints (balls in path: {balls_in_path})")
+                    
+                    # If automatic mode is enabled, execute path immediately
+                    if self.automatic_mode and path:
+                        logger.info("🤖 Auto-executing path in automatic mode...")
+                        # Add a small delay to show the path briefly
+                        time.sleep(0.5)
+                        # Trigger execution by simulating Enter key press
+                        key = 13  # Enter key code
 
                 # Prepare the display frame
                 display_frame = frame.copy()
@@ -1629,12 +1655,22 @@ class BallCollector:
                 if path:
                     display_frame = self.draw_path(display_frame, path)
                     # Add path ready indicator
-                    cv2.putText(display_frame, "PATH READY - Press ENTER to execute", 
-                              (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.7, (0, 255, 0), 2)
+                    if self.automatic_mode:
+                        cv2.putText(display_frame, "AUTO MODE: Executing path automatically...", 
+                                  (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                  0.7, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(display_frame, "PATH READY - Press ENTER to execute", 
+                                  (10, display_frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                                  0.7, (0, 255, 0), 2)
                 
-                # Get key input
-                key = cv2.waitKey(1) & 0xFF
+                # Get key input (unless auto-execution is happening)
+                if not (self.automatic_mode and path):
+                    key = cv2.waitKey(1) & 0xFF
+                else:
+                    # In automatic mode with path, don't override the auto-execution
+                    if 'key' not in locals():
+                        key = cv2.waitKey(1) & 0xFF
                 
                 # Add key command help
                 help_text = [
@@ -1654,15 +1690,20 @@ class BallCollector:
                               0.5, (255, 255, 255), 1)
                     y += 20
                 
-                # Show planned path count and continuous operation status
+                # Show planned path count and operation status
                 if path:
                     ball_count = len([p for p in path if p['type'] == 'collect'])
                     cv2.putText(display_frame, f"Path planned: {ball_count} balls",
                               (10, y + 10), cv2.FONT_HERSHEY_SIMPLEX,
                               0.5, (0, 255, 0), 1)
-                    cv2.putText(display_frame, "CONTINUOUS MODE: Auto-continues after delivery",
-                              (10, y + 30), cv2.FONT_HERSHEY_SIMPLEX,
-                              0.4, (0, 255, 255), 1)
+                    if self.automatic_mode:
+                        cv2.putText(display_frame, "AUTOMATIC MODE: Fully autonomous operation",
+                                  (10, y + 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                  0.4, (0, 255, 0), 1)
+                    else:
+                        cv2.putText(display_frame, "MANUAL MODE: Press ENTER to execute (auto after first delivery)",
+                                  (10, y + 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                  0.4, (0, 255, 255), 1)
                 else:
                     cv2.putText(display_frame, "Scanning for balls...",
                               (10, y + 10), cv2.FONT_HERSHEY_SIMPLEX,
@@ -1777,11 +1818,11 @@ class BallCollector:
                                 remaining_balls = self.detect_balls()
                                 
                                 if remaining_balls:
-                                    logger.info(f"🎯 Found {len(remaining_balls)} remaining balls - planning new collection path")
+                                    logger.info(f"🎯 Found {len(remaining_balls)} remaining balls - automatically continuing collection")
                                     # Force immediate replanning by resetting timing
                                     last_plan_time = 0
                                     last_plan_positions = []
-                                    # Continue main loop to plan and execute new path
+                                    # Continue main loop to plan and execute new path automatically
                                 else:
                                     logger.info("🏁 No more balls detected - collection complete!")
                                     cv2.waitKey(2000)  # Pause to show completion message
