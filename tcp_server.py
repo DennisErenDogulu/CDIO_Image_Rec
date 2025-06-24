@@ -11,7 +11,7 @@ from ev3dev2.display import Display
 from ev3dev2.power import PowerSupply
 
 # ───────── Hardware Setup ─────────
-AXLE_TRACK_MM = 570    # Axle distance in mm
+AXLE_TRACK_MM = 250    # Axle distance in mm
 WHEEL_DIAM_MM = 69     # Wheel diameter in mm
 WHEEL_WIDTH_MM = 35    # Wheel width in mm
 
