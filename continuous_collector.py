@@ -1205,8 +1205,8 @@ class BallCollector:
         distance_to_target = math.hypot(dx, dy)
         target_angle = math.degrees(math.atan2(dy, dx))
         
-        # Check if we're already close enough
-        distance_tolerance = 8 if target_type == "goal" else 5
+        # Check if we're already close enough - more forgiving for goals
+        distance_tolerance = 15 if target_type == "goal" else 5  # Much more forgiving for goal delivery
         if distance_to_target <= distance_tolerance:
             logger.info(f"Already at target {target_pos}")
             return True
@@ -1219,12 +1219,15 @@ class BallCollector:
         should_back_up = abs(backward_angle_diff) < abs(forward_angle_diff) and abs(backward_angle_diff) < 90
         
         # CRITICAL: Ball collection AND goal delivery MUST be forward motion only!
-        if target_type == "collect" or target_type == "goal":
+        # Also prevent backing up during goal approach to avoid random backing
+        if target_type == "collect" or target_type == "goal" or target_type == "approach":
             should_back_up = False
             if target_type == "collect":
                 logger.info("Ball collection: forcing forward movement (collector only works when moving forward)")
-            else:
+            elif target_type == "goal":
                 logger.info("Goal delivery: forcing forward movement (collector must face goal to deliver balls)")
+            elif target_type == "approach":
+                logger.info("Goal approach: forcing forward movement (no backing up during goal runs)")
         
         # SAFETY: Check if backing up would be safe for the entire path to target
         if should_back_up and self.walls:
@@ -1341,7 +1344,7 @@ class BallCollector:
             target_angle = math.degrees(math.atan2(dy, dx))
             
             # Check if we've reached the target
-            distance_tolerance = 8 if target_type == "goal" else 12  # Increased tolerance for balls to 12cm
+            distance_tolerance = 15 if target_type == "goal" else 12  # Much more forgiving for goal delivery
             if remaining_distance <= distance_tolerance:
                 logger.info(f"Reached target with position checking")
                 return True
@@ -1360,9 +1363,9 @@ class BallCollector:
             if is_backing:
                 angle_diff = (angle_diff + 180) % 360 - 180
             
-            # Adjust heading if significantly off (more than 10 degrees)
+            # Adjust heading if significantly off - more forgiving for goals
             # Robot can turn as much as needed to face target directly
-            angle_threshold = 10  # Only skip very small adjustments
+            angle_threshold = 20 if target_type == "goal" else 10  # More forgiving angle tolerance for goals
             if abs(angle_diff) > angle_threshold:
                 # Turn directly to face target - no artificial limitations
                 logger.info(f"Adjusting direction: turning {angle_diff:.1f} degrees to face target")
@@ -1767,6 +1770,23 @@ class BallCollector:
                                     logger.info(f"Moving to goal")
                                     if not self.move_to_target_simple(target_pos, "goal"):
                                         raise Exception("Goal movement failed")
+                                    
+                                    # Final alignment before delivery - face goal opening directly
+                                    logger.info("Final alignment for goal delivery")
+                                    goal_side = self.goal_ranges[self.selected_goal][0][0]  # X coordinate of goal
+                                    if goal_side == 0:  # Left goal
+                                        target_angle = 180  # Face left (west)
+                                    else:  # Right goal  
+                                        target_angle = 0    # Face right (east)
+                                    
+                                    # Calculate angle difference and align if needed
+                                    angle_diff = (target_angle - self.robot_heading + 180) % 360 - 180
+                                    if abs(angle_diff) > 5:  # Only adjust if more than 5 degrees off
+                                        logger.info(f"Aligning with goal: turning {angle_diff:.1f} degrees")
+                                        if not self.turn(angle_diff):
+                                            logger.warning("Final alignment failed, but continuing")
+                                        else:
+                                            self.update_robot_position()
                                     
                                     # Move collector into goal for proper delivery (additional 8cm forward)
                                     logger.info("Moving collector into goal for proper delivery")
