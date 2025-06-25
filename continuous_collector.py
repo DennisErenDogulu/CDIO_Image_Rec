@@ -445,14 +445,17 @@ class BallCollector:
         # Create wall segments with small safety margin
         margin = WALL_SAFETY_MARGIN
         
-        # Get goal Y ranges for both goals
+        # Get goal Y ranges for both goals with extra clearance
         goal_a_y_vals = [y for (x, y) in self.goal_ranges['A']]
         goal_b_y_vals = [y for (x, y) in self.goal_ranges['B']]
         
-        goal_a_y_min = min(goal_a_y_vals)
-        goal_a_y_max = max(goal_a_y_vals)
-        goal_b_y_min = min(goal_b_y_vals)
-        goal_b_y_max = max(goal_b_y_vals)
+        # Add extra clearance around goals to prevent wall detection issues
+        goal_clearance = 8  # cm extra clearance around goal openings
+        
+        goal_a_y_min = min(goal_a_y_vals) - goal_clearance
+        goal_a_y_max = max(goal_a_y_vals) + goal_clearance
+        goal_b_y_min = min(goal_b_y_vals) - goal_clearance
+        goal_b_y_max = max(goal_b_y_vals) + goal_clearance
 
         self.walls = [
             # Bottom wall (full width)
@@ -462,33 +465,33 @@ class BallCollector:
             (margin, FIELD_HEIGHT_CM - margin, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin),
         ]
         
-        # Left wall segments (excluding goals)
+        # Left wall segments (excluding goals with extra clearance)
         if self.small_goal_side == "left":
-            # Goal A on left, so exclude its Y range
+            # Goal A on left, so exclude its Y range with extra clearance
             if goal_a_y_min > margin:
-                self.walls.append((margin, margin, margin, goal_a_y_min))
+                self.walls.append((margin, margin, margin, max(margin, goal_a_y_min)))
             if goal_a_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((margin, goal_a_y_max, margin, FIELD_HEIGHT_CM - margin))
+                self.walls.append((margin, min(FIELD_HEIGHT_CM - margin, goal_a_y_max), margin, FIELD_HEIGHT_CM - margin))
         else:
-            # Goal B on left, so exclude its Y range
+            # Goal B on left, so exclude its Y range with extra clearance
             if goal_b_y_min > margin:
-                self.walls.append((margin, margin, margin, goal_b_y_min))
+                self.walls.append((margin, margin, margin, max(margin, goal_b_y_min)))
             if goal_b_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((margin, goal_b_y_max, margin, FIELD_HEIGHT_CM - margin))
+                self.walls.append((margin, min(FIELD_HEIGHT_CM - margin, goal_b_y_max), margin, FIELD_HEIGHT_CM - margin))
         
-        # Right wall segments (excluding goals)
+        # Right wall segments (excluding goals with extra clearance)
         if self.small_goal_side == "right":
-            # Goal A on right, so exclude its Y range
+            # Goal A on right, so exclude its Y range with extra clearance
             if goal_a_y_min > margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_a_y_min))
+                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, max(margin, goal_a_y_min)))
             if goal_a_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, goal_a_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
+                self.walls.append((FIELD_WIDTH_CM - margin, min(FIELD_HEIGHT_CM - margin, goal_a_y_max), FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
         else:
-            # Goal B on right, so exclude its Y range
+            # Goal B on right, so exclude its Y range with extra clearance
             if goal_b_y_min > margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, goal_b_y_min))
+                self.walls.append((FIELD_WIDTH_CM - margin, margin, FIELD_WIDTH_CM - margin, max(margin, goal_b_y_min)))
             if goal_b_y_max < FIELD_HEIGHT_CM - margin:
-                self.walls.append((FIELD_WIDTH_CM - margin, goal_b_y_max, FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
+                self.walls.append((FIELD_WIDTH_CM - margin, min(FIELD_HEIGHT_CM - margin, goal_b_y_max), FIELD_WIDTH_CM - margin, FIELD_HEIGHT_CM - margin))
 
     def draw_walls(self, frame):
         """Draw walls, safety margins, goals, and starting box on the frame"""
