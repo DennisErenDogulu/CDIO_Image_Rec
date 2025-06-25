@@ -153,8 +153,9 @@ class BallCollector:
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))  # Use MJPG codec
         
         # Robot state
-        self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)  # Starting position
+        self.robot_pos = (ROBOT_START_X, ROBOT_START_Y)  # Starting position (green base marker)
         self.robot_heading = ROBOT_START_HEADING  # Starting heading
+        self.robot_front_pos = (ROBOT_START_X, ROBOT_START_Y)  # Front position (purple heading marker)
         
         # Calibration points for homography
         self.calibration_points = []
@@ -346,6 +347,9 @@ class BallCollector:
             
             # Update robot position (green marker center)
             self.robot_pos = (green_cm[0], green_cm[1])
+            
+            # Update robot front position (purple marker center - where collector is)
+            self.robot_front_pos = (purple_cm[0], purple_cm[1])
             
             # Calculate heading from green to purple marker
             dx = purple_cm[0] - green_cm[0]
@@ -1154,8 +1158,8 @@ class BallCollector:
         return frame
 
     def check_wall_proximity(self) -> bool:
-        """Check if robot is too close to any wall and back up if needed"""
-        if not self.walls or not self.robot_pos:
+        """Check if robot front (collector) is too close to any wall and back up if needed"""
+        if not self.walls or not self.robot_front_pos:
             return True
         
         wall_danger_distance = 5  # cm - reduced from 8cm to be less aggressive
@@ -1163,10 +1167,10 @@ class BallCollector:
         for wall in self.walls:
             wall_start = (wall[0], wall[1])
             wall_end = (wall[2], wall[3])
-            distance = point_to_line_distance(self.robot_pos, wall_start, wall_end)
+            distance = point_to_line_distance(self.robot_front_pos, wall_start, wall_end)
             
             if distance < wall_danger_distance:
-                logger.warning(f"Robot very close to wall ({distance:.1f}cm)! Small backup for safety")
+                logger.warning(f"Robot front (collector) very close to wall ({distance:.1f}cm)! Small backup for safety")
                 
                 # Back up 20cm away from the wall
                 if not self.move(-20):
@@ -1178,7 +1182,7 @@ class BallCollector:
                     logger.warning("Lost robot tracking after wall backup")
                     return True  # Don't fail, just continue
                 
-                logger.info(f"Backed away from wall, new position: ({self.robot_pos[0]:.1f}, {self.robot_pos[1]:.1f})")
+                logger.info(f"Backed away from wall, new front position: ({self.robot_front_pos[0]:.1f}, {self.robot_front_pos[1]:.1f})")
                 return True
         
         return True
@@ -1287,7 +1291,9 @@ class BallCollector:
             self.update_robot_position()
         
         # Move to target with position checking for longer distances
-        if distance_to_target > 15:  # For longer movements, break into steps with position checking
+        # For ball collection, use stepped approach for better control
+        collection_threshold = 25 if target_type == "collect" else 15
+        if distance_to_target > collection_threshold:
             return self._move_with_position_check(target_pos, target_type, should_back_up, distance_to_target)
         else:
             # Short movement - just go directly
@@ -1335,15 +1341,16 @@ class BallCollector:
             target_angle = math.degrees(math.atan2(dy, dx))
             
             # Check if we've reached the target
-            distance_tolerance = 8 if target_type == "goal" else 5
+            distance_tolerance = 8 if target_type == "goal" else 12  # Increased tolerance for balls to 12cm
             if remaining_distance <= distance_tolerance:
                 logger.info(f"Reached target with position checking")
                 return True
             
             # Final approach for ball collection (MUST be forward motion)
-            if target_type == "collect" and remaining_distance <= 15:
+            # Start collection earlier to avoid pushing balls
+            if target_type == "collect" and remaining_distance <= 22:  # Increased from 15cm to 22cm
                 # NO MORE TURNING for final approach - just collect straight ahead
-                logger.info(f"Final collection approach: {remaining_distance:.1f}cm (no more adjustments)")
+                logger.info(f"Final collection approach: {remaining_distance:.1f}cm (starting collection early)")
                 return self.collect(remaining_distance)
             
             # Recalculate direction based on current position
@@ -1353,15 +1360,13 @@ class BallCollector:
             if is_backing:
                 angle_diff = (angle_diff + 180) % 360 - 180
             
-            # Adjust heading if significantly off (more than 25 degrees)
-            # For ball collection, be even more conservative with adjustments
-            angle_threshold = 30 if target_type == "collect" else 25
+            # Adjust heading if significantly off (more than 10 degrees)
+            # Robot can turn as much as needed to face target directly
+            angle_threshold = 10  # Only skip very small adjustments
             if abs(angle_diff) > angle_threshold:
-                # Limit turn to maximum 20 degrees per adjustment to avoid over-correction
-                max_turn = 20
-                turn_amount = max(-max_turn, min(max_turn, angle_diff))
-                logger.info(f"Adjusting direction: turning {turn_amount:.1f} degrees (limited from {angle_diff:.1f})")
-                if not self.turn(turn_amount):
+                # Turn directly to face target - no artificial limitations
+                logger.info(f"Adjusting direction: turning {angle_diff:.1f} degrees to face target")
+                if not self.turn(angle_diff):
                     return False
                 self.update_robot_position()
             
@@ -1433,11 +1438,11 @@ class BallCollector:
         goal_x_edge = goal_candidates[0][0]  # X coordinate of goal (0 or FIELD_WIDTH_CM)
         
         if goal_x_edge == 0:  # Left side goal
-            goal_x = GOAL_OFFSET_CM  # Stop before left edge
+            goal_x = -2  # Position collector 2cm into goal opening for better delivery
             # Staging area much closer to goal since we can tank turn
             staging_x = 30  # Only 30cm from left edge (much closer than 25% = 45cm)
         else:  # Right side goal
-            goal_x = FIELD_WIDTH_CM - GOAL_OFFSET_CM  # Stop before right edge
+            goal_x = FIELD_WIDTH_CM + 2  # Position collector 2cm into goal opening for better delivery
             # Staging area much closer to goal since we can tank turn
             staging_x = FIELD_WIDTH_CM - 30  # Only 30cm from right edge (much closer than 75% = 135cm)
         
@@ -1763,10 +1768,10 @@ class BallCollector:
                                     if not self.move_to_target_simple(target_pos, "goal"):
                                         raise Exception("Goal movement failed")
                                     
-                                    # Move closer to goal for delivery (additional 3cm forward)
-                                    logger.info("Moving closer to goal for delivery")
-                                    if not self.move(3):
-                                        raise Exception("Failed to move closer to goal")
+                                    # Move collector into goal for proper delivery (additional 8cm forward)
+                                    logger.info("Moving collector into goal for proper delivery")
+                                    if not self.move(8):
+                                        raise Exception("Failed to move collector into goal")
                                     
                                     # After reaching goal position, deliver balls
                                     logger.info("Starting ball delivery sequence")
