@@ -78,6 +78,10 @@ def safe_motor_control(func):
 @safe_motor_control
 def execute_move(distance_cm):
     """Move forward/backward by distance_cm (negative = backward)"""
+    # Start collector motor before movement
+    collector.on(COLLECTOR_SPEED)
+    print("Auto-starting collector motor for movement")
+    
     # Determine direction and adjust speed accordingly
     if distance_cm < 0:
         # Moving backward - use negative speed for backward movement
@@ -91,12 +95,18 @@ def execute_move(distance_cm):
         print("Moving forward {:.1f} cm".format(distance_cm))
     
     mdiff.on_for_distance(SpeedRPM(speed), distance_mm)
+    # Keep collector running after movement (don't stop it)
+    print("Movement complete - collector still running")
     return True
 
 @safe_motor_control
 def execute_turn(angle_deg):
     """Turn by angle_deg (positive = CCW, negative = CW)"""
     try:
+        # Start collector motor before turning
+        collector.on(COLLECTOR_SPEED)
+        print("Auto-starting collector motor for turn")
+        
         # Set even slower speed for turns
         turn_speed = TURN_SPEED_RPM / 2  # Half the normal turn speed for more precision
         
@@ -128,6 +138,8 @@ def execute_turn(angle_deg):
             # For gentle turns, use the normal turn_degrees method
             mdiff.turn_degrees(SpeedRPM(TURN_SPEED_RPM), angle_deg)
         
+        # Keep collector running after turn (don't stop it)
+        print("Turn complete - collector still running")
         return True
     except Exception as e:
         print("Turn error: {}".format(e))

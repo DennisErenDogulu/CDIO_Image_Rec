@@ -47,7 +47,7 @@ PURPLE_MARKER_WIDTH_CM = 5  # Width of purple direction marker
 WALL_SAFETY_MARGIN = 1  # cm, minimum distance to keep from walls
 
 # Goal configuration
-SMALL_GOAL_SIDE = "right"  # "left" or "right" - where the small goal (A) is placed
+SMALL_GOAL_SIDE = "left"  # "left" or "right" - where the small goal (A) is placed
 GOAL_OFFSET_CM = 6   # cm, distance to stop before goal edge (closer to goal)
 
 # Robot configuration
@@ -320,9 +320,20 @@ class BallCollector:
                     scored_contours.sort(key=lambda x: x[1], reverse=True)
                     best_contour = scored_contours[0][0]
                     
-                    M = cv2.moments(best_contour)
-                    if M["m00"] != 0:
-                        purple_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                    # Instead of using centroid, find the tip point (furthest point from green marker)
+                    max_distance = 0
+                    tip_point = None
+                    
+                    # Check each point in the contour to find the one furthest from green marker
+                    for point in best_contour:
+                        px, py = point[0]
+                        distance = math.hypot(px - green_center[0], py - green_center[1])
+                        if distance > max_distance:
+                            max_distance = distance
+                            tip_point = (px, py)
+                    
+                    if tip_point:
+                        purple_center = tip_point
         
         return green_center, purple_center
 
@@ -637,10 +648,26 @@ class BallCollector:
         y_min = IGNORED_AREA["y_min"] - margin
         y_max = IGNORED_AREA["y_max"] + margin
         
-        # Check if line segment intersects with expanded obstacle rectangle
         x1, y1 = start_pos
         x2, y2 = end_pos
         
+        # Method 1: Check if either endpoint is inside the expanded obstacle
+        if (x_min <= x1 <= x_max and y_min <= y1 <= y_max) or \
+           (x_min <= x2 <= x_max and y_min <= y2 <= y_max):
+            return True
+        
+        # Method 2: Check if the line crosses the obstacle using parametric line equation
+        # Sample points along the line and check if any fall within obstacle
+        num_samples = 20  # Check 20 points along the line
+        for i in range(num_samples + 1):
+            t = i / num_samples
+            x = x1 + t * (x2 - x1)
+            y = y1 + t * (y2 - y1)
+            
+            if x_min <= x <= x_max and y_min <= y <= y_max:
+                return True
+        
+        # Method 3: Additional check using line-rectangle intersection for robustness
         # Check intersection with each edge of the obstacle rectangle
         obstacle_edges = [
             ((x_min, y_min), (x_max, y_min)),  # top
@@ -654,7 +681,7 @@ class BallCollector:
             x4, y4 = edge_end
             
             denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-            if denom == 0:  # Lines are parallel
+            if abs(denom) < 1e-10:  # Lines are parallel (using small epsilon for floating point)
                 continue
                 
             t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
@@ -1289,7 +1316,7 @@ class BallCollector:
             logger.info(f"Going forward to target (requires {abs(angle_diff):.1f}° turn)")
         
         # Turn to face the right direction
-        if abs(angle_diff) > 10:  # Only turn if significantly off
+        if abs(angle_diff) > 2:  # Turn for any significant angle difference (reduced from 10 to 2 degrees)
             logger.info(f"Turning {angle_diff:.1f} degrees")
             if not self.turn(angle_diff):
                 return False
@@ -1366,9 +1393,9 @@ class BallCollector:
             if is_backing:
                 angle_diff = (angle_diff + 180) % 360 - 180
             
-            # Adjust heading if significantly off - more forgiving for goals
+            # Adjust heading for better precision - allow frequent small corrections
             # Robot can turn as much as needed to face target directly
-            angle_threshold = 20 if target_type == "goal" else 10  # More forgiving angle tolerance for goals
+            angle_threshold = 3 if target_type == "goal" else 2  # Very precise angle tolerance for better accuracy
             if abs(angle_diff) > angle_threshold:
                 # Turn directly to face target - no artificial limitations
                 logger.info(f"Adjusting direction: turning {angle_diff:.1f} degrees to face target")
