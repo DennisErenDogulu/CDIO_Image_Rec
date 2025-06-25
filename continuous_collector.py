@@ -1415,17 +1415,23 @@ class BallCollector:
         try:
             logger.info(f"Sending COLLECT_REVERSE command for {self.delivery_time} seconds")
             result = self.send_command("COLLECT_REVERSE", duration=self.delivery_time)
+            
+            # Enable automatic mode after first delivery attempt (regardless of success)
+            if not self.automatic_mode:
+                self.automatic_mode = True
+                logger.info("🤖 AUTOMATIC MODE ENABLED - Will auto-execute future paths")
+            
             if result:
                 logger.info("COLLECT_REVERSE command executed successfully")
-                # Enable automatic mode after first successful delivery
-                if not self.automatic_mode:
-                    self.automatic_mode = True
-                    logger.info("🤖 AUTOMATIC MODE ENABLED - Will auto-execute future paths")
             else:
-                logger.warning("COLLECT_REVERSE command returned failure")
+                logger.warning("COLLECT_REVERSE command returned failure, but continuing in automatic mode")
             return result
         except Exception as e:
             logger.error("Exception during ball delivery: {}".format(e))
+            # Still enable automatic mode even if delivery failed
+            if not self.automatic_mode:
+                self.automatic_mode = True
+                logger.info("🤖 AUTOMATIC MODE ENABLED after delivery attempt (despite error)")
             return False
 
     def calculate_goal_approach_path(self, current_pos, current_heading):
@@ -1601,6 +1607,11 @@ class BallCollector:
                     if balls:
                         logger.info(f"Planning to collect {len(balls)} balls from position {self.robot_pos}")
                         
+                        # Enable automatic mode when balls are detected for the first time
+                        if not self.automatic_mode:
+                            self.automatic_mode = True
+                            logger.info("🤖 AUTOMATIC MODE ENABLED - Robot will now operate autonomously")
+                        
                         # Sort balls by distance from current robot position
                         balls.sort(key=lambda b: math.hypot(
                             b[0] - self.robot_pos[0],
@@ -1712,7 +1723,7 @@ class BallCollector:
                                   (10, y + 30), cv2.FONT_HERSHEY_SIMPLEX,
                                   0.4, (0, 255, 0), 1)
                     else:
-                        cv2.putText(display_frame, "MANUAL MODE: Press ENTER to execute (auto after first delivery)",
+                        cv2.putText(display_frame, "MANUAL MODE: Press ENTER to execute (auto when balls detected)",
                                   (10, y + 30), cv2.FONT_HERSHEY_SIMPLEX,
                                   0.4, (0, 255, 255), 1)
                 else:
@@ -1847,6 +1858,12 @@ class BallCollector:
                                 
                                 if remaining_balls:
                                     logger.info(f"🎯 Found {len(remaining_balls)} remaining balls - automatically continuing collection")
+                                    
+                                    # Enable automatic mode when balls are found for the first time
+                                    if not self.automatic_mode:
+                                        self.automatic_mode = True
+                                        logger.info("🤖 AUTOMATIC MODE ENABLED - Robot will now operate autonomously")
+                                    
                                     # Force immediate replanning by resetting timing
                                     last_plan_time = 0
                                     last_plan_positions = []
